@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"regexp"
 	"strconv"
@@ -36,39 +38,61 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 // Client provides a slim wrapper around the Pulumi HTTP/REST API.
 type Client struct {
-	apiURL   string
-	apiToken apiAccessToken
-	apiUser  string
-	apiOrgs  []string
-	diag     diag.Sink
-	client   restClient
+	apiURL     string
+	apiToken   apiAccessToken
+	apiUser    string
+	apiOrgs    []string
+	tokenInfo  *workspace.TokenInformation // might be nil if running against old services
+	diag       diag.Sink
+	insecure   bool
+	restClient restClient
+	httpClient *http.Client
+
+	// If true, do not probe the backend with GET /api/capabilities and assume no capabilities.
+	DisableCapabilityProbing bool
 }
 
 // newClient creates a new Pulumi API client with the given URL and API token. It is a variable instead of a regular
 // function so it can be set to a different implementation at runtime, if necessary.
-var newClient = func(apiURL, apiToken string, d diag.Sink) *Client {
+var newClient = func(apiURL, apiToken string, insecure bool, d diag.Sink) *Client {
+	var httpClient *http.Client
+	if insecure {
+		tr := &http.Transport{
+			//nolint:gosec // The user has explicitly opted into setting this
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		httpClient = &http.Client{Transport: tr}
+	} else {
+		httpClient = http.DefaultClient
+	}
+
 	return &Client{
-		apiURL:   apiURL,
-		apiToken: apiAccessToken(apiToken),
-		diag:     d,
-		client: &defaultRESTClient{
+		apiURL:     apiURL,
+		apiToken:   apiAccessToken(apiToken),
+		diag:       d,
+		httpClient: httpClient,
+		restClient: &defaultRESTClient{
 			client: &defaultHTTPClient{
-				client: http.DefaultClient,
+				client: httpClient,
 			},
 		},
 	}
 }
 
+// Returns true if this client is insecure (i.e. has TLS disabled).
+func (pc *Client) Insecure() bool {
+	return pc.insecure
+}
+
 // NewClient creates a new Pulumi API client with the given URL and API token.
-func NewClient(apiURL, apiToken string, d diag.Sink) *Client {
-	return newClient(apiURL, apiToken, d)
+func NewClient(apiURL, apiToken string, insecure bool, d diag.Sink) *Client {
+	return newClient(apiURL, apiToken, insecure, d)
 }
 
 // URL returns the URL of the API endpoint this client interacts with
@@ -79,24 +103,25 @@ func (pc *Client) URL() string {
 // restCall makes a REST-style request to the Pulumi API using the given method, path, query object, and request
 // object. If a response object is provided, the server's response is deserialized into that object.
 func (pc *Client) restCall(ctx context.Context, method, path string, queryObj, reqObj, respObj interface{}) error {
-	return pc.client.Call(ctx, pc.diag, pc.apiURL, method, path, queryObj, reqObj, respObj, pc.apiToken,
+	return pc.restClient.Call(ctx, pc.diag, pc.apiURL, method, path, queryObj, reqObj, respObj, pc.apiToken,
 		httpCallOptions{})
 }
 
 // restCall makes a REST-style request to the Pulumi API using the given method, path, query object, and request
 // object. If a response object is provided, the server's response is deserialized into that object.
 func (pc *Client) restCallWithOptions(ctx context.Context, method, path string, queryObj, reqObj,
-	respObj interface{}, opts httpCallOptions) error {
-	return pc.client.Call(ctx, pc.diag, pc.apiURL, method, path, queryObj, reqObj, respObj, pc.apiToken, opts)
+	respObj interface{}, opts httpCallOptions,
+) error {
+	return pc.restClient.Call(ctx, pc.diag, pc.apiURL, method, path, queryObj, reqObj, respObj, pc.apiToken, opts)
 }
 
 // updateRESTCall makes a REST-style request to the Pulumi API using the given method, path, query object, and request
 // object. The call is authorized with the indicated update token. If a response object is provided, the server's
 // response is deserialized into that object.
 func (pc *Client) updateRESTCall(ctx context.Context, method, path string, queryObj, reqObj, respObj interface{},
-	token updateAccessToken, httpOptions httpCallOptions) error {
-
-	return pc.client.Call(ctx, pc.diag, pc.apiURL, method, path, queryObj, reqObj, respObj, token, httpOptions)
+	token updateToken, httpOptions httpCallOptions,
+) error {
+	return pc.restClient.Call(ctx, pc.diag, pc.apiURL, method, path, queryObj, reqObj, respObj, token, httpOptions)
 }
 
 // getProjectPath returns the API path for the given owner and the given project name joined with path separators
@@ -178,7 +203,7 @@ type serviceUserInfo struct {
 	Email       string `json:"email,omitempty"`
 }
 
-// Copied from https://github.com/pulumi/pulumi-service/blob/master/pkg/apitype/users.go#L20-L34
+// Copied from https://github.com/pulumi/pulumi-service/blob/master/pkg/apitype/users.go#L20-L37
 type serviceUser struct {
 	ID            string            `json:"id"`
 	GitHubLogin   string            `json:"githubLogin"`
@@ -188,32 +213,47 @@ type serviceUser struct {
 	Organizations []serviceUserInfo `json:"organizations"`
 	Identities    []string          `json:"identities"`
 	SiteAdmin     *bool             `json:"siteAdmin,omitempty"`
+	TokenInfo     *serviceTokenInfo `json:"tokenInfo,omitempty"`
+}
+
+// Copied from https://github.com/pulumi/pulumi-service/blob/master/pkg/apitype/users.go#L39-L43
+type serviceTokenInfo struct {
+	Name         string `json:"name"`
+	Organization string `json:"organization,omitempty"`
+	Team         string `json:"team,omitempty"`
 }
 
 // GetPulumiAccountName returns the user implied by the API token associated with this client.
-func (pc *Client) GetPulumiAccountDetails(ctx context.Context) (string, []string, error) {
+func (pc *Client) GetPulumiAccountDetails(ctx context.Context) (string, []string, *workspace.TokenInformation, error) {
 	if pc.apiUser == "" {
 		resp := serviceUser{}
 		if err := pc.restCall(ctx, "GET", "/api/user", nil, nil, &resp); err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
 
 		if resp.GitHubLogin == "" {
-			return "", nil, errors.New("unexpected response from server")
+			return "", nil, nil, errors.New("unexpected response from server")
 		}
 
 		pc.apiUser = resp.GitHubLogin
 		pc.apiOrgs = make([]string, len(resp.Organizations))
 		for i, org := range resp.Organizations {
 			if org.GitHubLogin == "" {
-				return "", nil, errors.New("unexpected response from server")
+				return "", nil, nil, errors.New("unexpected response from server")
 			}
 
 			pc.apiOrgs[i] = org.GitHubLogin
 		}
+		if resp.TokenInfo != nil {
+			pc.tokenInfo = &workspace.TokenInformation{
+				Name:         resp.TokenInfo.Name,
+				Organization: resp.TokenInfo.Organization,
+				Team:         resp.TokenInfo.Team,
+			}
+		}
 	}
 
-	return pc.apiUser, pc.apiOrgs, nil
+	return pc.apiUser, pc.apiOrgs, pc.tokenInfo, nil
 }
 
 // GetCLIVersionInfo asks the service for information about versions of the CLI (the newest version as well as the
@@ -221,7 +261,18 @@ func (pc *Client) GetPulumiAccountDetails(ctx context.Context) (string, []string
 func (pc *Client) GetCLIVersionInfo(ctx context.Context) (semver.Version, semver.Version, error) {
 	var versionInfo apitype.CLIVersionResponse
 
-	if err := pc.restCall(ctx, "GET", "/api/cli/version", nil, nil, &versionInfo); err != nil {
+	err := pc.restCallWithOptions(
+		ctx,
+		"GET",
+		"/api/cli/version",
+		nil,          // query
+		nil,          // request
+		&versionInfo, // response
+		httpCallOptions{
+			RetryPolicy: retryNone,
+		},
+	)
+	if err != nil {
 		return semver.Version{}, semver.Version{}, err
 	}
 
@@ -248,7 +299,8 @@ type ListStacksFilter struct {
 
 // ListStacks lists all stacks the current user has access to, optionally filtered by project.
 func (pc *Client) ListStacks(
-	ctx context.Context, filter ListStacksFilter, inContToken *string) ([]apitype.StackSummary, *string, error) {
+	ctx context.Context, filter ListStacksFilter, inContToken *string,
+) ([]apitype.StackSummary, *string, error) {
 	queryFilter := struct {
 		Project           *string `url:"project,omitempty"`
 		Organization      *string `url:"organization,omitempty"`
@@ -271,10 +323,8 @@ func (pc *Client) ListStacks(
 	return resp.Stacks, resp.ContinuationToken, nil
 }
 
-var (
-	// ErrNoPreviousDeployment is returned when there isn't a previous deployment.
-	ErrNoPreviousDeployment = errors.New("no previous deployment")
-)
+// ErrNoPreviousDeployment is returned when there isn't a previous deployment.
+var ErrNoPreviousDeployment = errors.New("no previous deployment")
 
 type getLatestConfigurationResponse struct {
 	Info apitype.UpdateInfo `json:"info,omitempty"`
@@ -321,7 +371,7 @@ func (pc *Client) GetLatestConfiguration(ctx context.Context, stackID StackIdent
 func (pc *Client) DoesProjectExist(ctx context.Context, owner string, projectName string) (bool, error) {
 	if err := pc.restCall(ctx, "HEAD", getProjectPath(owner, projectName), nil, nil, nil); err != nil {
 		// If this was a 404, return false - project not found.
-		if errResp, ok := err.(*apitype.ErrorResponse); ok && errResp.Code == http.StatusNotFound {
+		if is404(err) {
 			return false, nil
 		}
 
@@ -341,21 +391,23 @@ func (pc *Client) GetStack(ctx context.Context, stackID StackIdentifier) (apityp
 
 // CreateStack creates a stack with the given cloud and stack name in the scope of the indicated project.
 func (pc *Client) CreateStack(
-	ctx context.Context, stackID StackIdentifier, tags map[apitype.StackTagName]string) (apitype.Stack, error) {
+	ctx context.Context, stackID StackIdentifier, tags map[apitype.StackTagName]string, teams []string,
+) (apitype.Stack, error) {
 	// Validate names and tags.
-	if err := validation.ValidateStackProperties(stackID.Stack, tags); err != nil {
+	if err := validation.ValidateStackTags(tags); err != nil {
 		return apitype.Stack{}, fmt.Errorf("validating stack properties: %w", err)
 	}
 
 	stack := apitype.Stack{
-		StackName:   tokens.QName(stackID.Stack),
+		StackName:   stackID.Stack.Q(),
 		ProjectName: stackID.Project,
 		OrgName:     stackID.Owner,
 		Tags:        tags,
 	}
 	createStackReq := apitype.CreateStackRequest{
-		StackName: stackID.Stack,
+		StackName: stackID.Stack.String(),
 		Tags:      tags,
+		Teams:     teams,
 	}
 
 	endpoint := fmt.Sprintf("/api/stacks/%s/%s", stackID.Owner, stackID.Project)
@@ -414,28 +466,27 @@ func (pc *Client) DecryptValue(ctx context.Context, stack StackIdentifier, ciphe
 }
 
 func (pc *Client) Log3rdPartySecretsProviderDecryptionEvent(ctx context.Context, stack StackIdentifier,
-	secretName string) error {
+	secretName string,
+) error {
 	req := apitype.Log3rdPartyDecryptionEvent{SecretName: secretName}
-	if err := pc.restCall(ctx, "POST", path.Join(getStackPath(stack, "decrypt"), "log-decryption"),
-		nil, &req, nil); err != nil {
-		return err
-	}
-	return nil
+	return pc.restCall(
+		ctx, "POST", path.Join(getStackPath(stack, "decrypt"), "log-decryption"),
+		nil, &req, nil)
 }
 
 func (pc *Client) LogBulk3rdPartySecretsProviderDecryptionEvent(ctx context.Context, stack StackIdentifier,
-	command string) error {
+	command string,
+) error {
 	req := apitype.Log3rdPartyDecryptionEvent{CommandName: command}
-	if err := pc.restCall(ctx, "POST", path.Join(getStackPath(stack, "decrypt"), "log-batch-decryption"), nil,
-		&req, nil); err != nil {
-		return err
-	}
-	return nil
+	return pc.restCall(
+		ctx, "POST", path.Join(getStackPath(stack, "decrypt"), "log-batch-decryption"),
+		nil, &req, nil)
 }
 
 // BulkDecryptValue decrypts a ciphertext value in the context of the indicated stack.
 func (pc *Client) BulkDecryptValue(ctx context.Context, stack StackIdentifier,
-	ciphertexts [][]byte) (map[string][]byte, error) {
+	ciphertexts [][]byte,
+) (map[string][]byte, error) {
 	req := apitype.BulkDecryptValueRequest{Ciphertexts: ciphertexts}
 	var resp apitype.BulkDecryptValueResponse
 	if err := pc.restCallWithOptions(ctx, "POST", getStackPath(stack, "batch-decrypt"), nil, &req, &resp,
@@ -451,7 +502,8 @@ func (pc *Client) GetStackUpdates(
 	ctx context.Context,
 	stack StackIdentifier,
 	pageSize int,
-	page int) ([]apitype.UpdateInfo, error) {
+	page int,
+) ([]apitype.UpdateInfo, error) {
 	var response apitype.GetHistoryResponse
 	path := getStackPath(stack, "updates")
 	if pageSize > 0 {
@@ -470,8 +522,8 @@ func (pc *Client) GetStackUpdates(
 // ExportStackDeployment exports the indicated stack's deployment as a raw JSON message.
 // If version is nil, will export the latest version of the stack.
 func (pc *Client) ExportStackDeployment(
-	ctx context.Context, stack StackIdentifier, version *int) (apitype.UntypedDeployment, error) {
-
+	ctx context.Context, stack StackIdentifier, version *int,
+) (apitype.UntypedDeployment, error) {
 	tracingSpan, childCtx := opentracing.StartSpanFromContext(ctx, "ExportStackDeployment")
 	defer tracingSpan.Finish()
 
@@ -492,8 +544,8 @@ func (pc *Client) ExportStackDeployment(
 
 // ImportStackDeployment imports a new deployment into the indicated stack.
 func (pc *Client) ImportStackDeployment(ctx context.Context, stack StackIdentifier,
-	deployment *apitype.UntypedDeployment) (UpdateIdentifier, error) {
-
+	deployment *apitype.UntypedDeployment,
+) (UpdateIdentifier, error) {
 	var resp apitype.ImportStackResponse
 	if err := pc.restCallWithOptions(ctx, "POST", getStackPath(stack, "import"), nil, deployment, &resp,
 		httpCallOptions{GzipCompress: true}); err != nil {
@@ -507,19 +559,24 @@ func (pc *Client) ImportStackDeployment(ctx context.Context, stack StackIdentifi
 	}, nil
 }
 
+type CreateUpdateDetails struct {
+	Messages         []apitype.Message
+	RequiredPolicies []apitype.RequiredPolicy
+}
+
 // CreateUpdate creates a new update for the indicated stack with the given kind and assorted options. If the update
 // requires that the Pulumi program is uploaded, the provided getContents callback will be invoked to fetch the
 // contents of the Pulumi program.
 func (pc *Client) CreateUpdate(
 	ctx context.Context, kind apitype.UpdateKind, stack StackIdentifier, proj *workspace.Project,
 	cfg config.Map, m apitype.UpdateMetadata, opts engine.UpdateOptions,
-	dryRun bool) (UpdateIdentifier, []apitype.RequiredPolicy, error) {
-
+	dryRun bool,
+) (UpdateIdentifier, CreateUpdateDetails, error) {
 	// First create the update program request.
 	wireConfig := make(map[string]apitype.ConfigValue)
 	for k, cv := range cfg {
 		v, err := cv.Value(config.NopDecrypter)
-		contract.AssertNoError(err)
+		contract.AssertNoErrorf(err, "error fetching config value for key %v", k)
 
 		wireConfig[k.String()] = apitype.ConfigValue{
 			String: v,
@@ -569,20 +626,23 @@ func (pc *Client) CreateUpdate(
 	path := getStackPath(stack, endpoint)
 	var updateResponse apitype.UpdateProgramResponse
 	if err := pc.restCall(ctx, "POST", path, nil, &updateRequest, &updateResponse); err != nil {
-		return UpdateIdentifier{}, []apitype.RequiredPolicy{}, err
+		return UpdateIdentifier{}, CreateUpdateDetails{}, err
 	}
 
 	return UpdateIdentifier{
-		StackIdentifier: stack,
-		UpdateKind:      kind,
-		UpdateID:        updateResponse.UpdateID,
-	}, updateResponse.RequiredPolicies, nil
+			StackIdentifier: stack,
+			UpdateKind:      kind,
+			UpdateID:        updateResponse.UpdateID,
+		}, CreateUpdateDetails{
+			Messages:         updateResponse.Messages,
+			RequiredPolicies: updateResponse.RequiredPolicies,
+		}, nil
 }
 
 // RenameStack renames the provided stack to have the new identifier.
 func (pc *Client) RenameStack(ctx context.Context, currentID, newID StackIdentifier) error {
 	req := apitype.StackRenameRequest{
-		NewName:    newID.Stack,
+		NewName:    newID.Stack.String(),
 		NewProject: newID.Project,
 	}
 	return pc.restCall(ctx, "POST", getStackPath(currentID, "rename"), nil, &req, nil)
@@ -591,10 +651,10 @@ func (pc *Client) RenameStack(ctx context.Context, currentID, newID StackIdentif
 // StartUpdate starts the indicated update. It returns the new version of the update's target stack and the token used
 // to authenticate operations on the update if any. Replaces the stack's tags with the updated set.
 func (pc *Client) StartUpdate(ctx context.Context, update UpdateIdentifier,
-	tags map[apitype.StackTagName]string) (int, string, error) {
-
+	tags map[apitype.StackTagName]string,
+) (int, string, error) {
 	// Validate names and tags.
-	if err := validation.ValidateStackProperties(update.StackIdentifier.Stack, tags); err != nil {
+	if err := validation.ValidateStackTags(tags); err != nil {
 		return 0, "", fmt.Errorf("validating stack properties: %w", err)
 	}
 
@@ -612,7 +672,8 @@ func (pc *Client) StartUpdate(ctx context.Context, update UpdateIdentifier,
 
 // ListPolicyGroups lists all `PolicyGroups` the organization has in the Pulumi service.
 func (pc *Client) ListPolicyGroups(ctx context.Context, orgName string, inContToken *string) (
-	apitype.ListPolicyGroupsResponse, *string, error) {
+	apitype.ListPolicyGroupsResponse, *string, error,
+) {
 	// NOTE: The ListPolicyGroups API on the Pulumi Service is not currently paginated.
 	var resp apitype.ListPolicyGroupsResponse
 	err := pc.restCall(ctx, "GET", listPolicyGroupsPath(orgName), nil, nil, &resp)
@@ -624,7 +685,8 @@ func (pc *Client) ListPolicyGroups(ctx context.Context, orgName string, inContTo
 
 // ListPolicyPacks lists all `PolicyPack` the organization has in the Pulumi service.
 func (pc *Client) ListPolicyPacks(ctx context.Context, orgName string, inContToken *string) (
-	apitype.ListPolicyPacksResponse, *string, error) {
+	apitype.ListPolicyPacksResponse, *string, error,
+) {
 	// NOTE: The ListPolicyPacks API on the Pulumi Service is not currently paginated.
 	var resp apitype.ListPolicyPacksResponse
 	err := pc.restCall(ctx, "GET", listPolicyPacksPath(orgName), nil, nil, &resp)
@@ -637,8 +699,8 @@ func (pc *Client) ListPolicyPacks(ctx context.Context, orgName string, inContTok
 // PublishPolicyPack publishes a `PolicyPack` to the Pulumi service. If it successfully publishes
 // the Policy Pack, it returns the version of the pack.
 func (pc *Client) PublishPolicyPack(ctx context.Context, orgName string,
-	analyzerInfo plugin.AnalyzerInfo, dirArchive io.Reader) (string, error) {
-
+	analyzerInfo plugin.AnalyzerInfo, dirArchive io.Reader,
+) (string, error) {
 	//
 	// Step 1: Send POST containing policy metadata to service. This begins process of creating
 	// publishing the PolicyPack.
@@ -700,7 +762,7 @@ func (pc *Client) PublishPolicyPack(ctx context.Context, orgName string,
 		putReq.Header.Add(k, v)
 	}
 
-	_, err = http.DefaultClient.Do(putReq)
+	_, err = pc.httpClient.Do(putReq)
 	if err != nil {
 		return "", fmt.Errorf("Failed to upload compressed PolicyPack: %w", err)
 	}
@@ -765,8 +827,8 @@ func validatePolicyPackVersion(s string) error {
 // ApplyPolicyPack enables a `PolicyPack` to the Pulumi organization. If policyGroup is not empty,
 // it will enable the PolicyPack on the default PolicyGroup.
 func (pc *Client) ApplyPolicyPack(ctx context.Context, orgName, policyGroup,
-	policyPackName, versionTag string, policyPackConfig map[string]*json.RawMessage) error {
-
+	policyPackName, versionTag string, policyPackConfig map[string]*json.RawMessage,
+) error {
 	// If a Policy Group was not specified, we use the default Policy Group.
 	if policyGroup == "" {
 		policyGroup = apitype.DefaultPolicyGroup
@@ -789,7 +851,8 @@ func (pc *Client) ApplyPolicyPack(ctx context.Context, orgName, policyGroup,
 
 // GetPolicyPackSchema gets Policy Pack config schema.
 func (pc *Client) GetPolicyPackSchema(ctx context.Context, orgName,
-	policyPackName, versionTag string) (*apitype.GetPolicyPackConfigSchemaResponse, error) {
+	policyPackName, versionTag string,
+) (*apitype.GetPolicyPackConfigSchemaResponse, error) {
 	var resp apitype.GetPolicyPackConfigSchemaResponse
 	err := pc.restCall(ctx, http.MethodGet,
 		getPolicyPackConfigSchemaPath(orgName, policyPackName, versionTag), nil, nil, &resp)
@@ -802,8 +865,8 @@ func (pc *Client) GetPolicyPackSchema(ctx context.Context, orgName,
 // DisablePolicyPack disables a `PolicyPack` to the Pulumi organization. If policyGroup is not empty,
 // it will disable the PolicyPack on the default PolicyGroup.
 func (pc *Client) DisablePolicyPack(ctx context.Context, orgName string, policyGroup string,
-	policyPackName, versionTag string) error {
-
+	policyPackName, versionTag string,
+) error {
 	// If Policy Group was not specified, use the default Policy Group.
 	if policyGroup == "" {
 		policyGroup = apitype.DefaultPolicyGroup
@@ -836,8 +899,8 @@ func (pc *Client) RemovePolicyPack(ctx context.Context, orgName string, policyPa
 // RemovePolicyPackByVersion removes a specific version of a `PolicyPack` from
 // the Pulumi organization.
 func (pc *Client) RemovePolicyPackByVersion(ctx context.Context, orgName string,
-	policyPackName string, versionTag string) error {
-
+	policyPackName string, versionTag string,
+) error {
 	path := deletePolicyPackVersionPath(orgName, policyPackName, versionTag)
 	err := pc.restCall(ctx, http.MethodDelete, path, nil, nil, nil)
 	if err != nil {
@@ -853,7 +916,7 @@ func (pc *Client) DownloadPolicyPack(ctx context.Context, url string) (io.ReadCl
 		return nil, fmt.Errorf("Failed to download compressed PolicyPack: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(getS3Req)
+	resp, err := pc.httpClient.Do(getS3Req)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to download compressed PolicyPack: %w", err)
 	}
@@ -863,8 +926,8 @@ func (pc *Client) DownloadPolicyPack(ctx context.Context, url string) (io.ReadCl
 
 // GetUpdateEvents returns all events, taking an optional continuation token from a previous call.
 func (pc *Client) GetUpdateEvents(ctx context.Context, update UpdateIdentifier,
-	continuationToken *string) (apitype.UpdateResults, error) {
-
+	continuationToken *string,
+) (apitype.UpdateResults, error) {
 	path := getUpdatePath(update)
 	if continuationToken != nil {
 		path += fmt.Sprintf("?continuationToken=%s", *continuationToken)
@@ -880,8 +943,8 @@ func (pc *Client) GetUpdateEvents(ctx context.Context, update UpdateIdentifier,
 
 // RenewUpdateLease renews the indicated update lease for the given duration.
 func (pc *Client) RenewUpdateLease(ctx context.Context, update UpdateIdentifier, token string,
-	duration time.Duration) (string, error) {
-
+	duration time.Duration,
+) (string, error) {
 	req := apitype.RenewUpdateLeaseRequest{
 		Duration: int(duration / time.Second),
 	}
@@ -891,27 +954,29 @@ func (pc *Client) RenewUpdateLease(ctx context.Context, update UpdateIdentifier,
 	// during a long running update).  Since we would fail our update operation if we can't renew our lease, we'll retry
 	// these POST operations.
 	if err := pc.updateRESTCall(ctx, "POST", getUpdatePath(update, "renew_lease"), nil, req, &resp,
-		updateAccessToken(token), httpCallOptions{RetryAllMethods: true}); err != nil {
+		updateAccessToken(updateTokenStaticSource(token)), httpCallOptions{RetryPolicy: retryAllMethods}); err != nil {
 		return "", err
 	}
 	return resp.Token, nil
 }
 
 // InvalidateUpdateCheckpoint invalidates the checkpoint for the indicated update.
-func (pc *Client) InvalidateUpdateCheckpoint(ctx context.Context, update UpdateIdentifier, token string) error {
+func (pc *Client) InvalidateUpdateCheckpoint(ctx context.Context, update UpdateIdentifier,
+	token UpdateTokenSource,
+) error {
 	req := apitype.PatchUpdateCheckpointRequest{
 		IsInvalid: true,
 	}
 
 	// It is safe to retry this PATCH operation, because it is logically idempotent.
 	return pc.updateRESTCall(ctx, "PATCH", getUpdatePath(update, "checkpoint"), nil, req, nil,
-		updateAccessToken(token), httpCallOptions{RetryAllMethods: true})
+		updateAccessToken(token), httpCallOptions{RetryPolicy: retryAllMethods})
 }
 
 // PatchUpdateCheckpoint patches the checkpoint for the indicated update with the given contents.
 func (pc *Client) PatchUpdateCheckpoint(ctx context.Context, update UpdateIdentifier, deployment *apitype.DeploymentV3,
-	token string) error {
-
+	token UpdateTokenSource,
+) error {
 	rawDeployment, err := json.Marshal(deployment)
 	if err != nil {
 		return err
@@ -925,14 +990,14 @@ func (pc *Client) PatchUpdateCheckpoint(ctx context.Context, update UpdateIdenti
 	// It is safe to retry this PATCH operation, because it is logically idempotent, since we send the entire
 	// deployment instead of a set of changes to apply.
 	return pc.updateRESTCall(ctx, "PATCH", getUpdatePath(update, "checkpoint"), nil, req, nil,
-		updateAccessToken(token), httpCallOptions{RetryAllMethods: true, GzipCompress: true})
+		updateAccessToken(token), httpCallOptions{RetryPolicy: retryAllMethods, GzipCompress: true})
 }
 
 // PatchUpdateCheckpointVerbatim is a variant of PatchUpdateCheckpoint that preserves JSON indentation of the
 // UntypedDeployment transferred over the wire.
 func (pc *Client) PatchUpdateCheckpointVerbatim(ctx context.Context, update UpdateIdentifier,
-	sequenceNumber int, untypedDeploymentBytes json.RawMessage, token string) error {
-
+	sequenceNumber int, untypedDeploymentBytes json.RawMessage, token UpdateTokenSource,
+) error {
 	req := apitype.PatchUpdateVerbatimCheckpointRequest{
 		Version:           3,
 		UntypedDeployment: untypedDeploymentBytes,
@@ -947,15 +1012,15 @@ func (pc *Client) PatchUpdateCheckpointVerbatim(ctx context.Context, update Upda
 	// It is safe to retry this PATCH operation, because it is logically idempotent, since we send the entire
 	// deployment instead of a set of changes to apply.
 	return pc.updateRESTCall(ctx, "PATCH", getUpdatePath(update, "checkpointverbatim"), nil, reqPayload, nil,
-		updateAccessToken(token), httpCallOptions{RetryAllMethods: true, GzipCompress: true})
+		updateAccessToken(token), httpCallOptions{RetryPolicy: retryAllMethods, GzipCompress: true})
 }
 
 // PatchUpdateCheckpointDelta patches the checkpoint for the indicated update with the given contents, just like
 // PatchUpdateCheckpoint. Unlike PatchUpdateCheckpoint, it uses a text diff-based protocol to conserve bandwidth on
 // large stack states.
 func (pc *Client) PatchUpdateCheckpointDelta(ctx context.Context, update UpdateIdentifier,
-	sequenceNumber int, checkpointHash string, deploymentDelta json.RawMessage, token string) error {
-
+	sequenceNumber int, checkpointHash string, deploymentDelta json.RawMessage, token UpdateTokenSource,
+) error {
 	req := apitype.PatchUpdateCheckpointDeltaRequest{
 		Version:         3,
 		CheckpointHash:  checkpointHash,
@@ -965,34 +1030,33 @@ func (pc *Client) PatchUpdateCheckpointDelta(ctx context.Context, update UpdateI
 
 	// It is safe to retry because SequenceNumber serves as an idempotency key.
 	return pc.updateRESTCall(ctx, "PATCH", getUpdatePath(update, "checkpointdelta"), nil, req, nil,
-		updateAccessToken(token), httpCallOptions{RetryAllMethods: true, GzipCompress: true})
+		updateAccessToken(token), httpCallOptions{RetryPolicy: retryAllMethods, GzipCompress: true})
 }
 
 // CancelUpdate cancels the indicated update.
 func (pc *Client) CancelUpdate(ctx context.Context, update UpdateIdentifier) error {
-
 	// It is safe to retry this PATCH operation, because it is logically idempotent.
 	return pc.restCallWithOptions(ctx, "POST", getUpdatePath(update, "cancel"), nil, nil, nil,
-		httpCallOptions{RetryAllMethods: true})
+		httpCallOptions{RetryPolicy: retryAllMethods})
 }
 
 // CompleteUpdate completes the indicated update with the given status.
 func (pc *Client) CompleteUpdate(ctx context.Context, update UpdateIdentifier, status apitype.UpdateStatus,
-	token string) error {
-
+	token UpdateTokenSource,
+) error {
 	req := apitype.CompleteUpdateRequest{
 		Status: status,
 	}
 
 	// It is safe to retry this PATCH operation, because it is logically idempotent.
 	return pc.updateRESTCall(ctx, "POST", getUpdatePath(update, "complete"), nil, req, nil,
-		updateAccessToken(token), httpCallOptions{RetryAllMethods: true})
+		updateAccessToken(token), httpCallOptions{RetryPolicy: retryAllMethods})
 }
 
 // GetUpdateEngineEvents returns the engine events for an update.
 func (pc *Client) GetUpdateEngineEvents(ctx context.Context, update UpdateIdentifier,
-	continuationToken *string) (apitype.GetUpdateEventsResponse, error) {
-
+	continuationToken *string,
+) (apitype.GetUpdateEventsResponse, error) {
 	path := getUpdatePath(update, "events")
 	if continuationToken != nil {
 		path += fmt.Sprintf("?continuationToken=%s", *continuationToken)
@@ -1008,10 +1072,11 @@ func (pc *Client) GetUpdateEngineEvents(ctx context.Context, update UpdateIdenti
 
 // RecordEngineEvents posts a batch of engine events to the Pulumi service.
 func (pc *Client) RecordEngineEvents(
-	ctx context.Context, update UpdateIdentifier, batch apitype.EngineEventBatch, token string) error {
+	ctx context.Context, update UpdateIdentifier, batch apitype.EngineEventBatch, token UpdateTokenSource,
+) error {
 	callOpts := httpCallOptions{
-		GzipCompress:    true,
-		RetryAllMethods: true,
+		GzipCompress: true,
+		RetryPolicy:  retryAllMethods,
 	}
 	return pc.updateRESTCall(
 		ctx, "POST", getUpdatePath(update, "events/batch"),
@@ -1021,8 +1086,8 @@ func (pc *Client) RecordEngineEvents(
 
 // UpdateStackTags updates the stacks's tags, replacing all existing tags.
 func (pc *Client) UpdateStackTags(
-	ctx context.Context, stack StackIdentifier, tags map[apitype.StackTagName]string) error {
-
+	ctx context.Context, stack StackIdentifier, tags map[apitype.StackTagName]string,
+) error {
 	// Validate stack tags.
 	if err := validation.ValidateStackTags(tags); err != nil {
 		return err
@@ -1037,8 +1102,8 @@ func getDeploymentPath(stack StackIdentifier, components ...string) string {
 }
 
 func (pc *Client) CreateDeployment(ctx context.Context, stack StackIdentifier,
-	req apitype.CreateDeploymentRequest) (*apitype.CreateDeploymentResponse, error) {
-
+	req apitype.CreateDeploymentRequest,
+) (*apitype.CreateDeploymentResponse, error) {
 	var resp apitype.CreateDeploymentResponse
 	err := pc.restCall(ctx, http.MethodPost, getDeploymentPath(stack), nil, req, &resp)
 	if err != nil {
@@ -1048,8 +1113,8 @@ func (pc *Client) CreateDeployment(ctx context.Context, stack StackIdentifier,
 }
 
 func (pc *Client) GetDeploymentLogs(ctx context.Context, stack StackIdentifier, id,
-	token string) (*apitype.DeploymentLogs, error) {
-
+	token string,
+) (*apitype.DeploymentLogs, error) {
 	path := getDeploymentPath(stack, id, fmt.Sprintf("logs?continuationToken=%s", token))
 	var resp apitype.DeploymentLogs
 	err := pc.restCall(ctx, http.MethodGet, path, nil, nil, &resp)
@@ -1060,8 +1125,8 @@ func (pc *Client) GetDeploymentLogs(ctx context.Context, stack StackIdentifier, 
 }
 
 func (pc *Client) GetDeploymentUpdates(ctx context.Context, stack StackIdentifier,
-	id string) ([]apitype.GetDeploymentUpdatesUpdateInfo, error) {
-
+	id string,
+) ([]apitype.GetDeploymentUpdatesUpdateInfo, error) {
 	path := getDeploymentPath(stack, id, "updates")
 	var resp []apitype.GetDeploymentUpdatesUpdateInfo
 	err := pc.restCall(ctx, http.MethodGet, path, nil, nil, &resp)
@@ -1069,4 +1134,72 @@ func (pc *Client) GetDeploymentUpdates(ctx context.Context, stack StackIdentifie
 		return nil, fmt.Errorf("getting deployment %s updates failed: %w", id, err)
 	}
 	return resp, nil
+}
+
+func (pc *Client) GetCapabilities(ctx context.Context) (*apitype.CapabilitiesResponse, error) {
+	if pc.DisableCapabilityProbing {
+		return &apitype.CapabilitiesResponse{}, nil
+	}
+
+	var resp apitype.CapabilitiesResponse
+	err := pc.restCall(ctx, http.MethodGet, "/api/capabilities", nil, nil, &resp)
+	if is404(err) {
+		// The client continues to support legacy backends. They do not support /api/capabilities and are
+		// assumed here to have no additional capabilities.
+		return &apitype.CapabilitiesResponse{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying capabilities failed: %w", err)
+	}
+	return &resp, nil
+}
+
+func getSearchPath(orgName string) string {
+	return fmt.Sprintf("/api/orgs/%s/search/resources", url.PathEscape(orgName))
+}
+
+func getNaturalLanguageSearchPath(orgName string) string {
+	return fmt.Sprintf("/api/orgs/%s/search/resources/parse", url.PathEscape(orgName))
+}
+
+func getPulumiOrgSearchPath(baseURL string, orgName string) string {
+	return fmt.Sprintf("%s/%s/resources", baseURL, url.PathEscape(orgName))
+}
+
+// Pulumi Cloud Search Functions
+func (pc *Client) GetSearchQueryResults(
+	ctx context.Context, orgName string, queryParams *apitype.PulumiQueryRequest, baseURL string,
+) (*apitype.ResourceSearchResponse, error) {
+	var resp apitype.ResourceSearchResponse
+	err := pc.restCall(ctx, http.MethodGet, getSearchPath(orgName), queryParams, nil, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("querying search failed: %w", err)
+	}
+	resp.URL = fmt.Sprintf("%s?query=%s", getPulumiOrgSearchPath(baseURL, orgName), url.QueryEscape(queryParams.Query))
+	return &resp, nil
+}
+
+func (pc *Client) GetNaturalLanguageQueryResults(
+	ctx context.Context, orgName string, queryString string,
+) (*apitype.PulumiQueryResponse, error) {
+	var resp apitype.PulumiQueryResponse
+	queryParamObject := apitype.PulumiQueryRequest{
+		Query: queryString,
+	}
+	err := pc.restCall(ctx, http.MethodGet, getNaturalLanguageSearchPath(orgName), queryParamObject, nil, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("querying search failed: %w", err)
+	}
+	return &resp, nil
+}
+
+func is404(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errResp *apitype.ErrorResponse
+	if errors.As(err, &errResp) && errResp.Code == http.StatusNotFound {
+		return true
+	}
+	return false
 }

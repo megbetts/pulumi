@@ -2,15 +2,14 @@
     "name": "@pulumi/mypkg",
     "version": "${VERSION}",
     "scripts": {
-        "build": "tsc",
-        "install": "node scripts/install-pulumi-plugin.js resource mypkg ${VERSION}"
+        "build": "tsc"
     },
     "dependencies": {
         "@pulumi/pulumi": "^3.42.0"
     },
     "devDependencies": {
         "@types/mocha": "latest",
-        "@types/node": "latest",
+        "@types/node": "ts4.3",
         "mocha": "latest",
         "ts-node": "latest",
         "typescript": "^4.3.5"

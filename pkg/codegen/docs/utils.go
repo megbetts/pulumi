@@ -15,7 +15,7 @@
 // Pulling out some of the repeated strings tokens into constants would harm readability, so we just ignore the
 // goconst linter's warning.
 //
-// nolint: lll, goconst
+//nolint:lll, goconst
 package docs
 
 import (
@@ -24,6 +24,7 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/dotnet"
 	go_gen "github.com/pulumi/pulumi/pkg/v3/codegen/go"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
@@ -39,7 +40,7 @@ func isPythonTypeNameBoundary(prev rune, next rune) bool {
 
 // wbr inserts HTML <wbr> in between case changes, e.g. "fooBar" becomes "foo<wbr>Bar".
 func wbr(s string) string {
-	var runes []rune
+	runes := slice.Prealloc[rune](len(s))
 	var prev rune
 	for i, r := range s {
 		if i != 0 &&
@@ -83,7 +84,14 @@ func getModuleLink(name string) string {
 }
 
 func getResourceLink(name string) string {
-	return strings.ToLower(name)
+	link := strings.ToLower(name)
+	// Handle URL generation for resources named `index`. We prepend a double underscore
+	// here, since a link of .../<module>/index has trouble resolving and returns a 404 in
+	// the browser, likely due to `index` being some sort of reserved keyword.
+	if link == "index" {
+		return "--" + link
+	}
+	return link
 }
 
 func getFunctionLink(name string) string {

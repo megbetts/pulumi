@@ -16,6 +16,7 @@ package schema
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,9 @@ import (
 	"github.com/blang/semver"
 	"github.com/segmentio/encoding/json"
 
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -113,7 +117,7 @@ var ErrGetSchemaNotImplemented = getSchemaNotImplemented{}
 type getSchemaNotImplemented struct{}
 
 func (f getSchemaNotImplemented) Error() string {
-	return fmt.Sprintf("it looks like GetSchema is not implemented")
+	return "it looks like GetSchema is not implemented"
 }
 
 func schemaIsEmpty(schemaBytes []byte) bool {
@@ -174,7 +178,7 @@ func (l *pluginLoader) LoadPackageReference(pkg string, version *semver.Version)
 		}
 	}
 
-	p, err := importPartialSpec(spec, nil, l)
+	p, err := ImportPartialSpec(spec, nil, l)
 	if err != nil {
 		return nil, err
 	}
@@ -210,18 +214,37 @@ func LoadPackageReference(loader Loader, pkg string, version *semver.Version) (P
 }
 
 func (l *pluginLoader) loadSchemaBytes(pkg string, version *semver.Version) ([]byte, *semver.Version, error) {
-	err := l.host.InstallPlugin(workspace.PluginSpec{
-		Kind:    workspace.ResourcePlugin,
-		Name:    pkg,
-		Version: version,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
 	pluginInfo, err := l.host.ResolvePlugin(workspace.ResourcePlugin, pkg, version)
 	if err != nil {
-		return nil, nil, err
+		// Try and install the plugin if it was missing and try again, unless auto plugin installs are turned off.
+		if env.DisableAutomaticPluginAcquisition.Value() {
+			return nil, nil, err
+		}
+
+		var missingError *workspace.MissingError
+		if errors.As(err, &missingError) {
+			spec := workspace.PluginSpec{
+				Kind:    workspace.ResourcePlugin,
+				Name:    pkg,
+				Version: version,
+			}
+
+			log := func(sev diag.Severity, msg string) {
+				l.host.Log(sev, "", msg, 0)
+			}
+
+			_, err = pkgWorkspace.InstallPlugin(spec, log)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			pluginInfo, err = l.host.ResolvePlugin(workspace.ResourcePlugin, pkg, version)
+			if err != nil {
+				return nil, version, err
+			}
+		} else {
+			return nil, nil, err
+		}
 	}
 	contract.Assertf(pluginInfo != nil, "loading pkg %q: pluginInfo was unexpectedly nil", pkg)
 
@@ -249,10 +272,7 @@ func (l *pluginLoader) loadSchemaBytes(pkg string, version *semver.Version) ([]b
 	}
 
 	if version == nil {
-		info, err := provider.GetPluginInfo()
-		if err != nil {
-			// Nonfatal
-		}
+		info, _ := provider.GetPluginInfo() // nonfatal error
 		version = info.Version
 	}
 
@@ -264,7 +284,7 @@ func (l *pluginLoader) loadPluginSchemaBytes(pkg string, version *semver.Version
 	if err != nil {
 		return nil, nil, err
 	}
-	contract.Assert(provider != nil)
+	contract.Assertf(provider != nil, "unexpected nil provider for %s@%v", pkg, version)
 
 	schemaFormatVersion := 0
 	schemaBytes, err := provider.GetSchema(schemaFormatVersion)
@@ -287,7 +307,7 @@ func (l *pluginLoader) loadCachedSchemaBytes(pkg string, path string, schemaTime
 	}
 
 	success := false
-	schemaFile, err := os.OpenFile(path, os.O_RDONLY, 0644)
+	schemaFile, err := os.OpenFile(path, os.O_RDONLY, 0o644)
 	defer func() {
 		if !success {
 			schemaFile.Close()

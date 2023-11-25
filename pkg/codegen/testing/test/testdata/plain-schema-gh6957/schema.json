@@ -41,15 +41,13 @@
   "language": {
     "csharp": {
       "packageReferences": {
+        "Pulumi": "3.26.1",
         "Pulumi.Aws": "4.*"
-      },
-      "projectReferences": [
-        "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-      ]
+      }
     },
     "go": {
       "generateResourceContainerTypes": true,
-      "importBasePath": "github.com/pulumi/pulumi-xyz/sdk/go/xyz",
+      "importBasePath": "plain-schema-gh6957/xyz",
       "generateExtraInputTypes": true
     },
     "nodejs": {

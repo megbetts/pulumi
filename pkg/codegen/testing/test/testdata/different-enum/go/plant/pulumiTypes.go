@@ -7,8 +7,11 @@ import (
 	"context"
 	"reflect"
 
+	"different-enum/plant/internal"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
+
+var _ = internal.GetEnvOrDefault
 
 type Container struct {
 	Brightness *ContainerBrightness `pulumi:"brightness"`
@@ -23,7 +26,7 @@ func (val *Container) Defaults() *Container {
 		return nil
 	}
 	tmp := *val
-	if isZero(tmp.Brightness) {
+	if tmp.Brightness == nil {
 		brightness_ := ContainerBrightness(1.0)
 		tmp.Brightness = &brightness_
 	}
@@ -54,7 +57,7 @@ func (val *ContainerArgs) Defaults() *ContainerArgs {
 		return nil
 	}
 	tmp := *val
-	if isZero(tmp.Brightness) {
+	if tmp.Brightness == nil {
 		tmp.Brightness = ContainerBrightness(1.0)
 	}
 	return &tmp

@@ -19,6 +19,8 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+
+	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model/pretty"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
 )
 
@@ -36,6 +38,32 @@ func NewListType(elementType Type) *ListType {
 // SyntaxNode returns the syntax node for the type. This is always syntax.None.
 func (*ListType) SyntaxNode() hclsyntax.Node {
 	return syntax.None
+}
+
+func (t *ListType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
+	if existingFormatter, ok := seenFormatters[t]; ok {
+		return existingFormatter
+	}
+
+	var formatter pretty.Formatter
+	if seenFormatter, ok := seenFormatters[t.ElementType]; ok {
+		formatter = seenFormatter
+	} else {
+		formatter = t.ElementType.pretty(seenFormatters)
+	}
+
+	seenFormatters[t] = &pretty.Wrap{
+		Prefix:  "list(",
+		Postfix: ")",
+		Value:   formatter,
+	}
+
+	return seenFormatters[t]
+}
+
+func (t *ListType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 // Traverse attempts to traverse the optional type with the given traverser. The result type of traverse(list(T))

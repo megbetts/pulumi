@@ -23,6 +23,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 )
 
@@ -64,7 +65,7 @@ func newStackTagGetCmd(stack *string) *cobra.Command {
 			opts := display.Options{
 				Color: cmdutil.GetGlobalColorization(),
 			}
-			s, err := requireStack(ctx, *stack, false, opts, false /*setCurrent*/)
+			s, err := requireStack(ctx, *stack, stackLoadOnly, opts)
 			if err != nil {
 				return err
 			}
@@ -97,7 +98,7 @@ func newStackTagLsCmd(stack *string) *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			s, err := requireStack(ctx, *stack, false, opts, true /*setCurrent*/)
+			s, err := requireStack(ctx, *stack, stackSetCurrent, opts)
 			if err != nil {
 				return err
 			}
@@ -125,21 +126,21 @@ func newStackTagLsCmd(stack *string) *cobra.Command {
 }
 
 func printStackTags(tags map[apitype.StackTagName]string) {
-	var names []string
+	names := slice.Prealloc[string](len(tags))
 	for n := range tags {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 
-	rows := []cmdutil.TableRow{}
+	rows := slice.Prealloc[cmdutil.TableRow](len(names))
 	for _, name := range names {
 		rows = append(rows, cmdutil.TableRow{Columns: []string{name, tags[name]}})
 	}
 
-	cmdutil.PrintTable(cmdutil.Table{
+	printTable(cmdutil.Table{
 		Headers: []string{"NAME", "VALUE"},
 		Rows:    rows,
-	})
+	}, nil)
 }
 
 func newStackTagRmCmd(stack *string) *cobra.Command {
@@ -154,7 +155,7 @@ func newStackTagRmCmd(stack *string) *cobra.Command {
 			opts := display.Options{
 				Color: cmdutil.GetGlobalColorization(),
 			}
-			s, err := requireStack(ctx, *stack, false, opts, true /*setCurrent*/)
+			s, err := requireStack(ctx, *stack, stackSetCurrent, opts)
 			if err != nil {
 				return err
 			}
@@ -185,7 +186,7 @@ func newStackTagSetCmd(stack *string) *cobra.Command {
 			opts := display.Options{
 				Color: cmdutil.GetGlobalColorization(),
 			}
-			s, err := requireStack(ctx, *stack, false, opts, true /*setCurrent*/)
+			s, err := requireStack(ctx, *stack, stackSetCurrent, opts)
 			if err != nil {
 				return err
 			}

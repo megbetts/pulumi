@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"reflect"
 	"strings"
 
@@ -30,6 +29,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype/migrate"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/santhosh-tekuri/jsonschema/v5"
 )
@@ -58,9 +58,10 @@ var (
 	ErrDeploymentSchemaVersionTooNew = fmt.Errorf("this stack's deployment version is too new")
 )
 
-var deploymentSchema *jsonschema.Schema
-var resourceSchema *jsonschema.Schema
-var propertyValueSchema *jsonschema.Schema
+var (
+	deploymentSchema    *jsonschema.Schema
+	propertyValueSchema *jsonschema.Schema
+)
 
 func init() {
 	compiler := jsonschema.NewCompiler()
@@ -76,10 +77,9 @@ func init() {
 		default:
 			return jsonschema.LoadURL(s)
 		}
-		return ioutil.NopCloser(strings.NewReader(schema)), nil
+		return io.NopCloser(strings.NewReader(schema)), nil
 	}
 	deploymentSchema = compiler.MustCompile(apitype.DeploymentSchemaID)
-	resourceSchema = compiler.MustCompile(apitype.ResourceSchemaID)
 	propertyValueSchema = compiler.MustCompile(apitype.PropertyValueSchemaID)
 }
 
@@ -100,7 +100,7 @@ func ValidateUntypedDeployment(deployment *apitype.UntypedDeployment) error {
 
 // SerializeDeployment serializes an entire snapshot as a deploy record.
 func SerializeDeployment(snap *deploy.Snapshot, sm secrets.Manager, showSecrets bool) (*apitype.DeploymentV3, error) {
-	contract.Require(snap != nil, "snap")
+	contract.Requiref(snap != nil, "snap", "must not be nil")
 
 	// Capture the version information into a manifest.
 	manifest := snap.Manifest.Serialize()
@@ -122,7 +122,7 @@ func SerializeDeployment(snap *deploy.Snapshot, sm secrets.Manager, showSecrets 
 	}
 
 	// Serialize all vertices and only include a vertex section if non-empty.
-	var resources []apitype.ResourceV3
+	resources := slice.Prealloc[apitype.ResourceV3](len(snap.Resources))
 	for _, res := range snap.Resources {
 		sres, err := SerializeResource(res, enc, showSecrets)
 		if err != nil {
@@ -131,7 +131,7 @@ func SerializeDeployment(snap *deploy.Snapshot, sm secrets.Manager, showSecrets 
 		resources = append(resources, sres)
 	}
 
-	var operations []apitype.OperationV2
+	operations := slice.Prealloc[apitype.OperationV2](len(snap.PendingOperations))
 	for _, op := range snap.PendingOperations {
 		sop, err := SerializeOperation(op, enc, showSecrets)
 		if err != nil {
@@ -143,14 +143,8 @@ func SerializeDeployment(snap *deploy.Snapshot, sm secrets.Manager, showSecrets 
 	var secretsProvider *apitype.SecretsProvidersV1
 	if sm != nil {
 		secretsProvider = &apitype.SecretsProvidersV1{
-			Type: sm.Type(),
-		}
-		if state := sm.State(); state != nil {
-			rm, err := json.Marshal(state)
-			if err != nil {
-				return nil, err
-			}
-			secretsProvider.State = rm
+			Type:  sm.Type(),
+			State: sm.State(),
 		}
 	}
 
@@ -162,15 +156,12 @@ func SerializeDeployment(snap *deploy.Snapshot, sm secrets.Manager, showSecrets 
 	}, nil
 }
 
-// DeserializeUntypedDeployment deserializes an untyped deployment and produces a `deploy.Snapshot`
-// from it. DeserializeDeployment will return an error if the untyped deployment's version is
-// not within the range `DeploymentSchemaVersionCurrent` and `DeploymentSchemaVersionOldestSupported`.
-func DeserializeUntypedDeployment(
+// UnmarshalUntypedDeployment unmarshals a raw untyped deployment into an up to date deployment object.
+func UnmarshalUntypedDeployment(
 	ctx context.Context,
 	deployment *apitype.UntypedDeployment,
-	secretsProv SecretsProvider) (*deploy.Snapshot, error) {
-
-	contract.Require(deployment != nil, "deployment")
+) (*apitype.DeploymentV3, error) {
+	contract.Requiref(deployment != nil, "deployment", "must not be nil")
 	switch {
 	case deployment.Version > apitype.DeploymentSchemaVersionCurrent:
 		return nil, ErrDeploymentSchemaVersionTooNew
@@ -201,15 +192,30 @@ func DeserializeUntypedDeployment(
 		contract.Failf("unrecognized version: %d", deployment.Version)
 	}
 
-	return DeserializeDeploymentV3(ctx, v3deployment, secretsProv)
+	return &v3deployment, nil
+}
+
+// DeserializeUntypedDeployment deserializes an untyped deployment and produces a `deploy.Snapshot`
+// from it. DeserializeDeployment will return an error if the untyped deployment's version is
+// not within the range `DeploymentSchemaVersionCurrent` and `DeploymentSchemaVersionOldestSupported`.
+func DeserializeUntypedDeployment(
+	ctx context.Context,
+	deployment *apitype.UntypedDeployment,
+	secretsProv secrets.Provider,
+) (*deploy.Snapshot, error) {
+	v3deployment, err := UnmarshalUntypedDeployment(ctx, deployment)
+	if err != nil {
+		return nil, err
+	}
+	return DeserializeDeploymentV3(ctx, *v3deployment, secretsProv)
 }
 
 // DeserializeDeploymentV3 deserializes a typed DeploymentV3 into a `deploy.Snapshot`.
 func DeserializeDeploymentV3(
 	ctx context.Context,
 	deployment apitype.DeploymentV3,
-	secretsProv SecretsProvider) (*deploy.Snapshot, error) {
-
+	secretsProv secrets.Provider,
+) (*deploy.Snapshot, error) {
 	// Unpack the versions.
 	manifest, err := deploy.DeserializeManifest(deployment.Manifest)
 	if err != nil {
@@ -265,7 +271,7 @@ func DeserializeDeploymentV3(
 	}
 
 	// For every serialized resource vertex, create a ResourceDeployment out of it.
-	var resources []*resource.State
+	resources := slice.Prealloc[*resource.State](len(deployment.Resources))
 	for _, res := range deployment.Resources {
 		desres, err := DeserializeResource(res, dec, enc)
 		if err != nil {
@@ -274,7 +280,7 @@ func DeserializeDeploymentV3(
 		resources = append(resources, desres)
 	}
 
-	var ops []resource.Operation
+	ops := slice.Prealloc[resource.Operation](len(deployment.PendingOperations))
 	for _, op := range deployment.PendingOperations {
 		desop, err := DeserializeOperation(op, dec, enc)
 		if err != nil {
@@ -288,8 +294,8 @@ func DeserializeDeploymentV3(
 
 // SerializeResource turns a resource into a structure suitable for serialization.
 func SerializeResource(res *resource.State, enc config.Encrypter, showSecrets bool) (apitype.ResourceV3, error) {
-	contract.Assert(res != nil)
-	contract.Assertf(string(res.URN) != "", "Unexpected empty resource resource.URN")
+	contract.Requiref(res != nil, "res", "must not be nil")
+	contract.Requiref(res.URN != "", "res", "must have a URN")
 
 	// Serialize all input and output properties recursively, and add them if non-empty.
 	var inputs map[string]interface{}
@@ -330,6 +336,9 @@ func SerializeResource(res *resource.State, enc config.Encrypter, showSecrets bo
 		ImportID:                res.ImportID,
 		RetainOnDelete:          res.RetainOnDelete,
 		DeletedWith:             res.DeletedWith,
+		Created:                 res.Created,
+		Modified:                res.Modified,
+		SourcePosition:          res.SourcePosition,
 	}
 
 	if res.CustomTimeouts.IsNotEmpty() {
@@ -339,6 +348,7 @@ func SerializeResource(res *resource.State, enc config.Encrypter, showSecrets bo
 	return v3Resource, nil
 }
 
+// SerializeOperation serializes a resource in a pending state.
 func SerializeOperation(op resource.Operation, enc config.Encrypter, showSecrets bool) (apitype.OperationV2, error) {
 	res, err := SerializeResource(op.Resource, enc, showSecrets)
 	if err != nil {
@@ -352,7 +362,8 @@ func SerializeOperation(op resource.Operation, enc config.Encrypter, showSecrets
 
 // SerializeProperties serializes a resource property bag so that it's suitable for serialization.
 func SerializeProperties(props resource.PropertyMap, enc config.Encrypter,
-	showSecrets bool) (map[string]interface{}, error) {
+	showSecrets bool,
+) (map[string]interface{}, error) {
 	dst := make(map[string]interface{})
 	for _, k := range props.StableKeys() {
 		v, err := SerializePropertyValue(props[k], enc, showSecrets)
@@ -366,7 +377,8 @@ func SerializeProperties(props resource.PropertyMap, enc config.Encrypter,
 
 // SerializePropertyValue serializes a resource property value so that it's suitable for serialization.
 func SerializePropertyValue(prop resource.PropertyValue, enc config.Encrypter,
-	showSecrets bool) (interface{}, error) {
+	showSecrets bool,
+) (interface{}, error) {
 	ctx := context.TODO()
 
 	// Serialize nulls as nil.
@@ -513,11 +525,13 @@ func DeserializeResource(res apitype.ResourceV3, dec config.Decrypter, enc confi
 		res.Type, res.URN, res.Custom, res.Delete, res.ID,
 		inputs, outputs, res.Parent, res.Protect, res.External, res.Dependencies, res.InitErrors, res.Provider,
 		res.PropertyDependencies, res.PendingReplacement, res.AdditionalSecretOutputs, res.Aliases, res.CustomTimeouts,
-		res.ImportID, res.RetainOnDelete, res.DeletedWith), nil
+		res.ImportID, res.RetainOnDelete, res.DeletedWith, res.Created, res.Modified, res.SourcePosition), nil
 }
 
+// DeserializeOperation hydrates a pending resource/operation pair.
 func DeserializeOperation(op apitype.OperationV2, dec config.Decrypter,
-	enc config.Encrypter) (resource.Operation, error) {
+	enc config.Encrypter,
+) (resource.Operation, error) {
 	res, err := DeserializeResource(op.Resource, dec, enc)
 	if err != nil {
 		return resource.Operation{}, err
@@ -527,7 +541,8 @@ func DeserializeOperation(op apitype.OperationV2, dec config.Decrypter,
 
 // DeserializeProperties deserializes an entire map of deploy properties into a resource property map.
 func DeserializeProperties(props map[string]interface{}, dec config.Decrypter,
-	enc config.Encrypter) (resource.PropertyMap, error) {
+	enc config.Encrypter,
+) (resource.PropertyMap, error) {
 	result := make(resource.PropertyMap)
 	for k, prop := range props {
 		desprop, err := DeserializePropertyValue(prop, dec, enc)
@@ -541,7 +556,8 @@ func DeserializeProperties(props map[string]interface{}, dec config.Decrypter,
 
 // DeserializePropertyValue deserializes a single deploy property into a resource property value.
 func DeserializePropertyValue(v interface{}, dec config.Decrypter,
-	enc config.Encrypter) (resource.PropertyValue, error) {
+	enc config.Encrypter,
+) (resource.PropertyValue, error) {
 	ctx := context.TODO()
 	if v != nil {
 		switch w := v.(type) {
@@ -579,14 +595,14 @@ func DeserializePropertyValue(v interface{}, dec config.Decrypter,
 					if err != nil {
 						return resource.PropertyValue{}, err
 					}
-					contract.Assert(isasset)
+					contract.Assertf(isasset, "resource with asset signature is not an asset")
 					return resource.NewAssetProperty(asset), nil
 				case resource.ArchiveSig:
 					archive, isarchive, err := resource.DeserializeArchive(objmap)
 					if err != nil {
 						return resource.PropertyValue{}, err
 					}
-					contract.Assert(isarchive)
+					contract.Assertf(isarchive, "resource with archive signature is not an archive")
 					return resource.NewArchiveProperty(archive), nil
 				case resource.SecretSig:
 					ciphertext, cipherOk := objmap["ciphertext"].(string)

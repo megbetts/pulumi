@@ -19,8 +19,7 @@
 // the update successfully completes.
 import { OpMap, OpType } from "./stack";
 
-export interface CancelEvent {
-}
+export type CancelEvent = {};
 
 // StdoutEngineEvent is emitted whenever a generic message is written, for example warnings
 // from the pulumi CLI itself. Less common than DiagnosticEvent
@@ -141,6 +140,8 @@ export interface StepEventStateMetadata {
     parent: string;
     // Protect is true to "protect" this resource (protected resources cannot be deleted).
     protect?: boolean;
+    // RetainOnDelete is true if the resource is not physically deleted when it is logically deleted.
+    retainOnDelete?: boolean;
     // Inputs contains the resource's input properties (as specified by the program). Secrets have
     // filtered out, and large assets have been replaced by hashes as applicable.
     inputs: Record<string, any>;

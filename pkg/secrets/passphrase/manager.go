@@ -33,6 +33,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 const Type = "passphrase"
@@ -70,7 +71,7 @@ func symmetricCrypterFromPhraseAndState(phrase string, state string) (config.Cry
 }
 
 func indexN(s string, substr string, n int) int {
-	contract.Require(n > 0, "n")
+	contract.Requiref(n > 0, "n", "must be greater than 0")
 	scratch := s
 
 	for i := n; i > 0; i-- {
@@ -92,7 +93,7 @@ type localSecretsManagerState struct {
 var _ secrets.Manager = &localSecretsManager{}
 
 type localSecretsManager struct {
-	state   localSecretsManagerState
+	state   json.RawMessage
 	crypter config.Crypter
 }
 
@@ -100,22 +101,37 @@ func (sm *localSecretsManager) Type() string {
 	return Type
 }
 
-func (sm *localSecretsManager) State() interface{} {
+func (sm *localSecretsManager) State() json.RawMessage {
 	return sm.state
 }
 
 func (sm *localSecretsManager) Decrypter() (config.Decrypter, error) {
-	contract.Assert(sm.crypter != nil)
+	contract.Assertf(sm.crypter != nil, "decrypter not initialized")
 	return sm.crypter, nil
 }
 
 func (sm *localSecretsManager) Encrypter() (config.Encrypter, error) {
-	contract.Assert(sm.crypter != nil)
+	contract.Assertf(sm.crypter != nil, "encrypter not initialized")
 	return sm.crypter, nil
 }
 
-var lock sync.Mutex
-var cache map[string]secrets.Manager
+func EditProjectStack(info *workspace.ProjectStack, state json.RawMessage) error {
+	info.EncryptedKey = ""
+	info.SecretsProvider = ""
+
+	var s localSecretsManagerState
+	err := json.Unmarshal(state, &s)
+	if err != nil {
+		return fmt.Errorf("unmarshalling passphrase state: %w", err)
+	}
+	info.EncryptionSalt = s.Salt
+	return nil
+}
+
+var (
+	lock  sync.Mutex
+	cache map[string]secrets.Manager
+)
 
 // clearCachedSecretsManagers is used to clear the cache, for tests.
 func clearCachedSecretsManagers() {
@@ -142,7 +158,37 @@ func setCachedSecretsManager(state string, sm secrets.Manager) {
 	cache[state] = sm
 }
 
-func NewPassphaseSecretsManager(phrase string, state string) (secrets.Manager, error) {
+func NewPassphraseSecretsManager(phrase string) (string, secrets.Manager, error) {
+	// Produce a new salt.
+	salt := make([]byte, 8)
+	_, err := cryptorand.Read(salt)
+	contract.AssertNoErrorf(err, "could not read from system random")
+
+	// Encrypt a message and store it with the salt so we can test if the password is correct later.
+	crypter := config.NewSymmetricCrypterFromPassphrase(phrase, salt)
+
+	// symmetricCrypter does not use ctx, safe to use context.Background()
+	ignoredCtx := context.Background()
+	msg, err := crypter.EncryptValue(ignoredCtx, "pulumi")
+	contract.AssertNoErrorf(err, "could not encrypt message")
+
+	// Encode the salt as the passphrase secrets manager state.
+	state := fmt.Sprintf("v1:%s:%s", base64.StdEncoding.EncodeToString(salt), msg)
+	jsonState, err := json.Marshal(localSecretsManagerState{
+		Salt: state,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("marshalling state: %w", err)
+	}
+
+	sm := &localSecretsManager{
+		crypter: crypter,
+		state:   jsonState,
+	}
+	return state, sm, nil
+}
+
+func GetPassphraseSecretsManager(phrase string, state string) (secrets.Manager, error) {
 	// Check the cache first, if we have already seen this state before, return a cached value.
 	if cached, ok := getCachedSecretsManager(state); ok {
 		return cached, nil
@@ -153,20 +199,26 @@ func NewPassphaseSecretsManager(phrase string, state string) (secrets.Manager, e
 	if err != nil {
 		return nil, err
 	}
+
+	jsonState, err := json.Marshal(localSecretsManagerState{
+		Salt: state,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshalling state: %w", err)
+	}
+
 	sm := &localSecretsManager{
 		crypter: crypter,
-		state: localSecretsManagerState{
-			Salt: state,
-		},
+		state:   jsonState,
 	}
 	setCachedSecretsManager(state, sm)
 	return sm, nil
 }
 
-// NewPromptingPassphraseSecretsManager returns a new passphrase-based secrets manager, from the
+// newPromptingPassphraseSecretsManagerFromState returns a new passphrase-based secrets manager, from the
 // given state. Will use the passphrase found in PULUMI_CONFIG_PASSPHRASE, the file specified by
 // PULUMI_CONFIG_PASSPHRASE_FILE, or otherwise will prompt for the passphrase if interactive.
-func NewPromptingPassphraseSecretsManager(state string) (secrets.Manager, error) {
+func newPromptingPassphraseSecretsManagerFromState(state string) (secrets.Manager, error) {
 	// Check the cache first, if we have already seen this state before, return a cached value.
 	if cached, ok := getCachedSecretsManager(state); ok {
 		return cached, nil
@@ -181,7 +233,7 @@ func NewPromptingPassphraseSecretsManager(state string) (secrets.Manager, error)
 			return nil, phraseErr
 		}
 
-		sm, smerr := NewPassphaseSecretsManager(phrase, state)
+		sm, smerr := GetPassphraseSecretsManager(phrase, state)
 		switch {
 		case interactive && smerr == ErrIncorrectPassphrase:
 			cmdutil.Diag().Errorf(diag.Message("", "incorrect passphrase"))
@@ -194,19 +246,19 @@ func NewPromptingPassphraseSecretsManager(state string) (secrets.Manager, error)
 	}
 }
 
-// NewPassphaseSecretsManagerFromState returns a new passphrase-based secrets manager, from the
+// NewPassphraseSecretsManager returns a new passphrase-based secrets manager, from the
 // given state. Will use the passphrase found in PULUMI_CONFIG_PASSPHRASE, the file specified by
 // PULUMI_CONFIG_PASSPHRASE_FILE, or otherwise will prompt for the passphrase if interactive.
-func NewPromptingPassphaseSecretsManagerFromState(state json.RawMessage) (secrets.Manager, error) {
+func NewPromptingPassphraseSecretsManagerFromState(state json.RawMessage) (secrets.Manager, error) {
 	var s localSecretsManagerState
 	if err := json.Unmarshal(state, &s); err != nil {
 		return nil, fmt.Errorf("unmarshalling state: %w", err)
 	}
 
-	sm, err := NewPromptingPassphraseSecretsManager(s.Salt)
+	sm, err := newPromptingPassphraseSecretsManagerFromState(s.Salt)
 	switch {
 	case err == ErrIncorrectPassphrase:
-		return newLockedPasspharseSecretsManager(s), nil
+		return newLockedPasspharseSecretsManager(state), nil
 	case err != nil:
 		return nil, fmt.Errorf("constructing secrets manager: %w", err)
 	default:
@@ -214,8 +266,38 @@ func NewPromptingPassphaseSecretsManagerFromState(state json.RawMessage) (secret
 	}
 }
 
-// PromptForNewPassphrase prompts for a new passphrase, and returns the state and the secrets manager.
-func PromptForNewPassphrase(rotate bool) (string, secrets.Manager, error) {
+func NewPromptingPassphraseSecretsManager(info *workspace.ProjectStack,
+	rotateSecretsProvider bool,
+) (secrets.Manager, error) {
+	if rotateSecretsProvider {
+		info.EncryptionSalt = ""
+	}
+
+	// If there are any other secrets providers set in the config, remove them, as the passphrase
+	// provider deals only with EncryptionSalt, not EncryptedKey or SecretsProvider.
+	info.EncryptedKey = ""
+	info.SecretsProvider = ""
+
+	// If we have a salt, we can just use it.
+	if info.EncryptionSalt != "" {
+		return newPromptingPassphraseSecretsManagerFromState(info.EncryptionSalt)
+	}
+
+	// Otherwise, prompt the user for a new passphrase.
+	state, sm, err := promptForNewPassphrase(rotateSecretsProvider)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store the salt and save it.
+	info.EncryptionSalt = state
+
+	// Return the passphrase secrets manager.
+	return sm, nil
+}
+
+// promptForNewPassphrase prompts for a new passphrase, and returns the state and the secrets manager.
+func promptForNewPassphrase(rotate bool) (string, secrets.Manager, error) {
 	var phrase string
 
 	// Get a the passphrase from the user, ensuring that they match.
@@ -253,30 +335,12 @@ func PromptForNewPassphrase(rotate bool) (string, secrets.Manager, error) {
 		cmdutil.Diag().Errorf(diag.Message("", "passphrases do not match"))
 	}
 
-	// Produce a new salt.
-	salt := make([]byte, 8)
-	_, err := cryptorand.Read(salt)
-	contract.AssertNoErrorf(err, "could not read from system random")
-
-	// Encrypt a message and store it with the salt so we can test if the password is correct later.
-	crypter := config.NewSymmetricCrypterFromPassphrase(phrase, salt)
-
-	// symmetricCrypter does not use ctx, safe to use context.Background()
-	ignoredCtx := context.Background()
-	msg, err := crypter.EncryptValue(ignoredCtx, "pulumi")
-	contract.AssertNoError(err)
-
-	// Encode the salt as the passphrase secrets manager state.
-	state := fmt.Sprintf("v1:%s:%s", base64.StdEncoding.EncodeToString(salt), msg)
-
-	// Create the secrets manager using the state.
-	sm, err := NewPassphaseSecretsManager(phrase, state)
+	state, sm, err := NewPassphraseSecretsManager(phrase)
 	if err != nil {
 		return "", nil, err
 	}
-
-	// Return both the state and the secrets manager.
-	return state, sm, nil
+	setCachedSecretsManager(state, sm)
+	return state, sm, err
 }
 
 func readPassphrase(prompt string, useEnv bool) (phrase string, interactive bool, err error) {
@@ -314,7 +378,7 @@ func isInteractive() bool {
 // checkpoints and we'd like to continue to support these operations even if we don't have the correct passphrase. But
 // if we never end up having to call encrypt or decrypt, this provider will be sufficient.  Since it has the correct
 // state, we ensure that when we roundtrip, we don't lose the state stored in the deployment.
-func newLockedPasspharseSecretsManager(state localSecretsManagerState) secrets.Manager {
+func newLockedPasspharseSecretsManager(state json.RawMessage) secrets.Manager {
 	return &localSecretsManager{
 		state:   state,
 		crypter: &errorCrypter{},

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (python || all) && !smoke
+//go:build (python || all) && !xplatform_acceptance
 
 package ints
 
@@ -27,6 +27,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	pygen "github.com/pulumi/pulumi/pkg/v3/codegen/python"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
@@ -117,6 +118,34 @@ func TestConfigBasicPython(t *testing.T) {
 			{Key: "a.b[1].c", Value: "false", Path: true},
 			{Key: "tokens[0]", Value: "shh", Path: true, Secret: true},
 			{Key: "foo.bar", Value: "don't tell", Path: true, Secret: true},
+		},
+	})
+}
+
+// Tests configuration error from the perspective of a Pulumi program.
+func TestConfigMissingPython(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("config_missing", "python"),
+		Dependencies: []string{
+			filepath.Join("..", "..", "sdk", "python", "env", "src"),
+		},
+		Quick:         true,
+		ExpectFailure: true,
+		ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
+			assert.NotEmpty(t, stackInfo.Events)
+			text1 := "Missing required configuration variable 'config_missing_py:notFound'"
+			text2 := "\tplease set a value using the command `pulumi config set --secret config_missing_py:notFound <value>`"
+			var found1, found2 bool
+			for _, event := range stackInfo.Events {
+				if event.DiagnosticEvent != nil && strings.Contains(event.DiagnosticEvent.Message, text1) {
+					found1 = true
+				}
+				if event.DiagnosticEvent != nil && strings.Contains(event.DiagnosticEvent.Message, text2) {
+					found2 = true
+				}
+			}
+			assert.True(t, found1, "expected error %q", text1)
+			assert.True(t, found2, "expected error %q", text2)
 		},
 	})
 }
@@ -474,13 +503,13 @@ func TestPythonResourceArgs(t *testing.T) {
 	assert.NoError(t, os.RemoveAll(outdir))
 	for f, contents := range files {
 		outfile := filepath.Join(outdir, f)
-		assert.NoError(t, os.MkdirAll(filepath.Dir(outfile), 0755))
+		assert.NoError(t, os.MkdirAll(filepath.Dir(outfile), 0o755))
 		if outfile == filepath.Join(outdir, "setup.py") {
 			contents = []byte(strings.ReplaceAll(string(contents), "${VERSION}", "0.0.1"))
 		}
-		assert.NoError(t, os.WriteFile(outfile, contents, 0600))
+		assert.NoError(t, os.WriteFile(outfile, contents, 0o600))
 	}
-	assert.NoError(t, os.WriteFile(filepath.Join(outdir, "README.md"), []byte(""), 0600))
+	assert.NoError(t, os.WriteFile(filepath.Join(outdir, "README.md"), []byte(""), 0o600))
 
 	// Test the program.
 	integration.ProgramTest(t, &integration.ProgramTestOptions{
@@ -618,11 +647,9 @@ func TestConstructPlainPython(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.componentDir, func(t *testing.T) {
-			localProviders :=
-				[]integration.LocalDependency{
-					{Package: "testprovider", Path: buildTestProvider(t, filepath.Join("..", "testprovider"))},
-					{Package: "testcomponent", Path: filepath.Join(testDir, test.componentDir)},
-				}
+			localProviders := []integration.LocalDependency{
+				{Package: "testcomponent", Path: filepath.Join(testDir, test.componentDir)},
+			}
 			integration.ProgramTest(t,
 				optsForConstructPlainPython(t, test.expectedResourceCount, localProviders, test.env...))
 		})
@@ -630,7 +657,8 @@ func TestConstructPlainPython(t *testing.T) {
 }
 
 func optsForConstructPlainPython(t *testing.T, expectedResourceCount int, localProviders []integration.LocalDependency,
-	env ...string) *integration.ProgramTestOptions {
+	env ...string,
+) *integration.ProgramTestOptions {
 	return &integration.ProgramTestOptions{
 		Env: env,
 		Dir: filepath.Join("construct_component_plain", "python"),
@@ -702,6 +730,10 @@ func TestConstructMethodsResourcesPython(t *testing.T) {
 
 func TestConstructMethodsErrorsPython(t *testing.T) {
 	testConstructMethodsErrors(t, "python", filepath.Join("..", "..", "sdk", "python", "env", "src"))
+}
+
+func TestConstructMethodsProviderPython(t *testing.T) {
+	testConstructMethodsProvider(t, "python", filepath.Join("..", "..", "sdk", "python", "env", "src"))
 }
 
 func TestConstructProviderPython(t *testing.T) {
@@ -964,6 +996,12 @@ func TestPythonTranslation(t *testing.T) {
 }
 
 func TestComponentProviderSchemaPython(t *testing.T) {
+	// TODO[https://github.com/pulumi/pulumi/issues/12365] we no longer have shim files so there's no native
+	// binary for the testComponentProviderSchema to just exec. It _ought_ to be rewritten to use the plugin
+	// host framework so that it starts the component up the same as all the other tests are doing (via
+	// shimless).
+	t.Skip("testComponentProviderSchema needs to be updated to use a plugin host to deal with non-native-binary providers")
+
 	path := filepath.Join("component_provider_schema", "testcomponent-python", "pulumi-resource-testcomponent")
 	if runtime.GOOS == WindowsOS {
 		path += ".cmd"
@@ -993,4 +1031,82 @@ func TestAboutPython(t *testing.T) {
 
 func TestConstructOutputValuesPython(t *testing.T) {
 	testConstructOutputValues(t, "python", filepath.Join("..", "..", "sdk", "python", "env", "src"))
+}
+
+// TestResourceRefsGetResourcePython tests that invoking the built-in 'pulumi:pulumi:getResource' function
+// returns resource references for any resource reference in a resource's state.
+func TestResourceRefsGetResourcePython(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("resource_refs_get_resource", "python"),
+		Dependencies: []string{
+			filepath.Join("..", "..", "sdk", "python", "env", "src"),
+		},
+		Quick: true,
+	})
+}
+
+// TestDeletedWithPython tests the DeletedWith resource option.
+func TestDeletedWithPython(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("deleted_with", "python"),
+		Dependencies: []string{
+			filepath.Join("..", "..", "sdk", "python", "env", "src"),
+		},
+		LocalProviders: []integration.LocalDependency{
+			{Package: "testprovider", Path: filepath.Join("..", "testprovider")},
+		},
+		Quick: true,
+	})
+}
+
+func TestConstructProviderPropagationPython(t *testing.T) {
+	t.Parallel()
+
+	testConstructProviderPropagation(t, "python", []string{
+		filepath.Join("..", "..", "sdk", "python", "env", "src"),
+	})
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/9411
+func TestDuplicateOutputPython(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("python", "duplicate-output"),
+		Dependencies: []string{
+			filepath.Join("..", "..", "sdk", "python", "env", "src"),
+		},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			expected := []interface{}{float64(1), float64(2)}
+			assert.Equal(t, expected, stack.Outputs["export1"])
+			assert.Equal(t, expected, stack.Outputs["export2"])
+		},
+	})
+}
+
+func TestConstructProviderExplicitPython(t *testing.T) {
+	t.Parallel()
+
+	testConstructProviderExplicit(t, "python", []string{
+		filepath.Join("..", "..", "sdk", "python", "env", "src"),
+	})
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/13551
+func TestFailsOnImplicitDependencyCyclesPython(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	pt := integration.ProgramTestManualLifeCycle(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("python", "implicit-dependency-cycles"),
+		Dependencies: []string{
+			filepath.Join("..", "..", "sdk", "python", "env", "src"),
+		},
+		Stdout: stdout,
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			assert.Contains(t, stdout.String(), "RuntimeError: We have detected a circular dependency involving a resource of type my:module:Child-1 named a-child-1.")
+			assert.Contains(t, stdout.String(), "Please review any `depends_on`, `parent` or other dependency relationships between your resources to ensure no cycles have been introduced in your program.")
+		},
+	})
+	require.NoError(t, pt.TestLifeCyclePrepare(), "prepare")
+	t.Cleanup(pt.TestCleanUp)
+
+	require.NoError(t, pt.TestLifeCycleInitialize(), "initialize")
+	require.Error(t, pt.TestPreviewUpdateAndEdits(), "preview")
 }

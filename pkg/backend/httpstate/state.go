@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -77,21 +78,13 @@ func (u *cloudUpdate) GetTarget() *deploy.Target {
 func (u *cloudUpdate) Complete(status apitype.UpdateStatus) error {
 	defer u.tokenSource.Close()
 
-	token, err := u.tokenSource.GetToken()
-	if err != nil {
-		return err
-	}
-	return u.backend.client.CompleteUpdate(u.context, u.update, status, token)
+	return u.backend.client.CompleteUpdate(u.context, u.update, status, u.tokenSource)
 }
 
 // recordEngineEvents will record the events with the Pulumi Service, enabling things like viewing
 // the update logs or drilling into the timeline of an update.
 func (u *cloudUpdate) recordEngineEvents(startingSeqNumber int, events []engine.Event) error {
-	contract.Assert(u.tokenSource != nil)
-	token, err := u.tokenSource.GetToken()
-	if err != nil {
-		return err
-	}
+	contract.Assertf(u.tokenSource != nil, "cloud update requires a token source")
 
 	var apiEvents apitype.EngineEventBatch
 	for idx, event := range events {
@@ -109,14 +102,15 @@ func (u *cloudUpdate) recordEngineEvents(startingSeqNumber int, events []engine.
 		apiEvents.Events = append(apiEvents.Events, apiEvent)
 	}
 
-	return u.backend.client.RecordEngineEvents(u.context, u.update, apiEvents, token)
+	return u.backend.client.RecordEngineEvents(u.context, u.update, apiEvents, u.tokenSource)
 }
 
 // RecordAndDisplayEvents inspects engine events from the given channel, and prints them to the CLI as well as
 // posting them to the Pulumi service.
 func (u *cloudUpdate) RecordAndDisplayEvents(
 	label string, action apitype.UpdateKind, stackRef backend.StackReference, op backend.UpdateOperation,
-	events <-chan engine.Event, done chan<- bool, opts display.Options, isPreview bool) {
+	permalink string, events <-chan engine.Event, done chan<- bool, opts display.Options, isPreview bool,
+) {
 	// We take the channel of engine events and pass them to separate components that will display
 	// them to the console or persist them on the Pulumi Service. Both should terminate as soon as
 	// they see a CancelEvent, and when finished, close the "done" channel.
@@ -135,7 +129,7 @@ func (u *cloudUpdate) RecordAndDisplayEvents(
 
 	// Start the Go-routines for displaying and persisting events.
 	go display.ShowEvents(
-		label, action, stackRef.Name(), op.Proj.Name,
+		label, action, stackRef.Name(), op.Proj.Name, permalink,
 		displayEvents, displayEventsDone, opts, isPreview)
 	go persistEngineEvents(
 		u, opts.Debug, /* persist debug events */
@@ -157,14 +151,14 @@ func (u *cloudUpdate) RecordAndDisplayEvents(
 }
 
 func (b *cloudBackend) newQuery(ctx context.Context,
-	op backend.QueryOperation) (engine.QueryInfo, error) {
-
+	op backend.QueryOperation,
+) (engine.QueryInfo, error) {
 	return &cloudQuery{root: op.Root, proj: op.Proj}, nil
 }
 
 func (b *cloudBackend) newUpdate(ctx context.Context, stackRef backend.StackReference, op backend.UpdateOperation,
-	update client.UpdateIdentifier, token string) (*cloudUpdate, error) {
-
+	update client.UpdateIdentifier, token string,
+) (*cloudUpdate, error) {
 	// Create a token source for this update if necessary.
 	var tokenSource *tokenSource
 	if token != "" {
@@ -180,7 +174,8 @@ func (b *cloudBackend) newUpdate(ctx context.Context, stackRef backend.StackRefe
 		renewLease := func(
 			ctx context.Context,
 			duration time.Duration,
-			currentToken string) (string, time.Time, error) {
+			currentToken string,
+		) (string, time.Time, error) {
 			tok, err := b.Client().RenewUpdateLease(
 				ctx, update, currentToken, duration)
 			if err != nil {
@@ -197,7 +192,8 @@ func (b *cloudBackend) newUpdate(ctx context.Context, stackRef backend.StackRefe
 	}
 
 	// Construct the deployment target.
-	target, err := b.getTarget(ctx, stackRef, op.StackConfiguration.Config, op.StackConfiguration.Decrypter)
+	target, err := b.getTarget(ctx, op.SecretsProvider, stackRef,
+		op.StackConfiguration.Config, op.StackConfiguration.Decrypter)
 	if err != nil {
 		return nil, err
 	}
@@ -214,13 +210,15 @@ func (b *cloudBackend) newUpdate(ctx context.Context, stackRef backend.StackRefe
 	}, nil
 }
 
-func (b *cloudBackend) getSnapshot(ctx context.Context, stackRef backend.StackReference) (*deploy.Snapshot, error) {
+func (b *cloudBackend) getSnapshot(ctx context.Context,
+	secretsProvider secrets.Provider, stackRef backend.StackReference,
+) (*deploy.Snapshot, error) {
 	untypedDeployment, err := b.exportDeployment(ctx, stackRef, nil /* get latest */)
 	if err != nil {
 		return nil, err
 	}
 
-	snapshot, err := stack.DeserializeUntypedDeployment(ctx, untypedDeployment, stack.DefaultSecretsProvider)
+	snapshot, err := stack.DeserializeUntypedDeployment(ctx, untypedDeployment, secretsProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -228,14 +226,15 @@ func (b *cloudBackend) getSnapshot(ctx context.Context, stackRef backend.StackRe
 	return snapshot, nil
 }
 
-func (b *cloudBackend) getTarget(ctx context.Context, stackRef backend.StackReference,
-	cfg config.Map, dec config.Decrypter) (*deploy.Target, error) {
+func (b *cloudBackend) getTarget(ctx context.Context, secretsProvider secrets.Provider, stackRef backend.StackReference,
+	cfg config.Map, dec config.Decrypter,
+) (*deploy.Target, error) {
 	stackID, err := b.getCloudStackIdentifier(stackRef)
 	if err != nil {
 		return nil, err
 	}
 
-	snapshot, err := b.getSnapshot(ctx, stackRef)
+	snapshot, err := b.getSnapshot(ctx, secretsProvider, stackRef)
 	if err != nil {
 		switch err {
 		case stack.ErrDeploymentSchemaVersionTooOld:
@@ -250,7 +249,7 @@ func (b *cloudBackend) getTarget(ctx context.Context, stackRef backend.StackRefe
 	}
 
 	return &deploy.Target{
-		Name:         tokens.Name(stackID.Stack),
+		Name:         stackID.Stack,
 		Organization: tokens.Name(stackID.Owner),
 		Config:       cfg,
 		Decrypter:    dec,
@@ -271,7 +270,8 @@ type engineEventBatch struct {
 // Pulumi Service. This is the data that powers the logs display.
 func persistEngineEvents(
 	update *cloudUpdate, persistDebugEvents bool,
-	events <-chan engine.Event, done chan<- bool) {
+	events <-chan engine.Event, done chan<- bool,
+) {
 	// A single update can emit hundreds, if not thousands, or tens of thousands of
 	// engine events. We transmit engine events in large batches to reduce the overhead
 	// associated with each HTTP request to the service. We also send multiple HTTP

@@ -16,7 +16,7 @@ import (
 func TestGenerateProgram(t *testing.T) {
 	t.Parallel()
 	err := os.Chdir("../../../dotnet") // chdir into codegen/dotnet
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	test.TestProgramCodegen(t,
 		test.ProgramCodegenOptions{
@@ -24,7 +24,7 @@ func TestGenerateProgram(t *testing.T) {
 			Extension:  "cs",
 			OutputFile: "Program.cs",
 			Check: func(t *testing.T, path string, dependencies codegen.StringSet) {
-				codegenDotnet.Check(t, path, dependencies, "../../../../../../../sdk/dotnet/Pulumi")
+				codegenDotnet.Check(t, path, dependencies, "")
 			},
 			GenProgram: codegenDotnet.GenerateProgram,
 			TestCases:  test.PulumiPulumiYAMLProgramTests,

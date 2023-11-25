@@ -7,8 +7,10 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/pkg/errors"
+	"errors"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumix"
+	"secrets/mypkg/internal"
 )
 
 type Resource struct {
@@ -48,22 +50,22 @@ func NewResource(ctx *pulumi.Context,
 		return nil, errors.New("invalid value for required argument 'FooMap'")
 	}
 	if args.Config != nil {
-		args.Config = pulumi.ToSecret(args.Config).(ConfigOutput)
+		args.Config = pulumi.ToSecret(args.Config).(ConfigInput)
 	}
 	if args.ConfigArray != nil {
-		args.ConfigArray = pulumi.ToSecret(args.ConfigArray).(ConfigArrayOutput)
+		args.ConfigArray = pulumi.ToSecret(args.ConfigArray).(ConfigArrayInput)
 	}
 	if args.ConfigMap != nil {
-		args.ConfigMap = pulumi.ToSecret(args.ConfigMap).(ConfigMapOutput)
+		args.ConfigMap = pulumi.ToSecret(args.ConfigMap).(ConfigMapInput)
 	}
 	if args.Foo != nil {
-		args.Foo = pulumi.ToSecret(args.Foo).(pulumi.StringOutput)
+		args.Foo = pulumi.ToSecret(args.Foo).(pulumi.StringInput)
 	}
 	if args.FooArray != nil {
-		args.FooArray = pulumi.ToSecret(args.FooArray).(pulumi.StringArrayOutput)
+		args.FooArray = pulumi.ToSecret(args.FooArray).(pulumi.StringArrayInput)
 	}
 	if args.FooMap != nil {
-		args.FooMap = pulumi.ToSecret(args.FooMap).(pulumi.StringMapOutput)
+		args.FooMap = pulumi.ToSecret(args.FooMap).(pulumi.StringMapInput)
 	}
 	secrets := pulumi.AdditionalSecretOutputs([]string{
 		"config",
@@ -74,6 +76,7 @@ func NewResource(ctx *pulumi.Context,
 		"fooMap",
 	})
 	opts = append(opts, secrets)
+	opts = internal.PkgResourceDefaultOpts(opts)
 	var resource Resource
 	err := ctx.RegisterResource("mypkg::Resource", name, args, &resource, opts...)
 	if err != nil {
@@ -147,6 +150,12 @@ func (i *Resource) ToResourceOutputWithContext(ctx context.Context) ResourceOutp
 	return pulumi.ToOutputWithContext(ctx, i).(ResourceOutput)
 }
 
+func (i *Resource) ToOutput(ctx context.Context) pulumix.Output[*Resource] {
+	return pulumix.Output[*Resource]{
+		OutputState: i.ToResourceOutputWithContext(ctx).OutputState,
+	}
+}
+
 type ResourceOutput struct{ *pulumi.OutputState }
 
 func (ResourceOutput) ElementType() reflect.Type {
@@ -159,6 +168,12 @@ func (o ResourceOutput) ToResourceOutput() ResourceOutput {
 
 func (o ResourceOutput) ToResourceOutputWithContext(ctx context.Context) ResourceOutput {
 	return o
+}
+
+func (o ResourceOutput) ToOutput(ctx context.Context) pulumix.Output[*Resource] {
+	return pulumix.Output[*Resource]{
+		OutputState: o.OutputState,
+	}
 }
 
 func (o ResourceOutput) Config() ConfigOutput {

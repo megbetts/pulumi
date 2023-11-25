@@ -22,7 +22,6 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,7 +43,7 @@ func createTGZ(files map[string][]byte) ([]byte, error) {
 		if err := writer.WriteHeader(&tar.Header{
 			Name: name,
 			Size: int64(len(content)),
-			Mode: 0600,
+			Mode: 0o600,
 		}); err != nil {
 			return nil, err
 		}
@@ -78,14 +77,13 @@ func prepareTestPluginTGZ(t *testing.T, files map[string][]byte) io.ReadCloser {
 
 	tgz, err := createTGZ(files)
 	require.NoError(t, err)
-	return ioutil.NopCloser(bytes.NewReader(tgz))
+	return io.NopCloser(bytes.NewReader(tgz))
 }
 
 func prepareTestDir(t *testing.T, files map[string][]byte) (string, io.ReadCloser, PluginSpec) {
 	tarball := prepareTestPluginTGZ(t, files)
 
-	dir, err := ioutil.TempDir("", "plugins-test-dir")
-	require.NoError(t, err)
+	dir := t.TempDir()
 
 	v1 := semver.MustParse("0.1.0")
 	plugin := PluginSpec{
@@ -163,7 +161,6 @@ func testPluginInstall(t *testing.T, expectedDir string, files map[string][]byte
 	}
 
 	dir, tarball, plugin := prepareTestDir(t, files)
-	defer os.RemoveAll(dir)
 
 	err := plugin.Install(tarball, false)
 	assert.NoError(t, err)
@@ -182,14 +179,13 @@ func TestInstallNoDeps(t *testing.T) {
 	content := []byte("hello\n")
 
 	dir, tarball, plugin := prepareTestDir(t, map[string][]byte{name: content})
-	defer os.RemoveAll(dir)
 
 	err := plugin.Install(tarball, false)
 	require.NoError(t, err)
 
 	pluginInfo := assertPluginInstalled(t, dir, plugin)
 
-	b, err := ioutil.ReadFile(filepath.Join(dir, plugin.Dir(), name))
+	b, err := os.ReadFile(filepath.Join(dir, plugin.Dir(), name))
 	require.NoError(t, err)
 	assert.Equal(t, content, b)
 
@@ -201,14 +197,13 @@ func TestReinstall(t *testing.T) {
 	content := []byte("hello\n")
 
 	dir, tarball, plugin := prepareTestDir(t, map[string][]byte{name: content})
-	defer os.RemoveAll(dir)
 
 	err := plugin.Install(tarball, false)
 	require.NoError(t, err)
 
 	pluginInfo := assertPluginInstalled(t, dir, plugin)
 
-	b, err := ioutil.ReadFile(filepath.Join(dir, plugin.Dir(), name))
+	b, err := os.ReadFile(filepath.Join(dir, plugin.Dir(), name))
 	require.NoError(t, err)
 	assert.Equal(t, content, b)
 
@@ -219,7 +214,7 @@ func TestReinstall(t *testing.T) {
 
 	pluginInfo = assertPluginInstalled(t, dir, plugin)
 
-	b, err = ioutil.ReadFile(filepath.Join(dir, plugin.Dir(), name))
+	b, err = os.ReadFile(filepath.Join(dir, plugin.Dir(), name))
 	require.NoError(t, err)
 	assert.Equal(t, content, b)
 
@@ -231,12 +226,11 @@ func TestConcurrentInstalls(t *testing.T) {
 	content := []byte("hello\n")
 
 	dir, tarball, plugin := prepareTestDir(t, map[string][]byte{name: content})
-	defer os.RemoveAll(dir)
 
 	assertSuccess := func() PluginInfo {
 		pluginInfo := assertPluginInstalled(t, dir, plugin)
 
-		b, err := ioutil.ReadFile(filepath.Join(dir, plugin.Dir(), name))
+		b, err := os.ReadFile(filepath.Join(dir, plugin.Dir(), name))
 		assert.NoError(t, err)
 		assert.Equal(t, content, b)
 
@@ -266,19 +260,18 @@ func TestConcurrentInstalls(t *testing.T) {
 
 func TestInstallCleansOldFiles(t *testing.T) {
 	dir, tarball, plugin := prepareTestDir(t, nil)
-	defer os.RemoveAll(dir)
 
 	// Leftover temp dirs.
-	tempDir1, err := ioutil.TempDir(dir, fmt.Sprintf("%s.tmp", plugin.Dir()))
+	tempDir1, err := os.MkdirTemp(dir, fmt.Sprintf("%s.tmp", plugin.Dir()))
 	assert.NoError(t, err)
-	tempDir2, err := ioutil.TempDir(dir, fmt.Sprintf("%s.tmp", plugin.Dir()))
+	tempDir2, err := os.MkdirTemp(dir, fmt.Sprintf("%s.tmp", plugin.Dir()))
 	assert.NoError(t, err)
-	tempDir3, err := ioutil.TempDir(dir, fmt.Sprintf("%s.tmp", plugin.Dir()))
+	tempDir3, err := os.MkdirTemp(dir, fmt.Sprintf("%s.tmp", plugin.Dir()))
 	assert.NoError(t, err)
 
 	// Leftover partial file.
 	partialPath := filepath.Join(dir, plugin.Dir()+".partial")
-	err = ioutil.WriteFile(partialPath, nil, 0600)
+	err = os.WriteFile(partialPath, nil, 0o600)
 	assert.NoError(t, err)
 
 	err = plugin.Install(tarball, false)
@@ -298,12 +291,11 @@ func TestInstallCleansOldFiles(t *testing.T) {
 
 func TestGetPluginsSkipsPartial(t *testing.T) {
 	dir, tarball, plugin := prepareTestDir(t, nil)
-	defer os.RemoveAll(dir)
 
 	err := plugin.Install(tarball, false)
 	assert.NoError(t, err)
 
-	err = ioutil.WriteFile(filepath.Join(dir, plugin.Dir()+".partial"), nil, 0600)
+	err = os.WriteFile(filepath.Join(dir, plugin.Dir()+".partial"), nil, 0o600)
 	assert.NoError(t, err)
 
 	assert.False(t, HasPlugin(plugin))

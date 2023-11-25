@@ -24,18 +24,20 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 // intentionally disabling here for cleaner err declaration/assignment.
-// nolint: vetshadow
+//
+//nolint:vetshadow
 func newWatchCmd() *cobra.Command {
 	var debug bool
 	var message string
 	var execKind string
-	var stack string
+	var stackName string
 	var configArray []string
 	var pathArray []string
 	var configPath bool
@@ -50,7 +52,7 @@ func newWatchCmd() *cobra.Command {
 	var showSames bool
 	var secretsProvider string
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:        "watch",
 		SuggestFor: []string{"developer", "dev"},
 		Short:      "Continuously update the resources in a stack",
@@ -87,7 +89,7 @@ func newWatchCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			s, err := requireStack(ctx, stack, true, opts.Display, false /*setCurrent*/)
+			s, err := requireStack(ctx, stackName, stackOfferNew, opts.Display)
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -102,17 +104,12 @@ func newWatchCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			m, err := getUpdateMetadata(message, root, execKind, "" /* execAgent */, false)
+			m, err := getUpdateMetadata(message, root, execKind, "" /* execAgent */, false, cmd.Flags())
 			if err != nil {
 				return result.FromError(fmt.Errorf("gathering environment metadata: %w", err))
 			}
 
-			sm, err := getStackSecretsManager(s)
-			if err != nil {
-				return result.FromError(fmt.Errorf("getting secrets manager: %w", err))
-			}
-
-			cfg, err := getStackConfiguration(ctx, s, proj, sm)
+			cfg, sm, err := getStackConfiguration(ctx, s, proj, nil)
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack configuration: %w", err))
 			}
@@ -121,9 +118,19 @@ func newWatchCmd() *cobra.Command {
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack decrypter: %w", err))
 			}
+			encrypter, err := sm.Encrypter()
+			if err != nil {
+				return result.FromError(fmt.Errorf("getting stack encrypter: %w", err))
+			}
 
 			stackName := s.Ref().Name().String()
-			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+				stackName,
+				proj,
+				cfg.Environment,
+				cfg.Config,
+				encrypter,
+				decrypter)
 			if configErr != nil {
 				return result.FromError(fmt.Errorf("validating stack config: %w", configErr))
 			}
@@ -147,7 +154,8 @@ func newWatchCmd() *cobra.Command {
 				Opts:               opts,
 				StackConfiguration: cfg,
 				SecretsManager:     sm,
-				Scopes:             cancellationScopes,
+				SecretsProvider:    stack.DefaultSecretsProvider,
+				Scopes:             backend.CancellationScopes,
 			}, pathArray)
 
 			switch {
@@ -169,7 +177,7 @@ func newWatchCmd() *cobra.Command {
 		&debug, "debug", "d", false,
 		"Print detailed debugging output during resource operations")
 	cmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
 		&stackConfigFile, "config-file", "",

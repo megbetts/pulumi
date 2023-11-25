@@ -21,23 +21,21 @@ builds:
 - <<: *pulumibin
   id: pulumi-language-go
   binary: pulumi-language-go
-  dir: sdk
-  main: ./go/pulumi-language-go
+  dir: sdk/go/pulumi-language-go
+  main: ./
+  gobinary: ../../../scripts/go-wrapper.sh
 - <<: *pulumibin
   id: pulumi-language-nodejs
   binary: pulumi-language-nodejs
-  dir: sdk
-  main: ./nodejs/cmd/pulumi-language-nodejs
+  dir: sdk/nodejs/cmd/pulumi-language-nodejs
+  main: ./
+  gobinary: ../../../../scripts/go-wrapper.sh
 - <<: *pulumibin
   id: pulumi-language-python
   binary: pulumi-language-python
-  dir: sdk
-  main: ./python/cmd/pulumi-language-python
-- <<: *pulumibin
-  id: pulumi-language-dotnet
-  binary: pulumi-language-dotnet
-  dir: sdk
-  main: ./dotnet/cmd/pulumi-language-dotnet
+  dir: sdk/python/cmd/pulumi-language-python
+  main: ./
+  gobinary: ../../../../scripts/go-wrapper.sh
 
 archives:
 - id: pulumi

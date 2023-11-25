@@ -39,8 +39,8 @@ import (
 // Watch watches the project's working directory for changes and automatically updates the active
 // stack.
 func Watch(ctx context.Context, b Backend, stack Stack, op UpdateOperation,
-	apply Applier, paths []string) result.Result {
-
+	apply Applier, paths []string,
+) result.Result {
 	opts := ApplierOptions{
 		DryRun:   false,
 		ShowLink: false,
@@ -51,7 +51,7 @@ func Watch(ctx context.Context, b Backend, stack Stack, op UpdateOperation,
 	go func() {
 		shown := map[operations.LogEntry]bool{}
 		for {
-			logs, err := b.GetLogs(ctx, stack, op.StackConfiguration, operations.LogQuery{
+			logs, err := b.GetLogs(ctx, op.SecretsProvider, stack, op.StackConfiguration, operations.LogQuery{
 				StartTime: &startTime,
 			})
 			if err != nil {
@@ -165,7 +165,7 @@ func getWatchUtil() (string, error) {
 			// Let's see if the file is executable. On Windows, os.Stat() returns a mode of "-rw-rw-rw" so on
 			// on windows we just trust the fact that the .exe can actually be launched.
 			if stat, err := os.Stat(candidate); err == nil {
-				if stat.Mode()&0100 != 0 || runtime.GOOS == windowsGOOS {
+				if stat.Mode()&0o100 != 0 || runtime.GOOS == windowsGOOS {
 					return candidate, nil
 				}
 				return "", fmt.Errorf("Could not locate an executable pulumi-watch, found %v without execute bit", fullPath)

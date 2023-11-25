@@ -12,6 +12,8 @@ permissions:
   contents: read
   # Only the 'changelog-comment' job should use this permission.
   pull-requests: write
+  # To sign artifacts.
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.client_payload.pull_request.number }}
@@ -51,6 +53,8 @@ jobs:
     uses: pulumi/pulumi/.github/workflows/ci.yml@master
     permissions:
       contents: read
+      # To sign artifacts.
+      id-token: write
     with:
       ref: refs/pull/${{ github.event.client_payload.pull_request.number }}/merge
       version: ${{ needs.info.outputs.version }}
@@ -58,8 +62,9 @@ jobs:
       build-all-targets: false
       test-version-sets: current
       integration-test-platforms: ubuntu-latest
-      smoke-test-platforms: ''
-      enable-coverage: true
+      acceptance-test-platforms: ''
+      # We'll only upload coverage artifacts with the periodic-coverage cron workflow.
+      enable-coverage: false
     secrets:
       # Scope secrets to the minimum required:
       PULUMI_BOT_TOKEN: ${{ secrets.PULUMI_BOT_TOKEN }}

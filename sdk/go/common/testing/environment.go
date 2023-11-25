@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -33,7 +32,7 @@ import (
 )
 
 const (
-	//nolint: gosec
+	//nolint:gosec
 	pulumiCredentialsPathEnvVar = "PULUMI_CREDENTIALS_PATH"
 )
 
@@ -45,7 +44,7 @@ type Environment struct {
 
 	// RootPath is a new temp directory where the environment starts.
 	RootPath string
-	// Current working directory.
+	// Current working directory, defaults to the root path.
 	CWD string
 	// Backend to use for commands
 	Backend string
@@ -55,7 +54,8 @@ type Environment struct {
 	Passphrase string
 	// Set to true to turn off setting PULUMI_CONFIG_PASSPHRASE.
 	NoPassphrase bool
-
+	// Set to true to use the local Pulumi dev build from ~/.pulumi-dev/bin/pulumi which get from `make install`
+	UseLocalPulumiBuild bool
 	// Content to pass on stdin, if any
 	Stdin io.Reader
 }
@@ -68,9 +68,9 @@ func WriteYarnRCForTest(root string) error {
 	// https://github.com/yarnpkg/yarn/issues/683
 	// Also add --network-concurrency 1 since we've been seeing
 	// https://github.com/yarnpkg/yarn/issues/4563 as well
-	return ioutil.WriteFile(
+	return os.WriteFile(
 		filepath.Join(root, ".yarnrc"),
-		[]byte("--mutex network\n--network-concurrency 1\n"), 0600)
+		[]byte("--mutex network\n--network-concurrency 1\n"), 0o600)
 }
 
 // NewGoEnvironment returns a new Environment object, located in a GOPATH temp directory.
@@ -90,7 +90,7 @@ func NewGoEnvironment(t *testing.T) *Environment {
 
 // NewEnvironment returns a new Environment object, located in a temp directory.
 func NewEnvironment(t *testing.T) *Environment {
-	root, err := ioutil.TempDir("", "test-env")
+	root, err := os.MkdirTemp("", "test-env")
 	assert.NoError(t, err, "creating temp directory")
 	assert.NoError(t, WriteYarnRCForTest(root), "writing .yarnrc file")
 
@@ -120,7 +120,7 @@ func (e *Environment) SetEnvVars(env ...string) {
 
 // ImportDirectory copies a folder into the test environment.
 func (e *Environment) ImportDirectory(path string) {
-	err := fsutil.CopyFile(e.RootPath, path, nil)
+	err := fsutil.CopyFile(e.CWD, path, nil)
 	if err != nil {
 		e.T.Fatalf("error importing directory: %v", err)
 	}
@@ -130,7 +130,12 @@ func (e *Environment) ImportDirectory(path string) {
 func (e *Environment) DeleteEnvironment() {
 	e.Helper()
 	err := os.RemoveAll(e.RootPath)
-	assert.NoErrorf(e, err, "cleaning up test directory %q", e.RootPath)
+	if err != nil {
+		// In CI, Windows sometimes lags behind in marking a resource
+		// as unused. This causes otherwise passing tests to fail.
+		// So ignore errors during cleanup.
+		e.Logf("error cleaning up test directory %q: %v", e.RootPath, err)
+	}
 }
 
 // DeleteEnvironment deletes the environment's RootPath, and everything
@@ -164,6 +169,18 @@ func (e *Environment) RunCommand(cmd string, args ...string) (string, string) {
 		YarnInstallMutex.Lock()
 		defer YarnInstallMutex.Unlock()
 	}
+
+	if e.UseLocalPulumiBuild {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			e.Logf("Run Error: %v", err)
+			e.Fatalf("Ran command %v args %v and expected success. Instead got failure.", cmd, args)
+		}
+		if home != "" {
+			cmd = filepath.Join(home, ".pulumi-dev", "bin", "pulumi")
+		}
+	}
+
 	e.Helper()
 	stdout, stderr, err := e.GetCommandResults(cmd, args...)
 	if err != nil {
@@ -196,6 +213,12 @@ func (e *Environment) LocalURL() string {
 // GetCommandResults runs the given command and args in the Environments CWD, returning
 // STDOUT, STDERR, and the result of os/exec.Command{}.Run.
 func (e *Environment) GetCommandResults(command string, args ...string) (string, string, error) {
+	return e.GetCommandResultsIn(e.CWD, command, args...)
+}
+
+// GetCommandResultsIn runs the given command and args in the given directory, returning
+// STDOUT, STDERR, and the result of os/exec.Command{}.Run.
+func (e *Environment) GetCommandResultsIn(dir string, command string, args ...string) (string, string, error) {
 	e.T.Helper()
 	e.T.Logf("Running command %v %v", command, strings.Join(args, " "))
 
@@ -208,9 +231,9 @@ func (e *Environment) GetCommandResults(command string, args ...string) (string,
 		passphrase = e.Passphrase
 	}
 
-	// nolint: gas
+	//nolint:gas
 	cmd := exec.Command(command, args...)
-	cmd.Dir = e.CWD
+	cmd.Dir = dir
 	if e.Stdin != nil {
 		cmd.Stdin = e.Stdin
 	}

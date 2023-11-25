@@ -145,9 +145,17 @@ export interface RemoteWorkspaceOptions {
      * An optional list of arbitrary commands to run before a remote Pulumi operation is invoked.
      */
     preRunCommands?: string[];
+
+    /**
+     * Whether to skip the default dependency installation step. Defaults to false.
+     */
+    skipInstallDependencies?: boolean;
 }
 
-async function createLocalWorkspace(args: RemoteGitProgramArgs, opts?: RemoteWorkspaceOptions): Promise<LocalWorkspace> {
+async function createLocalWorkspace(
+    args: RemoteGitProgramArgs,
+    opts?: RemoteWorkspaceOptions,
+): Promise<LocalWorkspace> {
     if (!isFullyQualifiedStackName(args.stackName)) {
         throw new Error(`stack name "${args.stackName}" must be fully qualified.`);
     }
@@ -172,6 +180,7 @@ async function createLocalWorkspace(args: RemoteGitProgramArgs, opts?: RemoteWor
         remoteGitProgramArgs: args,
         remoteEnvVars: opts?.envVars,
         remotePreRunCommands: opts?.preRunCommands,
+        remoteSkipInstallDependencies: opts?.skipInstallDependencies,
     };
     return await LocalWorkspace.create(localOpts);
 }

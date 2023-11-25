@@ -15,7 +15,7 @@
 // Pulling out some of the repeated strings tokens into constants would harm readability, so we just ignore the
 // goconst linter's warning.
 //
-// nolint: lll, goconst
+//nolint:lll, goconst
 package docs
 
 import (
@@ -26,6 +26,8 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/python"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 type methodDocArgs struct {
@@ -55,7 +57,7 @@ type methodDocArgs struct {
 }
 
 func (mod *modContext) genMethods(r *schema.Resource) []methodDocArgs {
-	methods := make([]methodDocArgs, 0, len(r.Methods))
+	methods := slice.Prealloc[methodDocArgs](len(r.Methods))
 	for _, m := range r.Methods {
 		methods = append(methods, mod.genMethod(r, m))
 	}
@@ -77,9 +79,11 @@ func (mod *modContext) genMethod(r *schema.Resource, m *schema.Method) methodDoc
 				inputProps[lang] = props
 			}
 		}
-		if f.Outputs != nil {
-			outputProps[lang] = mod.getPropertiesWithIDPrefixAndExclude(f.Outputs.Properties, lang, false, false, false,
-				fmt.Sprintf("%s_result_", m.Name), nil)
+		if f.ReturnType != nil {
+			if objectType, ok := f.ReturnType.(*schema.ObjectType); ok && objectType != nil {
+				outputProps[lang] = mod.getPropertiesWithIDPrefixAndExclude(objectType.Properties, lang, false, false, false,
+					fmt.Sprintf("%s_result_", m.Name), nil)
+			}
 		}
 	}
 
@@ -112,8 +116,8 @@ func (mod *modContext) genMethod(r *schema.Resource, m *schema.Method) methodDoc
 }
 
 func (mod *modContext) genMethodTS(f *schema.Function, resourceName, methodName string,
-	optionalArgs bool) []formalParam {
-
+	optionalArgs bool,
+) []formalParam {
 	argsType := fmt.Sprintf("%s.%sArgs", resourceName, title(methodName, "nodejs"))
 
 	var optionalFlag string
@@ -135,8 +139,8 @@ func (mod *modContext) genMethodTS(f *schema.Function, resourceName, methodName 
 }
 
 func (mod *modContext) genMethodGo(f *schema.Function, resourceName, methodName string,
-	optionalArgs bool) []formalParam {
-
+	optionalArgs bool,
+) []formalParam {
 	argsType := fmt.Sprintf("%s%sArgs", resourceName, title(methodName, "go"))
 
 	params := []formalParam{
@@ -198,7 +202,7 @@ func (mod *modContext) genMethodPython(f *schema.Function) []formalParam {
 
 	if f.Inputs != nil {
 		// Filter out the __self__ argument from the inputs.
-		args := make([]*schema.Property, 0, len(f.Inputs.InputShape.Properties)-1)
+		args := slice.Prealloc[*schema.Property](len(f.Inputs.InputShape.Properties) - 1)
 		for _, arg := range f.Inputs.InputShape.Properties {
 			if arg.Name == "__self__" {
 				continue
@@ -216,7 +220,9 @@ func (mod *modContext) genMethodPython(f *schema.Function) []formalParam {
 			}
 		})
 		for _, arg := range args {
-			typ := docLanguageHelper.GetLanguageTypeString(mod.pkg, mod.mod, arg.Type, true /*input*/)
+			def, err := mod.pkg.Definition()
+			contract.AssertNoErrorf(err, "failed to get definition for package %q", mod.pkg.Name())
+			typ := docLanguageHelper.GetLanguageTypeString(def, mod.mod, arg.Type, true /*input*/)
 			var defaultValue string
 			if !arg.IsRequired() {
 				defaultValue = " = None"
@@ -236,8 +242,8 @@ func (mod *modContext) genMethodPython(f *schema.Function) []formalParam {
 // genMethodArgs generates the arguments string for a given method that can be
 // rendered directly into a template. An empty string indicates no args.
 func (mod *modContext) genMethodArgs(r *schema.Resource, m *schema.Method,
-	methodNameMap map[string]string) map[string]string {
-
+	methodNameMap map[string]string,
+) map[string]string {
 	dctx := mod.docGenContext
 	f := m.Function
 
@@ -321,8 +327,10 @@ func (mod *modContext) getMethodResult(r *schema.Resource, m *schema.Method) map
 
 	var resultTypeName string
 	for _, lang := range dctx.supportedLanguages {
-		if m.Function.Outputs != nil && len(m.Function.Outputs.Properties) > 0 {
-			resultTypeName = dctx.getLanguageDocHelper(lang).GetMethodResultName(mod.pkg, mod.mod, r, m)
+		if m.Function.ReturnType != nil {
+			def, err := mod.pkg.Definition()
+			contract.AssertNoErrorf(err, "failed to get definition for package %q", mod.pkg.Name())
+			resultTypeName = dctx.getLanguageDocHelper(lang).GetMethodResultName(def, mod.mod, r, m)
 		}
 		resourceMap[lang] = propertyType{
 			Name: resultTypeName,

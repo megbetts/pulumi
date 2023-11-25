@@ -20,7 +20,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -29,15 +28,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pulumi/pulumi/pkg/v3/backend/filestate"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/testing/integration"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	ptesting "github.com/pulumi/pulumi/sdk/v3/go/common/testing"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 //nolint:paralleltest // mutates environment variables
@@ -245,7 +246,7 @@ func TestStackCommands(t *testing.T) {
 
 				stackFile := path.Join(e.RootPath, "stack.json")
 				e.RunCommand("pulumi", "stack", "export", "--file", "stack.json")
-				stackJSON, err := ioutil.ReadFile(stackFile)
+				stackJSON, err := os.ReadFile(stackFile)
 				if !assert.NoError(t, err) {
 					t.FailNow()
 				}
@@ -259,7 +260,7 @@ func TestStackCommands(t *testing.T) {
 				deployment.Version = deploymentVersion
 				bytes, err := json.Marshal(deployment)
 				assert.NoError(t, err)
-				err = ioutil.WriteFile(stackFile, bytes, os.FileMode(os.O_CREATE))
+				err = os.WriteFile(stackFile, bytes, os.FileMode(os.O_CREATE))
 				if !assert.NoError(t, err) {
 					t.FailNow()
 				}
@@ -295,7 +296,7 @@ func TestStackCommands(t *testing.T) {
 		// becomes invalid.
 		stackFile := path.Join(e.RootPath, "stack.json")
 		e.RunCommand("pulumi", "stack", "export", "--file", "stack.json")
-		stackJSON, err := ioutil.ReadFile(stackFile)
+		stackJSON, err := os.ReadFile(stackFile)
 		if !assert.NoError(t, err) {
 			t.FailNow()
 		}
@@ -331,7 +332,7 @@ func TestStackCommands(t *testing.T) {
 		if !assert.NoError(t, err) {
 			t.FailNow()
 		}
-		err = ioutil.WriteFile(stackFile, bytes, os.FileMode(os.O_CREATE))
+		err = os.WriteFile(stackFile, bytes, os.FileMode(os.O_CREATE))
 		if !assert.NoError(t, err) {
 			t.FailNow()
 		}
@@ -360,15 +361,16 @@ func TestStackBackups(t *testing.T) {
 		e.ImportDirectory("integration/stack_outputs/nodejs")
 
 		// We're testing that backups are created so ensure backups aren't disabled.
-		if env := os.Getenv(filestate.DisableCheckpointBackupsEnvVar); env != "" {
-			os.Unsetenv(filestate.DisableCheckpointBackupsEnvVar)
-			defer os.Setenv(filestate.DisableCheckpointBackupsEnvVar, env)
+		disableCheckpointBackups := env.SelfManagedDisableCheckpointBackups.Var().Name()
+		if env := os.Getenv(disableCheckpointBackups); env != "" {
+			os.Unsetenv(disableCheckpointBackups)
+			defer os.Setenv(disableCheckpointBackups, env)
 		}
 
 		const stackName = "imulup"
 
 		// Get the path to the backup directory for this project.
-		backupDir, err := getStackProjectBackupDir(e, stackName)
+		backupDir, err := getStackProjectBackupDir(e, "stack_outputs", stackName)
 		assert.NoError(t, err, "getting stack project backup path")
 		defer func() {
 			if !t.Failed() {
@@ -424,6 +426,57 @@ func TestStackBackups(t *testing.T) {
 
 		e.RunCommand("pulumi", "stack", "rm", "--yes")
 	})
+}
+
+//nolint:paralleltest // mutates environment variables
+func TestDestroySetsEncryptedkey(t *testing.T) {
+	e := ptesting.NewEnvironment(t)
+	defer func() {
+		if !t.Failed() {
+			e.DeleteEnvironment()
+		}
+	}()
+
+	const stackName = "imulup"
+
+	// Set up the environment.
+	{
+		e.Setenv("PULUMI_CONFIG_PASSPHRASE", "")
+
+		integration.CreateBasicPulumiRepo(e)
+		e.ImportDirectory("integration/stack_outputs/nodejs")
+
+		e.SetBackend(e.LocalURL())
+		e.RunCommand("pulumi", "stack", "init", stackName)
+
+		// Build the project.
+		e.RunCommand("yarn", "link", "@pulumi/pulumi")
+		e.RunCommand("yarn", "install")
+
+		e.RunCommand("pulumi", "config", "set", "--secret", "token", "cookie")
+
+		// Now run pulumi up.
+		e.RunCommand("pulumi", "up", "--non-interactive", "--yes", "--skip-preview")
+	}
+
+	wd := e.RootPath
+	stackFile := filepath.Join(wd, "Pulumi.imulup.yaml")
+
+	// Remove `encryptionsalt` from `Pulumi.imulup.yaml`.
+	preamble := "secretsprovider: passphrase\n"
+	err := os.WriteFile(stackFile, []byte(preamble), 0o600)
+	assert.NoError(t, err, "writing Pulumi.imulup.yaml")
+
+	// Now run pulumi destroy.
+	e.RunCommand("pulumi", "destroy", "--non-interactive", "--yes", "--skip-preview")
+
+	// Check that the stack file has `encryptionsalt` set.
+	data, err := os.ReadFile(stackFile)
+	assert.NoError(t, err, "reading Pulumi.imulup.yaml")
+	s := string(data)
+	assert.Contains(t, s, "encryptionsalt", "should contain encryptionsalt")
+
+	e.RunCommand("pulumi", "stack", "rm", "--yes")
 }
 
 func TestStackRenameAfterCreate(t *testing.T) {
@@ -557,13 +610,12 @@ func TestLocalStateLocking(t *testing.T) {
 		stderr := <-stderrs
 		assert.Equal(t, "", stderr)
 	}
-
 }
 
 // stackFileFormatAsserters returns a function to assert that the current file
 // format is for gzip and plain formats respectively.
-func stackFileFormatAsserters(t *testing.T, e *ptesting.Environment, stackName string) (func(), func()) {
-	stacksDir := filepath.Join(".pulumi", "stacks")
+func stackFileFormatAsserters(t *testing.T, e *ptesting.Environment, projectName, stackName string) (func(), func()) {
+	stacksDir := filepath.Join(".pulumi", "stacks", projectName)
 	pathStack := filepath.Join(stacksDir, stackName+".json")
 	pathStackGzip := pathStack + ".gz"
 	pathStackBak := pathStack + ".bak"
@@ -624,9 +676,10 @@ func TestLocalStateGzip(t *testing.T) { //nolint:paralleltest
 	e.RunCommand("yarn", "install")
 	e.RunCommand("pulumi", "up", "--non-interactive", "--yes", "--skip-preview")
 
-	assertGzipFileFormat, assertPlainFileFormat := stackFileFormatAsserters(t, e, stackName)
-	switchGzipOff := func() { e.Setenv(filestate.PulumiFilestateGzipEnvVar, "0") }
-	switchGzipOn := func() { e.Setenv(filestate.PulumiFilestateGzipEnvVar, "1") }
+	assertGzipFileFormat, assertPlainFileFormat := stackFileFormatAsserters(t, e, "stack_dependencies", stackName)
+	gzipEnvVar := env.SelfManagedGzip.Var().Name()
+	switchGzipOff := func() { e.Setenv(gzipEnvVar, "0") }
+	switchGzipOn := func() { e.Setenv(gzipEnvVar, "1") }
 	pulumiUp := func() { e.RunCommand("pulumi", "up", "--non-interactive", "--yes", "--skip-preview") }
 
 	// Test "pulumi up" with gzip compression on and off.
@@ -662,7 +715,7 @@ func TestLocalStateGzip(t *testing.T) { //nolint:paralleltest
 }
 
 func getFileNames(infos []os.DirEntry) []string {
-	var result []string
+	result := slice.Prealloc[string](len(infos))
 	for _, i := range infos {
 		result = append(result, i.Name())
 	}
@@ -693,10 +746,11 @@ func assertBackupStackFile(t *testing.T, stackName string, file os.DirEntry, bef
 	assert.True(t, parsedTime < after, "False: %v < %v", parsedTime, after)
 }
 
-func getStackProjectBackupDir(e *ptesting.Environment, stackName string) (string, error) {
+func getStackProjectBackupDir(e *ptesting.Environment, projectName, stackName string) (string, error) {
 	return filepath.Join(e.RootPath,
 		workspace.BookkeepingDir,
 		workspace.BackupDir,
+		projectName,
 		stackName,
 	), nil
 }
@@ -704,6 +758,96 @@ func getStackProjectBackupDir(e *ptesting.Environment, stackName string) (string
 func addRandomSuffix(s string) string {
 	b := make([]byte, 4)
 	_, err := cryptorand.Read(b)
-	contract.AssertNoError(err)
+	contract.AssertNoErrorf(err, "error generating random suffix")
 	return s + "-" + hex.EncodeToString(b)
+}
+
+func TestStackTags(t *testing.T) {
+	t.Parallel()
+
+	// This test requires the service, as only the service supports stack tags.
+	if os.Getenv("PULUMI_ACCESS_TOKEN") == "" {
+		t.Skipf("Skipping: PULUMI_ACCESS_TOKEN is not set")
+	}
+	if os.Getenv("PULUMI_TEST_OWNER") == "" {
+		t.Skipf("Skipping: PULUMI_TEST_OWNER is not set")
+	}
+
+	e := ptesting.NewEnvironment(t)
+	defer func() {
+		if !t.Failed() {
+			e.DeleteEnvironment()
+		}
+	}()
+	stackName, err := resource.NewUniqueHex("test-", 8, -1)
+	contract.AssertNoErrorf(err, "resource.NewUniqueHex should not fail with no maximum length is set")
+
+	integration.CreateBasicPulumiRepo(e)
+	e.ImportDirectory("testdata/simple_tags")
+
+	e.RunCommand("pulumi", "stack", "init", stackName)
+
+	e.RunCommand("pulumi", "stack", "tag", "set", "tagA", "valueA")
+	e.RunCommand("pulumi", "stack", "tag", "set", "tagB", "valueB")
+
+	lsTags := func() map[string]string {
+		stdout, _ := e.RunCommand("pulumi", "stack", "tag", "ls", "--json")
+		var tags map[string]string
+		err = json.Unmarshal([]byte(stdout), &tags)
+		require.NoError(t, err, "parsing the tags json")
+		return tags
+	}
+
+	tags := lsTags()
+	assert.Equal(t, "valueA", tags["tagA"], "tagA should be set to valueA")
+	assert.Equal(t, "valueB", tags["tagB"], "tagB should be set to valueB")
+
+	e.RunCommand("pulumi", "stack", "tag", "rm", "tagA")
+	tags = lsTags()
+	assert.NotContains(t, tags, "tagA", "tagA should be removed")
+
+	e.RunCommand("yarn", "link", "@pulumi/pulumi")
+	e.RunCommand("yarn", "install")
+	e.RunCommand("pulumi", "up", "--non-interactive", "--yes", "--skip-preview")
+
+	tags = lsTags()
+	assert.Equal(t, "hello", tags["tagS"], "tagS should be set to hello")
+	assert.Equal(t, "true", tags["tagB"], "tagB should be set to true")
+	assert.Equal(t, "42", tags["tagN"], "tagN should be set to 42")
+}
+
+//nolint:paralleltest // pulumi new is not parallel safe
+func TestNewStackConflictingOrg(t *testing.T) {
+	// This test requires the service, as only the service supports orgs.
+	if os.Getenv("PULUMI_ACCESS_TOKEN") == "" {
+		t.Skipf("Skipping: PULUMI_ACCESS_TOKEN is not set")
+	}
+
+	e := ptesting.NewEnvironment(t)
+	defer deleteIfNotFailed(e)
+
+	project, err := resource.NewUniqueHex("test-name-", 8, -1)
+	require.NoError(t, err)
+
+	// `new` wants to work in an empty directory but our use of local filestate means we have a
+	// ".pulumi" directory at root.
+	projectDir := filepath.Join(e.RootPath, project)
+	err = os.Mkdir(projectDir, 0o700)
+	require.NoError(t, err)
+
+	e.CWD = projectDir
+
+	orgs := []string{"moolumi", "pulumi-test"}
+	for _, org := range orgs {
+		stackRef := fmt.Sprintf("%s/%s/stack", org, project)
+		// Ensure projects no longer exists. Ignoring errors.
+		_, _, err := e.GetCommandResults("pulumi", "stack", "rm", "-s", stackRef)
+		_ = err
+	}
+	for _, org := range orgs {
+		stackRef := fmt.Sprintf("%s/%s/stack", org, project)
+		e.RunCommand("pulumi", "new", "yaml", "-s", stackRef, "--yes", "--force")
+		e.RunCommand("pulumi", "up", "--yes")
+		e.RunCommand("pulumi", "destroy", "--yes", "--remove")
+	}
 }

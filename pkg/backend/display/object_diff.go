@@ -17,19 +17,22 @@ package display
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/sergi/go-diff/diffmatchpatch"
 	"gopkg.in/yaml.v3"
@@ -39,15 +42,15 @@ import (
 func getIndent(step engine.StepEventMetadata, seen map[resource.URN]engine.StepEventMetadata) int {
 	indent := 0
 	for p := step.Res.Parent; p != ""; {
-		if par, has := seen[p]; !has {
+		par, has := seen[p]
+		if !has {
 			// This can happen during deletes, since we delete children before parents.
 			// TODO[pulumi/pulumi#340]: we need to figure out how best to display this sequence; at the very
 			//     least, it would be ideal to preserve the indentation.
 			break
-		} else {
-			indent++
-			p = par.Res.Parent
 		}
+		indent++
+		p = par.Res.Parent
 	}
 	return indent
 }
@@ -79,8 +82,8 @@ func getIndentationString(indent int, op display.StepOp, prefix bool) string {
 	}
 
 	rp := deploy.RawPrefix(op)
-	contract.Assert(len(rp) == 2)
-	contract.Assert(len(result) >= 2)
+	contract.Assertf(len(rp) == 2, "expected raw prefix to be 2 characters long: %q", rp)
+	contract.Assertf(len(result) >= 2, "expected indention to be at least 2 characters long: %q", result)
 	return result[:len(result)-2] + rp
 }
 
@@ -145,7 +148,7 @@ func getResourcePropertiesSummary(step engine.StepEventMetadata, indent int) str
 		new := step.New
 		if old != nil && new != nil && old.Provider != new.Provider {
 			newProv, err := providers.ParseReference(new.Provider)
-			contract.Assert(err == nil)
+			contract.Assertf(err == nil, "invalid provider reference %q: %v", new.Provider, err)
 
 			writeWithIndentNoPrefix(&b, indent+1, deploy.OpUpdate, "[provider: ")
 			write(&b, deploy.OpDelete, "%s", old.Provider)
@@ -158,7 +161,7 @@ func getResourcePropertiesSummary(step engine.StepEventMetadata, indent int) str
 			writeVerbatim(&b, deploy.OpUpdate, "]\n")
 		} else {
 			prov, err := providers.ParseReference(step.Provider)
-			contract.Assert(err == nil)
+			contract.Assertf(err == nil, "invalid provider reference %q: %v", step.Provider, err)
 
 			// Elide references to default providers.
 			if prov.URN().Name() != "default" {
@@ -171,7 +174,8 @@ func getResourcePropertiesSummary(step engine.StepEventMetadata, indent int) str
 }
 
 func getResourcePropertiesDetails(
-	step engine.StepEventMetadata, indent int, planning bool, summary bool, truncateOutput bool, debug bool) string {
+	step engine.StepEventMetadata, indent int, planning bool, summary bool, truncateOutput bool, debug bool,
+) string {
 	var b bytes.Buffer
 
 	// indent everything an additional level, like other properties.
@@ -212,8 +216,8 @@ func maxKey(keys []resource.PropertyKey) int {
 
 func PrintObject(
 	b *bytes.Buffer, props resource.PropertyMap, planning bool,
-	indent int, op display.StepOp, prefix bool, truncateOutput bool, debug bool) {
-
+	indent int, op display.StepOp, prefix bool, truncateOutput bool, debug bool,
+) {
 	p := propertyPrinter{
 		dest:           b,
 		planning:       planning,
@@ -233,7 +237,7 @@ func (p *propertyPrinter) printObject(props resource.PropertyMap) {
 
 	// Now print out the values intelligently based on the type.
 	for _, k := range keys {
-		if v := props[k]; !resource.IsInternalPropertyKey(k) && shouldPrintPropertyValue(v, p.planning) {
+		if v := props[k]; !resource.IsInternalPropertyKey(k) {
 			p.printObjectProperty(k, v, maxkey)
 		}
 	}
@@ -246,8 +250,8 @@ func (p *propertyPrinter) printObjectProperty(key resource.PropertyKey, value re
 
 func PrintResourceReference(
 	b *bytes.Buffer, resRef resource.ResourceReference, planning bool,
-	indent int, op display.StepOp, prefix bool, debug bool) {
-
+	indent int, op display.StepOp, prefix bool, debug bool,
+) {
 	p := propertyPrinter{
 		dest:     b,
 		planning: planning,
@@ -329,6 +333,9 @@ func massageStackPreviewOutputDiff(diff *resource.ObjectDiff, inResource bool) {
 			delete(diff.Updates, k)
 		} else {
 			massageStackPreviewDiff(d, inResource)
+			if !d.Object.AnyChanges() {
+				delete(diff.Updates, k)
+			}
 		}
 	}
 }
@@ -336,8 +343,8 @@ func massageStackPreviewOutputDiff(diff *resource.ObjectDiff, inResource bool) {
 // getResourceOutputsPropertiesString prints only those properties that either differ from the input properties or, if
 // there is an old snapshot of the resource, differ from the prior old snapshot's output properties.
 func getResourceOutputsPropertiesString(
-	step engine.StepEventMetadata, indent int, planning, debug, refresh, showSames bool) string {
-
+	step engine.StepEventMetadata, indent int, planning, debug, refresh, showSames bool,
+) string {
 	// During the actual update we always show all the outputs for the stack, even if they are unchanged.
 	if !showSames && !planning && step.URN.Type() == resource.RootStackType {
 		showSames = true
@@ -477,9 +484,6 @@ func shouldPrintPropertyValue(v resource.PropertyValue, outs bool) bool {
 	if v.IsObject() && len(v.ObjectValue()) == 0 {
 		return false // skip objects with no properties, since they are also uninteresting.
 	}
-	if v.IsObject() && len(v.ObjectValue()) == 0 {
-		return false // skip objects with no properties, since they are also uninteresting.
-	}
 	if v.IsOutput() && !outs {
 		// also don't show output properties until the outs parameter tells us to.
 		return false
@@ -589,7 +593,7 @@ func (p *propertyPrinter) printPropertyValue(v resource.PropertyValue) {
 		} else if path, has := a.GetPath(); has {
 			p.write("asset(file:%s) { %s }", shortHash(a.Hash), path)
 		} else {
-			contract.Assert(a.IsURI())
+			contract.Assertf(a.IsURI(), "asset is not a text, file, or URI")
 			p.write("asset(uri:%s) { %s }", shortHash(a.Hash), a.URI)
 		}
 	case v.IsArchive():
@@ -607,9 +611,10 @@ func (p *propertyPrinter) printPropertyValue(v resource.PropertyValue) {
 			p.writeWithIndentNoPrefix("}")
 		} else if path, has := a.GetPath(); has {
 			p.write("archive(file:%s) { %s }", shortHash(a.Hash), path)
+		} else if uri, has := a.GetURI(); has {
+			p.write("archive(uri:%s) { %v }", shortHash(a.Hash), uri)
 		} else {
-			contract.Assert(a.IsURI())
-			p.write("archive(uri:%s) { %v }", shortHash(a.Hash), a.URI)
+			p.write("archive(%s) { }", shortHash(a.Hash))
 		}
 	case v.IsObject():
 		obj := v.ObjectValue()
@@ -657,8 +662,8 @@ func shortHash(hash string) string {
 
 func printOldNewDiffs(
 	b *bytes.Buffer, olds resource.PropertyMap, news resource.PropertyMap, include []resource.PropertyKey,
-	planning bool, indent int, op display.StepOp, summary bool, truncateOutput bool, debug bool) {
-
+	planning bool, indent int, op display.StepOp, summary bool, truncateOutput bool, debug bool,
+) {
 	// Get the full diff structure between the two, and print it (recursively).
 	if diff := olds.Diff(news, resource.IsInternalPropertyKey); diff != nil {
 		PrintObjectDiff(b, *diff, include, planning, indent, summary, truncateOutput, debug)
@@ -670,8 +675,8 @@ func printOldNewDiffs(
 }
 
 func PrintObjectDiff(b *bytes.Buffer, diff resource.ObjectDiff, include []resource.PropertyKey,
-	planning bool, indent int, summary bool, truncateOutput bool, debug bool) {
-
+	planning bool, indent int, summary bool, truncateOutput bool, debug bool,
+) {
 	p := propertyPrinter{
 		dest:           b,
 		planning:       planning,
@@ -685,7 +690,7 @@ func PrintObjectDiff(b *bytes.Buffer, diff resource.ObjectDiff, include []resour
 }
 
 func (p *propertyPrinter) printObjectDiff(diff resource.ObjectDiff, include []resource.PropertyKey) {
-	contract.Assert(p.indent > 0)
+	contract.Assertf(p.indent > 0, "indentation must be > 0 to print object diffs")
 
 	// Compute the maximum width of property keys so we can justify everything. If an include set was given, filter out
 	// any properties that are not in the set.
@@ -715,8 +720,8 @@ func (p *propertyPrinter) printObjectPropertyDiff(key resource.PropertyKey, maxk
 	titleFunc := propertyTitlePrinter(string(key), maxkey)
 	if add, isadd := diff.Adds[key]; isadd {
 		p.printAdd(add, titleFunc)
-	} else if delete, isdelete := diff.Deletes[key]; isdelete {
-		p.printDelete(delete, titleFunc)
+	} else if del, isdelete := diff.Deletes[key]; isdelete {
+		p.printDelete(del, titleFunc)
 	} else if update, isupdate := diff.Updates[key]; isupdate {
 		p.printPropertyValueDiff(titleFunc, update)
 	} else if same := diff.Sames[key]; !p.summary && shouldPrintPropertyValue(same, p.planning) {
@@ -726,7 +731,7 @@ func (p *propertyPrinter) printObjectPropertyDiff(key resource.PropertyKey, maxk
 
 func (p *propertyPrinter) printPropertyValueDiff(titleFunc func(*propertyPrinter), diff resource.ValueDiff) {
 	p = p.withOp(deploy.OpUpdate).withPrefix(true)
-	contract.Assert(p.indent > 0)
+	contract.Assertf(p.indent > 0, "indentation must be > 0 to print property value diffs")
 
 	if diff.Array != nil {
 		titleFunc(p)
@@ -741,8 +746,8 @@ func (p *propertyPrinter) printPropertyValueDiff(titleFunc func(*propertyPrinter
 
 			if add, isadd := a.Adds[i]; isadd {
 				elemPrinter.printAdd(add, elemTitleFunc)
-			} else if delete, isdelete := a.Deletes[i]; isdelete {
-				elemPrinter.printDelete(delete, elemTitleFunc)
+			} else if del, isdelete := a.Deletes[i]; isdelete {
+				elemPrinter.printDelete(del, elemTitleFunc)
 			} else if update, isupdate := a.Updates[i]; isupdate {
 				elemPrinter.printPropertyValueDiff(elemTitleFunc, update)
 			} else if same, issame := a.Sames[i]; issame && !p.summary {
@@ -802,13 +807,25 @@ func isPrimitive(value resource.PropertyValue) bool {
 }
 
 func (p *propertyPrinter) printPrimitivePropertyValue(v resource.PropertyValue) {
-	contract.Assert(isPrimitive(v))
+	contract.Requiref(isPrimitive(v), "v", "must be primitive")
 	if v.IsNull() {
 		p.writeVerbatim("<null>")
 	} else if v.IsBool() {
 		p.write("%t", v.BoolValue())
 	} else if v.IsNumber() {
-		p.write("%v", v.NumberValue())
+		// All pulumi numbers are IEEE doubles really (even in languages where we codegen integers the wire
+		// protocol only supports doubles). But by default Go will print them in scientific notation for large
+		// enough values which is suboptimal for our purposes when the value is still an integer. (i.e.
+		// non-fractional). See https://github.com/pulumi/pulumi/issues/13016 for context.
+		number := v.NumberValue()
+		if math.Trunc(number) == number {
+			p.write("%.f", number)
+		} else {
+			// For factional values we're fine with Go printing them in scientific notation for large
+			// exponents.
+			p.write("%g", number)
+		}
+
 	} else if v.IsString() {
 		if vv, kind, ok := p.decodeValue(v.StringValue()); ok {
 			p.write("(%s) ", kind)
@@ -853,8 +870,8 @@ func (p *propertyPrinter) printAdd(v resource.PropertyValue, title func(*propert
 }
 
 func (p *propertyPrinter) printArchiveDiff(titleFunc func(*propertyPrinter),
-	oldArchive, newArchive *resource.Archive) {
-
+	oldArchive, newArchive *resource.Archive,
+) {
 	p = p.withOp(deploy.OpUpdate).withPrefix(true)
 
 	hashChange := getTextChangeString(shortHash(oldArchive.Hash), shortHash(newArchive.Hash))
@@ -872,7 +889,7 @@ func (p *propertyPrinter) printArchiveDiff(titleFunc func(*propertyPrinter),
 			return
 		}
 	} else {
-		contract.Assert(oldArchive.IsAssets())
+		contract.Assertf(oldArchive.IsAssets(), "old archive is not a path, URI, or a group of assets")
 		oldAssets, _ := oldArchive.GetAssets()
 
 		if newAssets, has := newArchive.GetAssets(); has {
@@ -896,8 +913,8 @@ func (p *propertyPrinter) printAssetsDiff(oldAssets, newAssets map[string]interf
 	// as an add.  For any asset in both we print out of it is unchanged or not.  If so, we
 	// recurse on that data to print out how it changed.
 
-	var oldNames []string
-	var newNames []string
+	oldNames := slice.Prealloc[string](len(oldAssets))
+	newNames := slice.Prealloc[string](len(newAssets))
 
 	for name := range oldAssets {
 		oldNames = append(oldNames, name)
@@ -913,7 +930,7 @@ func (p *propertyPrinter) printAssetsDiff(oldAssets, newAssets map[string]interf
 	i := 0
 	j := 0
 
-	var keys []resource.PropertyKey
+	keys := slice.Prealloc[resource.PropertyKey](len(oldNames) + len(newNames))
 	for _, name := range oldNames {
 		keys = append(keys, "\""+resource.PropertyKey(name)+"\"")
 	}
@@ -981,9 +998,8 @@ func (p *propertyPrinter) printAssetsDiff(oldAssets, newAssets map[string]interf
 			titleFunc := propertyTitlePrinter("\""+oldName+"\"", maxkey)
 			p.indented(1).printDelete(assetOrArchiveToPropertyValue(oldAssets[oldName]), titleFunc)
 			i++
-			continue
 		} else {
-			contract.Assert(addNew)
+			contract.Assertf(addNew, "expected to print new asset")
 			newName := newNames[j]
 			titleFunc := propertyTitlePrinter("\""+newName+"\"", maxkey)
 			p.indented(1).printAdd(assetOrArchiveToPropertyValue(newAssets[newName]), titleFunc)
@@ -1020,7 +1036,7 @@ func (p *propertyPrinter) printAssetDiff(titleFunc func(*propertyPrinter), oldAs
 			return
 		}
 	} else {
-		contract.Assert(oldAsset.IsURI())
+		contract.Assertf(oldAsset.IsURI(), "old asset is not text, path, or URI")
 
 		oldURI, _ := oldAsset.GetURI()
 		if newURI, has := newAsset.GetURI(); has {
@@ -1180,10 +1196,13 @@ func (p *propertyPrinter) printEncodedValueDiff(old, new string) bool {
 		return false
 	}
 
-	if oldKind == newKind {
-		p.write("(%s) ", oldKind)
-	} else {
+	if oldKind != newKind {
 		p.write("(%s => %s) ", oldKind, newKind)
+	} else if old != new {
+		p.printTextDiff(strconv.Quote(old), strconv.Quote(new))
+		return true
+	} else {
+		p.write("(%s) ", oldKind)
 	}
 
 	diff := oldValue.Diff(newValue, resource.IsInternalPropertyKey)
@@ -1198,20 +1217,39 @@ func (p *propertyPrinter) printEncodedValueDiff(old, new string) bool {
 
 func (p *propertyPrinter) decodeValue(repr string) (resource.PropertyValue, string, bool) {
 	decode := func() (interface{}, string, bool) {
+		// Strip whitespace for the purposes of decoding.
+		repr = strings.TrimSpace(repr)
 		r := strings.NewReader(repr)
 
+		jsonDecoder := json.NewDecoder(r)
 		var object interface{}
-		if err := json.NewDecoder(r).Decode(&object); err == nil {
-			return object, "json", true
+		if err := jsonDecoder.Decode(&object); err == nil {
+			// Make sure _all_ the string was consumed as JSON.
+			if !jsonDecoder.More() {
+				return object, "json", true
+			}
+		}
+
+		// Only attempt to decode a YAML value if the representation is a multi-line string.
+		// This avoids decoding simple strings like "foo: bar" or "-" as YAML.
+		if !strings.ContainsAny(repr, "\r\n") {
+			return nil, "", false
 		}
 
 		r.Reset(repr)
-		if err := yaml.NewDecoder(r).Decode(&object); err == nil {
-			translated, ok := p.translateYAMLValue(object)
-			if !ok {
-				return nil, "", false
+		yamlDecoder := yaml.NewDecoder(r)
+		if err := yamlDecoder.Decode(&object); err == nil {
+			// Make sure _all_ the string was consumed as YAML. Unlike JsonDecoder above, the YamlDecoder
+			// doesn't give an easy way to do this, so our workaround is we ask it to try and decode another
+			// value, and if it fails with io.EOF, then we know we've consumed the whole string.
+			eofErr := yamlDecoder.Decode(nil)
+			if errors.Is(eofErr, io.EOF) {
+				translated, ok := p.translateYAMLValue(object)
+				if !ok {
+					return nil, "", false
+				}
+				return translated, "yaml", true
 			}
-			return translated, "yaml", true
 		}
 
 		return nil, "", false

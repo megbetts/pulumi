@@ -17,6 +17,7 @@ package pcl
 import (
 	"fmt"
 	"io"
+	"path"
 	"sort"
 
 	"github.com/hashicorp/hcl/v2"
@@ -24,9 +25,12 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
+	"github.com/spf13/afero"
 )
 
-// Node represents a single definition in a program or component. Nodes may be config, locals, resources, or outputs.
+// Node represents a single definition in a program or component.
+// Nodes may be config, locals, resources, components, or outputs.
 type Node interface {
 	model.Definition
 
@@ -117,13 +121,13 @@ func (p *Program) Packages() []*schema.Package {
 
 // PackageReferences returns the list of package referenced used by this program.
 func (p *Program) PackageReferences() []schema.PackageReference {
-	keys := make([]string, 0, len(p.binder.referencedPackages))
+	keys := slice.Prealloc[string](len(p.binder.referencedPackages))
 	for k := range p.binder.referencedPackages {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	values := make([]schema.PackageReference, 0, len(p.binder.referencedPackages))
+	values := slice.Prealloc[schema.PackageReference](len(p.binder.referencedPackages))
 	for _, k := range keys {
 		values = append(values, p.binder.referencedPackages[k])
 	}
@@ -134,13 +138,13 @@ func (p *Program) PackageReferences() []schema.PackageReference {
 // its returned value is a snapshot that contains only the package members referenced by the program. Otherwise, its
 // returned value is the full package definition.
 func (p *Program) PackageSnapshots() ([]*schema.Package, error) {
-	keys := make([]string, 0, len(p.binder.referencedPackages))
+	keys := slice.Prealloc[string](len(p.binder.referencedPackages))
 	for k := range p.binder.referencedPackages {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	values := make([]*schema.Package, 0, len(p.binder.referencedPackages))
+	values := slice.Prealloc[*schema.Package](len(p.binder.referencedPackages))
 	for _, k := range keys {
 		ref := p.binder.referencedPackages[k]
 
@@ -166,4 +170,121 @@ func (p *Program) Source() map[string]string {
 		source[file.Name] = string(file.Bytes)
 	}
 	return source
+}
+
+// writeSourceFiles writes the source files of the program, including those files of used components into the
+// provided file system starting from a root directory.
+func (p *Program) writeSourceFiles(directory string, fs afero.Fs, seenPaths map[string]bool) error {
+	// create the directory if it doesn't already exist
+	err := fs.MkdirAll(directory, 0o755)
+	if err != nil {
+		return fmt.Errorf("could not create output directory: %w", err)
+	}
+
+	for _, file := range p.files {
+		outputFile := path.Join(directory, file.Name)
+		err := afero.WriteFile(fs, outputFile, file.Bytes, 0o600)
+		if err != nil {
+			return fmt.Errorf("could not write output program: %w", err)
+		}
+	}
+
+	for _, node := range p.Nodes {
+		switch node := node.(type) {
+		case *Component:
+			componentDirectory := path.Join(directory, node.source)
+			if _, seen := seenPaths[componentDirectory]; !seen {
+				seenPaths[componentDirectory] = true
+				err = node.Program.writeSourceFiles(componentDirectory, fs, seenPaths)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// WriteSource writes the source files of the program, including those files of used components into the
+// provided file system.
+func (p *Program) WriteSource(fs afero.Fs) error {
+	seenPaths := map[string]bool{}
+	return p.writeSourceFiles("/", fs, seenPaths)
+}
+
+// collectComponentsRecursive is a helper function to find all used components in a program
+// and recursively searches of nested components from sub programs.
+func (p *Program) collectComponentsRecursive(components map[string]*Component) {
+	for _, node := range p.Nodes {
+		switch node := node.(type) {
+		case *Component:
+			if _, seen := components[node.DirPath()]; !seen {
+				components[node.DirPath()] = node
+				node.Program.collectComponentsRecursive(components)
+			}
+		}
+	}
+}
+
+// CollectComponents finds all used components in a program and recursively searches of nested components
+// from sub programs.
+func (p *Program) CollectComponents() map[string]*Component {
+	components := map[string]*Component{}
+	p.collectComponentsRecursive(components)
+	return components
+}
+
+func (p *Program) collectPackageSnapshots(seenPackages map[string]*schema.Package) error {
+	packages, err := p.PackageSnapshots()
+	if err != nil {
+		return err
+	}
+
+	for _, pkg := range packages {
+		if _, seen := seenPackages[pkg.Name]; !seen {
+			seenPackages[pkg.Name] = pkg
+		}
+	}
+
+	for _, component := range p.CollectComponents() {
+		err = component.Program.collectPackageSnapshots(seenPackages)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *Program) CollectNestedPackageSnapshots() (map[string]*schema.Package, error) {
+	seenPackages := map[string]*schema.Package{}
+	err := p.collectPackageSnapshots(seenPackages)
+	return seenPackages, err
+}
+
+// ConfigVariables returns the config variable nodes of the program
+func (p *Program) ConfigVariables() []*ConfigVariable {
+	var configVars []*ConfigVariable
+	for _, node := range p.Nodes {
+		switch node := node.(type) {
+		case *ConfigVariable:
+			configVars = append(configVars, node)
+		}
+	}
+
+	return configVars
+}
+
+// OutputVariables returns the output variable nodes of the program
+func (p *Program) OutputVariables() []*OutputVariable {
+	var outputs []*OutputVariable
+	for _, node := range p.Nodes {
+		switch node := node.(type) {
+		case *OutputVariable:
+			outputs = append(outputs, node)
+		}
+	}
+
+	return outputs
 }

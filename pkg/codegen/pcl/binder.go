@@ -17,6 +17,7 @@ package pcl
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/hashicorp/hcl/v2"
@@ -29,22 +30,51 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
-const pulumiPackage = "pulumi"
-const LogicalNamePropertyKey = "__logicalName"
+const (
+	pulumiPackage          = "pulumi"
+	LogicalNamePropertyKey = "__logicalName"
+)
+
+type ComponentProgramBinderArgs struct {
+	AllowMissingVariables        bool
+	AllowMissingProperties       bool
+	SkipResourceTypecheck        bool
+	SkipInvokeTypecheck          bool
+	SkipRangeTypecheck           bool
+	PreferOutputVersionedInvokes bool
+	BinderDirPath                string
+	BinderLoader                 schema.Loader
+	ComponentSource              string
+	ComponentNodeRange           hcl.Range
+}
+
+type ComponentProgramBinder = func(ComponentProgramBinderArgs) (*Program, hcl.Diagnostics, error)
 
 type bindOptions struct {
-	allowMissingVariables  bool
-	allowMissingProperties bool
-	skipResourceTypecheck  bool
-	loader                 schema.Loader
-	packageCache           *PackageCache
+	allowMissingVariables        bool
+	allowMissingProperties       bool
+	skipResourceTypecheck        bool
+	skipInvokeTypecheck          bool
+	skipRangeTypecheck           bool
+	preferOutputVersionedInvokes bool
+	loader                       schema.Loader
+	packageCache                 *PackageCache
+	// the directory path of the PCL program being bound
+	// we use this to locate the source of the component blocks
+	// which refer to a component resource in a relative directory
+	dirPath                string
+	componentProgramBinder ComponentProgramBinder
 }
 
 func (opts bindOptions) modelOptions() []model.BindOption {
+	var options []model.BindOption
 	if opts.allowMissingVariables {
-		return []model.BindOption{model.AllowMissingVariables}
+		options = append(options, model.AllowMissingVariables)
 	}
-	return nil
+	if opts.skipRangeTypecheck {
+		options = append(options, model.SkipRangeTypechecking)
+	}
+	return options
 }
 
 type binder struct {
@@ -72,6 +102,18 @@ func SkipResourceTypechecking(options *bindOptions) {
 	options.skipResourceTypecheck = true
 }
 
+func SkipRangeTypechecking(options *bindOptions) {
+	options.skipRangeTypecheck = true
+}
+
+func PreferOutputVersionedInvokes(options *bindOptions) {
+	options.preferOutputVersionedInvokes = true
+}
+
+func SkipInvokeTypechecking(options *bindOptions) {
+	options.skipInvokeTypecheck = true
+}
+
 func PluginHost(host plugin.Host) BindOption {
 	return Loader(schema.NewPluginLoader(host))
 }
@@ -85,6 +127,30 @@ func Loader(loader schema.Loader) BindOption {
 func Cache(cache *PackageCache) BindOption {
 	return func(options *bindOptions) {
 		options.packageCache = cache
+	}
+}
+
+func DirPath(path string) BindOption {
+	return func(options *bindOptions) {
+		options.dirPath = path
+	}
+}
+
+func ComponentBinder(binder ComponentProgramBinder) BindOption {
+	return func(options *bindOptions) {
+		options.componentProgramBinder = binder
+	}
+}
+
+// NonStrictBindOptions returns a set of bind options that make the binder lenient about type checking.
+// Changing errors into warnings when possible
+func NonStrictBindOptions() []BindOption {
+	return []BindOption{
+		AllowMissingVariables,
+		AllowMissingProperties,
+		SkipResourceTypechecking,
+		SkipInvokeTypechecking,
+		SkipRangeTypechecking,
 	}
 }
 
@@ -128,7 +194,7 @@ func BindProgram(files []*syntax.File, opts ...BindOption) (*Program, hcl.Diagno
 		ConstantValue: cty.NullVal(cty.DynamicPseudoType),
 	})
 	// Define builtin functions.
-	for name, fn := range pulumiBuiltins {
+	for name, fn := range pulumiBuiltins(options) {
 		b.root.DefineFunction(name, fn)
 	}
 	// Define the invoke function.
@@ -153,11 +219,84 @@ func BindProgram(files []*syntax.File, opts ...BindOption) (*Program, hcl.Diagno
 		diagnostics = append(diagnostics, b.bindNode(n)...)
 	}
 
+	if diagnostics.HasErrors() {
+		return nil, diagnostics, diagnostics
+	}
+
 	return &Program{
 		Nodes:  b.nodes,
 		files:  files,
 		binder: b,
 	}, diagnostics, nil
+}
+
+// Used by language plugins to bind a PCL program in the given directory.
+func BindDirectory(
+	directory string,
+	loader schema.ReferenceLoader,
+	extraOptions ...BindOption,
+) (*Program, hcl.Diagnostics, error) {
+	parser := syntax.NewParser()
+	// Load all .pp files in the directory
+	files, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var parseDiagnostics hcl.Diagnostics
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		fileName := file.Name()
+		path := filepath.Join(directory, fileName)
+
+		if filepath.Ext(path) == ".pp" {
+			file, err := os.Open(path)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			err = parser.ParseFile(file, filepath.Base(path))
+			if err != nil {
+				return nil, nil, err
+			}
+			parseDiagnostics = append(parseDiagnostics, parser.Diagnostics...)
+		}
+	}
+
+	if parseDiagnostics.HasErrors() {
+		return nil, parseDiagnostics, nil
+	}
+
+	opts := []BindOption{
+		Loader(loader),
+		DirPath(directory),
+		ComponentBinder(ComponentProgramBinderFromFileSystem()),
+	}
+
+	opts = append(opts, extraOptions...)
+
+	program, bindDiagnostics, err := BindProgram(parser.Files, opts...)
+
+	// err will be the same as bindDiagnostics if there are errors, but we don't want to return that here.
+	// err _could_ also be a context setup error in which case bindDiagnotics will be nil and that we do want to return.
+	if bindDiagnostics != nil {
+		err = nil
+	}
+
+	allDiagnostics := append(parseDiagnostics, bindDiagnostics...)
+	return program, allDiagnostics, err
+}
+
+func makeObjectPropertiesOptional(objectType *model.ObjectType) *model.ObjectType {
+	for property, propertyType := range objectType.Properties {
+		if !model.IsOptionalType(propertyType) {
+			objectType.Properties[property] = model.NewOptionalType(propertyType)
+		}
+	}
+
+	return objectType
 }
 
 // declareNodes declares all of the top-level nodes in the given file. This includes config, resources, outputs, and
@@ -216,6 +355,22 @@ func (b *binder) declareNodes(file *syntax.File) (hcl.Diagnostics, error) {
 						return diagnostics, fmt.Errorf("cannot bind expression: %v", diagnostics.Error())
 					}
 					typ = typeExpr.Type()
+					switch configType := typ.(type) {
+					case *model.ObjectType:
+						typ = makeObjectPropertiesOptional(configType)
+					case *model.ListType:
+						switch elementType := configType.ElementType.(type) {
+						case *model.ObjectType:
+							modifiedElementType := makeObjectPropertiesOptional(elementType)
+							typ = model.NewListType(modifiedElementType)
+						}
+					case *model.MapType:
+						switch elementType := configType.ElementType.(type) {
+						case *model.ObjectType:
+							modifiedElementType := makeObjectPropertiesOptional(elementType)
+							typ = model.NewMapType(modifiedElementType)
+						}
+					}
 				default:
 					diagnostics = append(diagnostics, labelsErrorf(item, "config variables must have exactly one or two labels"))
 				}
@@ -257,6 +412,22 @@ func (b *binder) declareNodes(file *syntax.File) (hcl.Diagnostics, error) {
 				if err := b.loadReferencedPackageSchemas(v); err != nil {
 					return nil, err
 				}
+			case "component":
+				if len(item.Labels) != 2 {
+					diagnostics = append(diagnostics, labelsErrorf(item, "components must have exactly two labels"))
+					continue
+				}
+				name := item.Labels[0]
+				source := item.Labels[1]
+
+				v := &Component{
+					name:         name,
+					syntax:       item,
+					source:       source,
+					VariableType: model.DynamicType,
+				}
+				diags := b.declareNode(name, v)
+				diagnostics = append(diagnostics, diags...)
 			}
 		}
 	}
@@ -283,6 +454,19 @@ func getStringAttrValue(attr *model.Attribute) (string, *hcl.Diagnostic) {
 		return part.Val.AsString(), nil
 	default:
 		return "", stringAttributeError(attr)
+	}
+}
+
+// Returns the value of constant boolean attribute
+func getBooleanAttributeValue(attr *model.Attribute) (bool, *hcl.Diagnostic) {
+	switch lit := attr.Syntax.Expr.(type) {
+	case *hclsyntax.LiteralValueExpr:
+		if lit.Val.Type() != cty.Bool {
+			return false, boolAttributeError(attr)
+		}
+		return lit.Val.True(), nil
+	default:
+		return false, boolAttributeError(attr)
 	}
 }
 

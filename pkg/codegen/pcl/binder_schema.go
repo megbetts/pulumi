@@ -16,6 +16,7 @@ package pcl
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/blang/semver"
@@ -24,6 +25,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/codegen"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/zclconf/go-cty/cty"
 )
@@ -32,6 +34,8 @@ type packageSchema struct {
 	schema schema.PackageReference
 
 	// These maps map from canonical tokens to actual tokens.
+	//
+	// Both maps take `nil` to mean uninitialized.
 	resourceTokenMap map[string]string
 	functionTokenMap map[string]string
 }
@@ -41,8 +45,24 @@ type packageOpts struct {
 	pluginDownloadURL string
 }
 
+// Lookup a PCL invoke token in a schema.
+func LookupFunction(pkg schema.PackageReference, token string) (*schema.Function, bool, error) {
+	s, _, ok, err := newPackageSchema(pkg).LookupFunction(token)
+	return s, ok, err
+}
+
+// Lookup a PCL resource token in a schema.
+func LookupResource(pkg schema.PackageReference, token string) (*schema.Resource, bool, error) {
+	r, _, ok, err := newPackageSchema(pkg).LookupResource(token)
+	return r, ok, err
+}
+
 func (ps *packageSchema) LookupFunction(token string) (*schema.Function, string, bool, error) {
-	contract.Assert(ps != nil)
+	contract.Assertf(ps != nil, "packageSchema must not be nil")
+
+	if ps.functionTokenMap == nil {
+		ps.initFunctionMap()
+	}
 
 	schemaToken, ok := ps.functionTokenMap[token]
 	if !ok {
@@ -58,7 +78,11 @@ func (ps *packageSchema) LookupFunction(token string) (*schema.Function, string,
 }
 
 func (ps *packageSchema) LookupResource(token string) (*schema.Resource, string, bool, error) {
-	contract.Assert(ps != nil)
+	contract.Assertf(ps != nil, "packageSchema must not be nil")
+
+	if ps.resourceTokenMap == nil {
+		ps.initResourceMap()
+	}
 
 	schemaToken, ok := ps.resourceTokenMap[token]
 	if !ok {
@@ -71,6 +95,26 @@ func (ps *packageSchema) LookupResource(token string) (*schema.Resource, string,
 
 	res, ok, err := ps.schema.Resources().Get(schemaToken)
 	return res, token, ok, err
+}
+
+func (ps *packageSchema) initFunctionMap() {
+	functionTokenMap := map[string]string{}
+	for it := ps.schema.Functions().Range(); it.Next(); {
+		functionTokenMap[canonicalizeToken(it.Token(), ps.schema)] = it.Token()
+	}
+	ps.functionTokenMap = functionTokenMap
+}
+
+func (ps *packageSchema) initResourceMap() {
+	resourceTokenMap := map[string]string{}
+	for it := ps.schema.Resources().Range(); it.Next(); {
+		resourceTokenMap[canonicalizeToken(it.Token(), ps.schema)] = it.Token()
+	}
+	ps.resourceTokenMap = resourceTokenMap
+}
+
+func newPackageSchema(pkg schema.PackageReference) *packageSchema {
+	return &packageSchema{schema: pkg}
 }
 
 type PackageInfo struct {
@@ -121,20 +165,7 @@ func (c *PackageCache) loadPackageSchema(loader schema.Loader, name, version str
 		return nil, err
 	}
 
-	resourceTokenMap := map[string]string{}
-	for it := pkg.Resources().Range(); it.Next(); {
-		resourceTokenMap[canonicalizeToken(it.Token(), pkg)] = it.Token()
-	}
-	functionTokenMap := map[string]string{}
-	for it := pkg.Functions().Range(); it.Next(); {
-		functionTokenMap[canonicalizeToken(it.Token(), pkg)] = it.Token()
-	}
-
-	schema := &packageSchema{
-		schema:           pkg,
-		resourceTokenMap: resourceTokenMap,
-		functionTokenMap: functionTokenMap,
-	}
+	schema := newPackageSchema(pkg)
 
 	c.m.Lock()
 	defer c.m.Unlock()
@@ -162,7 +193,8 @@ func (b *binder) getPkgOpts(node *Resource) packageOpts {
 			if rng, hasRange := block.Body.Attributes["range"]; hasRange {
 				expr, _ := model.BindExpression(rng.Expr, b.root, b.tokens, b.options.modelOptions()...)
 				typ := model.ResolveOutputs(expr.Type())
-				rk, rv, _ := model.GetCollectionTypes(typ, rng.Range())
+				strict := !b.options.skipRangeTypecheck
+				rk, rv, _ := model.GetCollectionTypes(typ, rng.Range(), strict)
 				rangeKey, rangeValue = rk, rv
 			}
 		}
@@ -234,7 +266,7 @@ func (b *binder) loadReferencedPackageSchemas(n Node) error {
 		}
 		return nil
 	})
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 
 	for _, name := range packageNames.SortedValues() {
 		if _, ok := b.referencedPackages[name]; ok && pkgOpts.version == "" || name == "" {
@@ -243,6 +275,9 @@ func (b *binder) loadReferencedPackageSchemas(n Node) error {
 
 		pkg, err := b.options.packageCache.loadPackageSchema(b.options.loader, name, pkgOpts.version)
 		if err != nil {
+			if b.options.skipResourceTypecheck || b.options.skipInvokeTypecheck {
+				continue
+			}
 			return err
 		}
 		b.referencedPackages[name] = pkg.schema
@@ -359,7 +394,11 @@ func (b *binder) schemaTypeToType(src schema.Type) model.Type {
 		case schema.ArchiveType:
 			return ArchiveType
 		case schema.AssetType:
-			return AssetType
+			// Generated SDK code accepts assets or archives when schema.AssetType is
+			// specified. In an effort to keep PCL type checking in sync with our
+			// generated SDKs, we match the SDKs behavior when translating schema types to
+			// PCL types.
+			return AssetOrArchiveType
 		case schema.JSONType:
 			fallthrough
 		case schema.AnyType:
@@ -445,7 +484,7 @@ func GetSchemaForType(t model.Type) (schema.Type, bool) {
 		if len(schemas) == 0 {
 			return nil, false
 		}
-		schemaTypes := make([]schema.Type, 0, len(schemas))
+		schemaTypes := slice.Prealloc[schema.Type](len(schemas))
 		for t := range schemas {
 			schemaTypes = append(schemaTypes, t.(schema.Type))
 		}
@@ -456,7 +495,7 @@ func GetSchemaForType(t model.Type) (schema.Type, bool) {
 	case *model.EnumType:
 		for _, t := range t.Annotations {
 			if t, ok := t.(enumSchemaType); ok {
-				contract.Assert(t.Type != nil)
+				contract.Assertf(t.Type != nil, "enum schema type must not be nil")
 				return t.Type, true
 			}
 		}
@@ -549,7 +588,7 @@ func GenEnum(
 	from model.Expression,
 	safeEnum func(member *schema.Enum),
 	unsafeEnum func(from model.Expression),
-) {
+) *hcl.Diagnostic {
 	known := cty.NilVal
 	if from, ok := from.(*model.TemplateExpression); ok && len(from.Parts) == 1 {
 		if from, ok := from.Parts[0].(*model.LiteralValueExpression); ok {
@@ -566,8 +605,47 @@ func GenEnum(
 		contract.Assertf(ok,
 			"We have determined %s is a safe enum, which we define as "+
 				"being able to calculate a member for", t)
-		safeEnum(member)
+		if member != nil {
+			safeEnum(member)
+		} else {
+			unsafeEnum(from)
+			knownVal := strings.Split(strings.Split(known.GoString(), "(")[1], ")")[0]
+			diag := &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  fmt.Sprintf("%v is not a valid value of the enum \"%v\"", knownVal, t.Token),
+			}
+			if members := enumMemberValues(t); len(members) > 0 {
+				diag.Detail = fmt.Sprintf("Valid members are %v", listToString(members))
+			}
+			return diag
+		}
 	} else {
 		unsafeEnum(from)
 	}
+	return nil
+}
+
+func enumMemberValues(t *model.EnumType) []interface{} {
+	srcBase, ok := GetSchemaForType(t)
+	if !ok {
+		return nil
+	}
+	src := srcBase.(*schema.EnumType)
+	members := make([]interface{}, len(src.Elements))
+	for i, el := range src.Elements {
+		members[i] = el.Value
+	}
+	return members
+}
+
+func listToString(l []interface{}) string {
+	vals := ""
+	for i, v := range l {
+		if i == 0 {
+			vals = fmt.Sprintf("\"%v\"", v)
+		} else {
+			vals = fmt.Sprintf("%s, \"%v\"", vals, v)
+		}
+	}
+	return vals
 }

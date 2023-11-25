@@ -34,7 +34,7 @@ type policyEnableArgs struct {
 func newPolicyEnableCmd() *cobra.Command {
 	args := policyEnableArgs{}
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "enable <org-name>/<policy-pack-name> <latest|version>",
 		Args:  cmdutil.ExactArgs(2),
 		Short: "Enable a Policy Pack for a Pulumi organization",
@@ -42,8 +42,8 @@ func newPolicyEnableCmd() *cobra.Command {
 			"Can specify latest to enable the latest version of the Policy Pack or a specific version number.",
 		Run: cmdutil.RunFunc(func(cmd *cobra.Command, cliArgs []string) error {
 			ctx := commandContext()
-			// Obtain current PolicyPack, tied to the Pulumi service backend.
-			policyPack, err := requirePolicyPack(ctx, cliArgs[0])
+			// Obtain current PolicyPack, tied to the Pulumi Cloud backend.
+			policyPack, err := requirePolicyPack(ctx, cliArgs[0], loginToCloud)
 			if err != nil {
 				return err
 			}
@@ -67,7 +67,7 @@ func newPolicyEnableCmd() *cobra.Command {
 			return policyPack.Enable(ctx, args.policyGroup,
 				backend.PolicyPackOperation{
 					VersionTag: version,
-					Scopes:     cancellationScopes,
+					Scopes:     backend.CancellationScopes,
 					Config:     config,
 				})
 		}),

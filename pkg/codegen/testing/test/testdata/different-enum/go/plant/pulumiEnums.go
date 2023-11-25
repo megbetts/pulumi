@@ -8,6 +8,7 @@ import (
 	"reflect"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumix"
 )
 
 // The log_name to populate in the Cloud Audit Record. This is added to regress pulumi/pulumi issue #7913
@@ -188,6 +189,12 @@ func (in *containerBrightnessPtr) ToContainerBrightnessPtrOutputWithContext(ctx 
 	return pulumi.ToOutputWithContext(ctx, in).(ContainerBrightnessPtrOutput)
 }
 
+func (in *containerBrightnessPtr) ToOutput(ctx context.Context) pulumix.Output[*ContainerBrightness] {
+	return pulumix.Output[*ContainerBrightness]{
+		OutputState: in.ToContainerBrightnessPtrOutputWithContext(ctx).OutputState,
+	}
+}
+
 // plant container colors
 type ContainerColor string
 
@@ -362,6 +369,12 @@ func (in *containerSizePtr) ToContainerSizePtrOutput() ContainerSizePtrOutput {
 
 func (in *containerSizePtr) ToContainerSizePtrOutputWithContext(ctx context.Context) ContainerSizePtrOutput {
 	return pulumi.ToOutputWithContext(ctx, in).(ContainerSizePtrOutput)
+}
+
+func (in *containerSizePtr) ToOutput(ctx context.Context) pulumix.Output[*ContainerSize] {
+	return pulumix.Output[*ContainerSize]{
+		OutputState: in.ToContainerSizePtrOutputWithContext(ctx).OutputState,
+	}
 }
 
 func init() {

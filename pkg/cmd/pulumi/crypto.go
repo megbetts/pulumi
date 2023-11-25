@@ -19,64 +19,78 @@ import (
 	"strings"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
-	"github.com/pulumi/pulumi/pkg/v3/backend/filestate"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/passphrase"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/deepcopy"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
-func getStackEncrypter(s backend.Stack) (config.Encrypter, error) {
-	sm, err := getStackSecretsManager(s)
+func getStackEncrypter(s backend.Stack, ps *workspace.ProjectStack) (config.Encrypter, bool, error) {
+	sm, needsSave, err := getStackSecretsManager(s, ps)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return sm.Encrypter()
+	enc, err := sm.Encrypter()
+	if err != nil {
+		return nil, needsSave, err
+	}
+	return enc, needsSave, nil
 }
 
-func getStackDecrypter(s backend.Stack) (config.Decrypter, error) {
-	sm, err := getStackSecretsManager(s)
+func getStackDecrypter(s backend.Stack, ps *workspace.ProjectStack) (config.Decrypter, bool, error) {
+	sm, needsSave, err := getStackSecretsManager(s, ps)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return sm.Decrypter()
+	dec, err := sm.Decrypter()
+	if err != nil {
+		return nil, needsSave, err
+	}
+	return dec, needsSave, nil
 }
 
-func getStackSecretsManager(s backend.Stack) (secrets.Manager, error) {
-	project, _, err := readProject()
+func getStackSecretsManager(s backend.Stack, ps *workspace.ProjectStack) (secrets.Manager, bool, error) {
+	oldConfig := deepcopy.Copy(ps).(*workspace.ProjectStack)
 
+	var sm secrets.Manager
+	var err error
+	if ps.SecretsProvider != passphrase.Type && ps.SecretsProvider != "default" && ps.SecretsProvider != "" {
+		sm, err = cloud.NewCloudSecretsManager(
+			ps, ps.SecretsProvider, false /* rotateSecretsProvider */)
+	} else if ps.EncryptionSalt != "" {
+		sm, err = passphrase.NewPromptingPassphraseSecretsManager(
+			ps, false /* rotateSecretsProvider */)
+	} else {
+		sm, err = s.DefaultSecretManager(ps)
+	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	ps, err := loadProjectStack(project, s)
-	if err != nil {
-		return nil, err
+	// Handle if the configuration changed any of EncryptedKey, etc
+	needsSave := needsSaveProjectStackAfterSecretManger(s, oldConfig, ps)
+	return stack.NewCachingSecretsManager(sm), needsSave, nil
+}
+
+func needsSaveProjectStackAfterSecretManger(stack backend.Stack,
+	old *workspace.ProjectStack, new *workspace.ProjectStack,
+) bool {
+	// We should only save the ProjectStack at this point IF we have changed the
+	// secrets provider.
+	// If we do not check to see if the secrets provider has changed, then we will actually
+	// reload the configuration file to be sorted or an empty {} when creating a stack
+	// this is not the desired behaviour.
+	if old.EncryptedKey != new.EncryptedKey ||
+		old.EncryptionSalt != new.EncryptionSalt ||
+		old.SecretsProvider != new.SecretsProvider {
+		return true
 	}
-
-	sm, err := func() (secrets.Manager, error) {
-		configFile, err := getProjectStackPath(s)
-		if err != nil {
-			return nil, err
-		}
-
-		// nolint: goconst
-		if ps.SecretsProvider != passphrase.Type && ps.SecretsProvider != "default" && ps.SecretsProvider != "" {
-			return newCloudSecretsManager(s.Ref().Name(), configFile, ps.SecretsProvider)
-		}
-
-		if ps.EncryptionSalt != "" {
-			return filestate.NewPassphraseSecretsManager(s.Ref().Name(), configFile, false /* rotatePassphraseSecretsProvider */)
-		}
-
-		return s.DefaultSecretManager(configFile)
-	}()
-	if err != nil {
-		return nil, err
-	}
-	return stack.NewCachingSecretsManager(sm), nil
+	return false
 }
 
 func validateSecretsProvider(typ string) error {
@@ -90,5 +104,4 @@ func validateSecretsProvider(typ string) error {
 	return fmt.Errorf("unknown secrets provider type '%s' (supported values: %s)",
 		kind,
 		strings.Join(supportedKinds, ","))
-
 }

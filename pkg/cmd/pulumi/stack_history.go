@@ -41,7 +41,7 @@ This command displays data about previous updates for a stack.`,
 			opts := display.Options{
 				Color: cmdutil.GetGlobalColorization(),
 			}
-			s, err := requireStack(ctx, stack, false /*offerNew */, opts, false /*setCurrent*/)
+			s, err := requireStack(ctx, stack, stackLoadOnly, opts)
 			if err != nil {
 				return err
 			}
@@ -52,9 +52,22 @@ This command displays data about previous updates for a stack.`,
 			}
 			var decrypter config.Decrypter
 			if showSecrets {
-				crypter, err := getStackDecrypter(s)
+				project, _, err := readProject()
+				if err != nil {
+					return fmt.Errorf("loading project: %w", err)
+				}
+				ps, err := loadProjectStack(project, s)
+				if err != nil {
+					return fmt.Errorf("getting stack config: %w", err)
+				}
+				crypter, needsSave, err := getStackDecrypter(s, ps)
 				if err != nil {
 					return fmt.Errorf("decrypting secrets: %w", err)
+				}
+				if needsSave {
+					if err = saveProjectStack(s, ps); err != nil {
+						return fmt.Errorf("saving stack config: %w", err)
+					}
 				}
 				decrypter = crypter
 			}

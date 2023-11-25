@@ -7,9 +7,11 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/pkg/errors"
+	"errors"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumix"
 	"simple-enum-schema/plant"
+	"simple-enum-schema/plant/internal"
 )
 
 type RubberTree struct {
@@ -32,18 +34,19 @@ func NewRubberTree(ctx *pulumi.Context,
 	if args.Container != nil {
 		args.Container = args.Container.ToContainerPtrOutput().ApplyT(func(v *plant.Container) *plant.Container { return v.Defaults() }).(plant.ContainerPtrOutput)
 	}
-	if isZero(args.Diameter) {
+	if args.Diameter == nil {
 		args.Diameter = Diameter(6.0)
 	}
-	if isZero(args.Farm) {
+	if args.Farm == nil {
 		args.Farm = pulumi.StringPtr("(unknown)")
 	}
-	if isZero(args.Size) {
+	if args.Size == nil {
 		args.Size = TreeSize("medium")
 	}
-	if isZero(args.Type) {
+	if args.Type == nil {
 		args.Type = RubberTreeVariety("Burgundy")
 	}
+	opts = internal.PkgResourceDefaultOpts(opts)
 	var resource RubberTree
 	err := ctx.RegisterResource("plant:tree/v1:RubberTree", name, args, &resource, opts...)
 	if err != nil {
@@ -117,6 +120,12 @@ func (i *RubberTree) ToRubberTreeOutputWithContext(ctx context.Context) RubberTr
 	return pulumi.ToOutputWithContext(ctx, i).(RubberTreeOutput)
 }
 
+func (i *RubberTree) ToOutput(ctx context.Context) pulumix.Output[*RubberTree] {
+	return pulumix.Output[*RubberTree]{
+		OutputState: i.ToRubberTreeOutputWithContext(ctx).OutputState,
+	}
+}
+
 type RubberTreeOutput struct{ *pulumi.OutputState }
 
 func (RubberTreeOutput) ElementType() reflect.Type {
@@ -129,6 +138,12 @@ func (o RubberTreeOutput) ToRubberTreeOutput() RubberTreeOutput {
 
 func (o RubberTreeOutput) ToRubberTreeOutputWithContext(ctx context.Context) RubberTreeOutput {
 	return o
+}
+
+func (o RubberTreeOutput) ToOutput(ctx context.Context) pulumix.Output[*RubberTree] {
+	return pulumix.Output[*RubberTree]{
+		OutputState: o.OutputState,
+	}
 }
 
 func (o RubberTreeOutput) Container() plant.ContainerPtrOutput {

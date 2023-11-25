@@ -15,12 +15,13 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
 	user "github.com/tweekmonster/luser"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
@@ -85,7 +86,6 @@ func DetectProjectPath() (string, error) {
 	path, err := DetectProjectPathFrom(dir)
 	if err != nil {
 		return "", err
-
 	}
 
 	return path, nil
@@ -116,9 +116,19 @@ func DetectProjectPathFrom(dir string) (string, error) {
 	path, err := fsutil.WalkUp(dir, isProject, func(s string) bool {
 		return true
 	})
+	// We special case permission errors to cause ErrProjectNotFound to return from this function. This is so
+	// users can run pulumi with unreadable root directories.
+	var perr *fs.PathError
+	if errors.As(err, &perr) {
+		if errors.Is(perr.Err, fs.ErrPermission) {
+			err = nil
+		}
+	}
+
 	if err != nil {
 		return "", fmt.Errorf("failed to locate Pulumi.yaml project file: %w", err)
 	}
+
 	if path == "" {
 		// Embed/wrap ErrProjectNotFound
 		return "", fmt.Errorf(
@@ -159,7 +169,7 @@ func DetectProjectAndPath() (*Project, string, error) {
 	if err != nil {
 		return nil, "", err
 	} else if path == "" {
-		return nil, "", errors.Errorf("no Pulumi project found in the current working directory. " +
+		return nil, "", errors.New("no Pulumi project found in the current working directory. " +
 			"Move to a directory with a Pulumi project or try creating a project first with `pulumi new`.")
 	}
 
@@ -241,7 +251,7 @@ func GetPulumiHomeDir() (string, error) {
 	// Otherwise, use the current user's home dir + .pulumi
 	user, err := user.Current()
 	if err != nil {
-		return "", errors.Wrapf(err, "getting current user")
+		return "", fmt.Errorf("getting current user: %w", err)
 	}
 
 	return filepath.Join(user.HomeDir, BookkeepingDir), nil

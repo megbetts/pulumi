@@ -25,6 +25,7 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/hashicorp/hcl/v2"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 
 	"gopkg.in/yaml.v3"
 )
@@ -53,7 +54,6 @@ const (
 	jsonType    primitiveType = 8
 )
 
-// nolint: goconst
 func (t primitiveType) String() string {
 	switch t {
 	case boolType:
@@ -147,9 +147,6 @@ func (*ArrayType) isType() {}
 
 // EnumType represents an enum.
 type EnumType struct {
-	// Package is the type's package. Package will not be accurate for types loaded by
-	// reference. In that case, use PackageReference instead.
-	Package *Package
 	// PackageReference is the PackageReference that defines the resource.
 	PackageReference PackageReference
 	// Token is the type's Pulumi type token.
@@ -214,9 +211,6 @@ func (*UnionType) isType() {}
 
 // ObjectType represents schematized maps from strings to particular types.
 type ObjectType struct {
-	// Package is the package that defines the resource. Package will not be accurate for
-	// types loaded by reference. In that case, use PackageReference instead.
-	Package *Package
 	// PackageReference is the PackageReference that defines the resource.
 	PackageReference PackageReference
 	// Token is the type's Pulumi type token.
@@ -380,9 +374,6 @@ type Alias struct {
 
 // Resource describes a Pulumi resource.
 type Resource struct {
-	// Package is the package that defines the resource. Package will not be accurate for
-	// types loaded by reference. In that case, use PackageReference instead.
-	Package *Package
 	// PackageReference is the PackageReference that defines the resource.
 	PackageReference PackageReference
 	// Token is the resource's Pulumi type token.
@@ -530,16 +521,26 @@ type Method struct {
 
 // Function describes a Pulumi function.
 type Function struct {
-	// Package is the package that defines the function.
-	Package *Package
+	// PackageReference is the PackageReference that defines the function.
+	PackageReference PackageReference
 	// Token is the function's Pulumi type token.
 	Token string
 	// Comment is the description of the function, if any.
 	Comment string
 	// Inputs is the bag of input values for the function, if any.
 	Inputs *ObjectType
+	// Determines whether the input bag should be treated as a single argument or as multiple arguments.
+	MultiArgumentInputs bool
 	// Outputs is the bag of output values for the function, if any.
 	Outputs *ObjectType
+	// The return type of the function, if any.
+	ReturnType Type
+	// The return type is plain and not wrapped in an Output.
+	ReturnTypePlain bool
+	// When InlineObjectAsReturnType is true, it means that the return type definition is defined inline
+	// as an object type that should be generated as a separate type and it is not
+	// a reference to a existing type in the schema.
+	InlineObjectAsReturnType bool
 	// DeprecationMessage indicates whether or not the function is deprecated.
 	DeprecationMessage string
 	// Language specifies additional language-specific data about the function.
@@ -551,29 +552,14 @@ type Function struct {
 	IsOverlay bool
 }
 
-// Determines if codegen should emit a ${fn}Output version that
-// automatically accepts Inputs and returns Outputs.
+// NeedsOutputVersion determines if codegen should emit a ${fn}Output version that
+// automatically accepts Inputs and returns ReturnType.
 func (fun *Function) NeedsOutputVersion() bool {
 	// Skip functions that return no value. Arguably we could
 	// support them and return `Task`, but there are no such
 	// functions in `pulumi-azure-native` or `pulumi-aws` so we
 	// omit to simplify.
-	if fun.Outputs == nil {
-		return false
-	}
-
-	// Skip functions that have no inputs. The user can simply
-	// lift the `Task` to `Output` manually.
-	if fun.Inputs == nil {
-		return false
-	}
-
-	// No properties is kind of like no inputs.
-	if len(fun.Inputs.Properties) == 0 {
-		return false
-	}
-
-	return true
+	return fun.ReturnType != nil
 }
 
 // Package describes a Pulumi package.
@@ -651,7 +637,7 @@ type Language interface {
 }
 
 func sortedLanguageNames(metadata map[string]interface{}) []string {
-	names := make([]string, 0, len(metadata))
+	names := slice.Prealloc[string](len(metadata))
 	for lang := range metadata {
 		names = append(names, lang)
 	}
@@ -761,9 +747,11 @@ func importFunctionLanguages(function *Function, languages map[string]Language) 
 			return fmt.Errorf("importing inputs: %w", err)
 		}
 	}
-	if function.Outputs != nil {
-		if err := importObjectTypeLanguages(function.Outputs, languages); err != nil {
-			return fmt.Errorf("importing outputs: %w", err)
+	if function.ReturnType != nil {
+		if objectType, ok := function.ReturnType.(*ObjectType); ok && objectType != nil {
+			if err := importObjectTypeLanguages(objectType, languages); err != nil {
+				return fmt.Errorf("importing outputs: %w", err)
+			}
 		}
 	}
 
@@ -787,14 +775,14 @@ func (pkg *Package) ImportLanguages(languages map[string]Language) error {
 		pkg.importedLanguages = map[string]struct{}{}
 	}
 
-	any := false
+	found := false
 	for lang := range languages {
 		if _, ok := pkg.importedLanguages[lang]; !ok {
-			any = true
+			found = true
 			break
 		}
 	}
-	if !any {
+	if !found {
 		return nil
 	}
 
@@ -894,7 +882,7 @@ func (pkg *Package) TokenToModule(tok string) string {
 	}
 }
 
-func (pkg *Package) TokenToRuntimeModule(tok string) string {
+func TokenToRuntimeModule(tok string) string {
 	// token := pkg ":" module ":" member
 
 	components := strings.Split(tok, ":")
@@ -902,6 +890,10 @@ func (pkg *Package) TokenToRuntimeModule(tok string) string {
 		return ""
 	}
 	return components[1]
+}
+
+func (pkg *Package) TokenToRuntimeModule(tok string) string {
+	return TokenToRuntimeModule(tok)
 }
 
 func (pkg *Package) GetResource(token string) (*Resource, bool) {
@@ -1036,8 +1028,8 @@ func (pkg *Package) MarshalYAML() ([]byte, error) {
 }
 
 func (pkg *Package) marshalObjectData(comment string, properties []*Property, language map[string]interface{},
-	plain, isOverlay bool) (ObjectTypeSpec, error) {
-
+	plain, isOverlay bool,
+) (ObjectTypeSpec, error) {
 	required, props, err := pkg.marshalProperties(properties, plain)
 	if err != nil {
 		return ObjectTypeSpec{}, err
@@ -1078,8 +1070,12 @@ func (pkg *Package) marshalEnum(t *EnumType) ComplexTypeSpec {
 	}
 
 	return ComplexTypeSpec{
-		ObjectTypeSpec: ObjectTypeSpec{Type: pkg.marshalType(t.ElementType, false).Type, IsOverlay: t.IsOverlay},
-		Enum:           values,
+		ObjectTypeSpec: ObjectTypeSpec{
+			Description: t.Comment,
+			Type:        pkg.marshalType(t.ElementType, false).Type,
+			IsOverlay:   t.IsOverlay,
+		},
+		Enum: values,
 	}
 }
 
@@ -1103,7 +1099,7 @@ func (pkg *Package) marshalResource(r *Resource) (ResourceSpec, error) {
 		stateInputs = &o.ObjectTypeSpec
 	}
 
-	var aliases []AliasSpec
+	aliases := slice.Prealloc[AliasSpec](len(r.Aliases))
 	for _, a := range r.Aliases {
 		aliases = append(aliases, AliasSpec{
 			Name:    a.Name,
@@ -1141,6 +1137,13 @@ func (pkg *Package) marshalFunction(f *Function) (FunctionSpec, error) {
 		}
 		inputs = &ins.ObjectTypeSpec
 	}
+	var multiArgumentInputs []string
+	if f.MultiArgumentInputs {
+		multiArgumentInputs = make([]string, len(f.Inputs.Properties))
+		for i, prop := range f.Inputs.Properties {
+			multiArgumentInputs[i] = prop.Name
+		}
+	}
 
 	var outputs *ObjectTypeSpec
 	if f.Outputs != nil {
@@ -1151,22 +1154,47 @@ func (pkg *Package) marshalFunction(f *Function) (FunctionSpec, error) {
 		outputs = &outs.ObjectTypeSpec
 	}
 
+	var returnType *ReturnTypeSpec
+	if f.ReturnType != nil {
+		returnType = &ReturnTypeSpec{}
+		if objectType, ok := f.ReturnType.(*ObjectType); ok {
+			ret, err := pkg.marshalObject(objectType, true)
+			if err != nil {
+				return FunctionSpec{}, fmt.Errorf("marshaling object spec: %w", err)
+			}
+			returnType.ObjectTypeSpec = &ret.ObjectTypeSpec
+			if f.ReturnTypePlain {
+				returnType.ObjectTypeSpecIsPlain = true
+			}
+		} else {
+			typeSpec := pkg.marshalType(f.ReturnType, true)
+			returnType.TypeSpec = &typeSpec
+			if f.ReturnTypePlain {
+				returnType.TypeSpec.Plain = true
+			}
+		}
+	}
+
 	lang, err := marshalLanguage(f.Language)
 	if err != nil {
 		return FunctionSpec{}, err
 	}
 
 	return FunctionSpec{
-		Description: f.Comment,
-		Inputs:      inputs,
-		Outputs:     outputs,
-		Language:    lang,
+		Description:         f.Comment,
+		DeprecationMessage:  f.DeprecationMessage,
+		IsOverlay:           f.IsOverlay,
+		Inputs:              inputs,
+		MultiArgumentInputs: multiArgumentInputs,
+		Outputs:             outputs,
+		ReturnType:          returnType,
+		Language:            lang,
 	}, nil
 }
 
 func (pkg *Package) marshalProperties(props []*Property, plain bool) (required []string, specs map[string]PropertySpec,
-	err error) {
-
+	err error,
+) {
 	if len(props) == 0 {
 		return
 	}
@@ -1203,14 +1231,16 @@ func (pkg *Package) marshalProperties(props []*Property, plain bool) (required [
 		}
 
 		specs[p.Name] = PropertySpec{
-			TypeSpec:           pkg.marshalType(typ, plain),
-			Description:        p.Comment,
-			Const:              p.ConstValue,
-			Default:            defaultValue,
-			DefaultInfo:        defaultSpec,
-			DeprecationMessage: p.DeprecationMessage,
-			Language:           lang,
-			Secret:             p.Secret,
+			TypeSpec:             pkg.marshalType(typ, plain),
+			Description:          p.Comment,
+			Const:                p.ConstValue,
+			Default:              defaultValue,
+			DefaultInfo:          defaultSpec,
+			DeprecationMessage:   p.DeprecationMessage,
+			Language:             lang,
+			Secret:               p.Secret,
+			ReplaceOnChanges:     p.ReplaceOnChanges,
+			WillReplaceOnChanges: p.WillReplaceOnChanges,
 		}
 	}
 	return required, specs, nil
@@ -1265,11 +1295,11 @@ func (pkg *Package) marshalType(t Type, plain bool) TypeSpec {
 			Plain:         !plain,
 		}
 	case *ObjectType:
-		return TypeSpec{Ref: pkg.marshalTypeRef(t.Package, "types", t.Token)}
+		return TypeSpec{Ref: pkg.marshalTypeRef(t.PackageReference, "types", t.Token)}
 	case *EnumType:
-		return TypeSpec{Ref: pkg.marshalTypeRef(t.Package, "types", t.Token)}
+		return TypeSpec{Ref: pkg.marshalTypeRef(t.PackageReference, "types", t.Token)}
 	case *ResourceType:
-		return TypeSpec{Ref: pkg.marshalTypeRef(t.Resource.Package, "resources", t.Token)}
+		return TypeSpec{Ref: pkg.marshalTypeRef(t.Resource.PackageReference, "resources", t.Token)}
 	case *TokenType:
 		var defaultType string
 		if t.UnderlyingType != nil {
@@ -1278,7 +1308,7 @@ func (pkg *Package) marshalType(t Type, plain bool) TypeSpec {
 
 		return TypeSpec{
 			Type: defaultType,
-			Ref:  t.Token,
+			Ref:  pkg.marshalTypeRef(pkg.Reference(), "types", t.Token),
 		}
 	default:
 		switch t {
@@ -1304,15 +1334,15 @@ func (pkg *Package) marshalType(t Type, plain bool) TypeSpec {
 	}
 }
 
-func (pkg *Package) marshalTypeRef(container *Package, section, token string) string {
+func (pkg *Package) marshalTypeRef(container PackageReference, section, token string) string {
 	token = url.PathEscape(token)
 
-	if container == pkg {
+	if p, err := container.Definition(); err == nil && p == pkg {
 		return fmt.Sprintf("#/%s/%s", section, token)
 	}
 
 	// TODO(schema): this isn't quite right--it doesn't handle schemas sourced from URLs--but it's good enough for now.
-	return fmt.Sprintf("/%s/%v/schema.json#/%s/%s", container.Name, container.Version, section, token)
+	return fmt.Sprintf("/%s/v%v/schema.json#/%s/%s", container.Name(), container.Version(), section, token)
 }
 
 func marshalLanguage(lang map[string]interface{}) (map[string]RawMessage, error) {
@@ -1373,7 +1403,7 @@ func (m *RawMessage) UnmarshalYAML(node *yaml.Node) error {
 
 // TypeSpec is the serializable form of a reference to a type.
 type TypeSpec struct {
-	// Type is the primitive or composite type, if any. May be "bool", "integer", "number", "string", "array", or
+	// Type is the primitive or composite type, if any. May be "boolean", "string", "integer", "number", "array", or
 	// "object".
 	Type string `json:"type,omitempty" yaml:"type,omitempty"`
 	// Ref is a reference to a type in this or another document. For example, the built-in Archive, Asset, and Any
@@ -1515,21 +1545,268 @@ type ResourceSpec struct {
 	Methods map[string]string `json:"methods,omitempty" yaml:"methods,omitempty"`
 }
 
+// ReturnTypeSpec is either ObjectTypeSpec or TypeSpec.
+type ReturnTypeSpec struct {
+	ObjectTypeSpec *ObjectTypeSpec
+
+	// If ObjectTypeSpec is non-nil, it can also be marked with ObjectTypeSpecIsPlain: true
+	// indicating that the generated code should not wrap in the result in an Output but return
+	// it directly. This option is incompatible with marking individual properties with
+	// ObjectTypSpec.Plain.
+	ObjectTypeSpecIsPlain bool
+
+	TypeSpec *TypeSpec
+}
+
+type returnTypeSpecObjectSerialForm struct {
+	ObjectTypeSpec
+	Plain any `json:"plain,omitempty"`
+}
+
+func (returnTypeSpec *ReturnTypeSpec) marshalJSONLikeObject() (map[string]interface{}, error) {
+	ts := returnTypeSpec
+	bytes, err := ts.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]interface{}
+	if err := json.Unmarshal(bytes, &r); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (returnTypeSpec *ReturnTypeSpec) MarshalJSON() ([]byte, error) {
+	ts := returnTypeSpec
+	if ts.ObjectTypeSpec != nil {
+		form := returnTypeSpecObjectSerialForm{
+			ObjectTypeSpec: *ts.ObjectTypeSpec,
+		}
+		if ts.ObjectTypeSpecIsPlain {
+			form.Plain = true
+		} else if len(ts.ObjectTypeSpec.Plain) > 0 {
+			form.Plain = ts.ObjectTypeSpec.Plain
+		}
+		return json.Marshal(form)
+	}
+	return json.Marshal(ts.TypeSpec)
+}
+
+func (returnTypeSpec *ReturnTypeSpec) UnmarshalJSON(inputJSON []byte) error {
+	ts := returnTypeSpec
+	var m returnTypeSpecObjectSerialForm
+	err := json.Unmarshal(inputJSON, &m)
+	if err == nil {
+		if m.ObjectTypeSpec.Properties != nil {
+			ts.ObjectTypeSpec = &m.ObjectTypeSpec
+			if plain, ok := m.Plain.(bool); ok && plain {
+				ts.ObjectTypeSpecIsPlain = true
+			}
+			if plain, ok := m.Plain.([]interface{}); ok {
+				for _, p := range plain {
+					if ps, ok := p.(string); ok {
+						ts.ObjectTypeSpec.Plain = append(ts.ObjectTypeSpec.Plain, ps)
+					}
+				}
+			}
+			return nil
+		}
+	}
+
+	return json.Unmarshal(inputJSON, &ts.TypeSpec)
+}
+
+// Deprecated.
+type Decoder func([]byte, interface{}) error
+
+// Deprecated.
+func (returnTypeSpec *ReturnTypeSpec) UnmarshalReturnTypeSpec(data []byte, decode Decoder) error {
+	var objectMap map[string]interface{}
+	if err := decode(data, &objectMap); err != nil {
+		return err
+	}
+	if len(objectMap) == 0 {
+		return nil
+	}
+	inputJSON, err := json.Marshal(objectMap)
+	if err != nil {
+		return err
+	}
+	return returnTypeSpec.UnmarshalJSON(inputJSON)
+}
+
+// Deprecated.
+func (returnTypeSpec *ReturnTypeSpec) UnmarshalYAML(inputYAML []byte) error {
+	return returnTypeSpec.UnmarshalReturnTypeSpec(inputYAML, yaml.Unmarshal)
+}
+
 // FunctionSpec is the serializable form of a function description.
 type FunctionSpec struct {
 	// Description is the description of the function, if any.
 	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 	// Inputs is the bag of input values for the function, if any.
 	Inputs *ObjectTypeSpec `json:"inputs,omitempty" yaml:"inputs,omitempty"`
+	// Determines whether the input bag should be treated as a single argument or as multiple arguments.
+	// When MultiArgumentInputs is non-empty, it must match up 1:1 with the property names in of the Inputs object.
+	// The order in which the properties are listed in MultiArgumentInputs determines the order in which the
+	// arguments are passed to the function.
+	MultiArgumentInputs []string `json:"multiArgumentInputs,omitempty" yaml:"multiArgumentInputs,omitempty"`
 	// Outputs is the bag of output values for the function, if any.
+	// This field is DEPRECATED. Use ReturnType instead where it allows for more flexible types
+	// to describe the outputs of the function definition. It is invalid to specify both Outputs and ReturnType.
 	Outputs *ObjectTypeSpec `json:"outputs,omitempty" yaml:"outputs,omitempty"`
-	// DeprecationMessage indicates whether or not the function is deprecated.
+	// Specified the return type of the function definition
+	ReturnType *ReturnTypeSpec
+	// DeprecationMessage indicates whether the function is deprecated.
 	DeprecationMessage string `json:"deprecationMessage,omitempty" yaml:"deprecationMessage,omitempty"`
 	// Language specifies additional language-specific data about the function.
 	Language map[string]RawMessage `json:"language,omitempty" yaml:"language,omitempty"`
 	// IsOverlay indicates whether the function is an overlay provided by the package. Overlay code is generated by the
 	// package rather than using the core Pulumi codegen libraries.
 	IsOverlay bool `json:"isOverlay,omitempty" yaml:"isOverlay,omitempty"`
+}
+
+func emptyObject(data RawMessage) (bool, error) {
+	var objectData *map[string]RawMessage
+	if err := json.Unmarshal(data, &objectData); err != nil {
+		return false, err
+	}
+
+	if objectData == nil {
+		return true, nil
+	}
+
+	return len(*objectData) == 0, nil
+}
+
+func unmarshalFunctionSpec(funcSpec *FunctionSpec, data map[string]RawMessage) error {
+	if description, ok := data["description"]; ok {
+		if err := json.Unmarshal(description, &funcSpec.Description); err != nil {
+			return err
+		}
+	}
+
+	if inputs, ok := data["inputs"]; ok {
+		if err := json.Unmarshal(inputs, &funcSpec.Inputs); err != nil {
+			return err
+		}
+	}
+
+	if multiArgumentInputs, ok := data["multiArgumentInputs"]; ok {
+		if err := json.Unmarshal(multiArgumentInputs, &funcSpec.MultiArgumentInputs); err != nil {
+			return err
+		}
+	}
+
+	if returnType, ok := data["outputs"]; ok {
+		isEmpty, err := emptyObject(returnType)
+		if err != nil {
+			return err
+		}
+
+		if !isEmpty {
+			if err := json.Unmarshal(returnType, &funcSpec.ReturnType); err != nil {
+				return err
+			}
+		} else {
+			funcSpec.ReturnType = nil
+		}
+	}
+
+	if deprecationMessage, ok := data["deprecationMessage"]; ok {
+		if err := json.Unmarshal(deprecationMessage, &funcSpec.DeprecationMessage); err != nil {
+			return err
+		}
+	}
+
+	if language, ok := data["language"]; ok {
+		if err := json.Unmarshal(language, &funcSpec.Language); err != nil {
+			return err
+		}
+	}
+
+	if isOverlay, ok := data["isOverlay"]; ok {
+		if err := json.Unmarshal(isOverlay, &funcSpec.IsOverlay); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UnmarshalJSON is custom unmarshalling logic for FunctionSpec so that we can derive Outputs from ReturnType
+// which otherwise isn't possible when both are retrieved from the same JSON field
+func (funcSpec *FunctionSpec) UnmarshalJSON(inputJSON []byte) error {
+	var data map[string]RawMessage
+	if err := json.Unmarshal(inputJSON, &data); err != nil {
+		return err
+	}
+	return unmarshalFunctionSpec(funcSpec, data)
+}
+
+// UnmarshalYAML is custom unmarshalling logic for FunctionSpec so that we can derive Outputs from ReturnType
+// which otherwise isn't possible when both are retrieved from the same JSON field
+func (funcSpec *FunctionSpec) UnmarshalYAML(node *yaml.Node) error {
+	var data map[string]RawMessage
+	if err := node.Decode(&data); err != nil {
+		return err
+	}
+	return unmarshalFunctionSpec(funcSpec, data)
+}
+
+func (funcSpec FunctionSpec) marshalFunctionSpec() (map[string]interface{}, error) {
+	data := make(map[string]interface{})
+	if funcSpec.Description != "" {
+		data["description"] = funcSpec.Description
+	}
+
+	if funcSpec.Inputs != nil {
+		data["inputs"] = funcSpec.Inputs
+	}
+
+	if len(funcSpec.MultiArgumentInputs) > 0 {
+		data["multiArgumentInputs"] = funcSpec.MultiArgumentInputs
+	}
+
+	if funcSpec.ReturnType != nil {
+		rto, err := funcSpec.ReturnType.marshalJSONLikeObject()
+		if err != nil {
+			return nil, err
+		}
+		data["outputs"] = rto
+	}
+
+	// for backward-compat when we only specify the outputs object of the function
+	if funcSpec.ReturnType == nil && funcSpec.Outputs != nil {
+		data["outputs"] = funcSpec.Outputs
+	}
+
+	if funcSpec.DeprecationMessage != "" {
+		data["deprecationMessage"] = funcSpec.DeprecationMessage
+	}
+
+	if funcSpec.IsOverlay {
+		// the default is false, so only write the property when it is true
+		data["isOverlay"] = true
+	}
+
+	if funcSpec.Language != nil && len(funcSpec.Language) > 0 {
+		data["language"] = funcSpec.Language
+	}
+
+	return data, nil
+}
+
+func (funcSpec FunctionSpec) MarshalJSON() ([]byte, error) {
+	data, err := funcSpec.marshalFunctionSpec()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(data)
+}
+
+func (funcSpec FunctionSpec) MarshalYAML() (interface{}, error) {
+	return funcSpec.marshalFunctionSpec()
 }
 
 // ConfigSpec is the serializable description of a package's configuration variables.

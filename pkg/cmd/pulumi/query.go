@@ -1,4 +1,4 @@
-// Copyright 2016-2019, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,16 +22,18 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 )
 
 // intentionally disabling here for cleaner err declaration/assignment.
-// nolint: vetshadow
+//
+//nolint:vetshadow
 func newQueryCmd() *cobra.Command {
-	var stack string
+	var stackName string
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "query",
 		Short: "Run query program against cloud resources",
 		Long: "[EXPERIMENTAL] Run query program against cloud resources.\n" +
@@ -56,12 +58,13 @@ func newQueryCmd() *cobra.Command {
 				Type:          display.DisplayQuery,
 			}
 
-			b, err := currentBackend(ctx, opts.Display)
+			// Try to read the current project
+			project, root, err := readProject()
 			if err != nil {
 				return result.FromError(err)
 			}
 
-			proj, root, err := readProject()
+			b, err := currentBackend(ctx, project, opts.Display)
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -70,17 +73,18 @@ func newQueryCmd() *cobra.Command {
 				Experimental: hasExperimentalCommands(),
 			}
 
-			res := b.Query(ctx, backend.QueryOperation{
-				Proj:   proj,
-				Root:   root,
-				Opts:   opts,
-				Scopes: cancellationScopes,
+			err = b.Query(ctx, backend.QueryOperation{
+				Proj:            project,
+				Root:            root,
+				Opts:            opts,
+				Scopes:          backend.CancellationScopes,
+				SecretsProvider: stack.DefaultSecretsProvider,
 			})
 			switch {
-			case res != nil && res.Error() == context.Canceled:
+			case err != nil && err == context.Canceled:
 				return nil
-			case res != nil:
-				return PrintEngineResult(res)
+			case err != nil:
+				return PrintEngineResult(result.FromError(err))
 			default:
 				return nil
 			}
@@ -88,7 +92,7 @@ func newQueryCmd() *cobra.Command {
 	}
 
 	cmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 
 	return cmd

@@ -21,10 +21,7 @@ func TestGitClone(t *testing.T) {
 
 	// This makes a git repo to clone from, so to avoid relying on something at GitHub that could
 	// change or be inaccessible.
-	tmpDir, err := os.MkdirTemp("", "pulumi-git-test")
-	assert.NoError(t, err)
-	assert.True(t, len(tmpDir) > 1)
-	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+	tmpDir := t.TempDir()
 	originDir := filepath.Join(tmpDir, "origin")
 
 	origin, err := git.PlainInit(originDir, false)
@@ -36,6 +33,7 @@ func TestGitClone(t *testing.T) {
 			Name:  "testo",
 			Email: "testo@example.com",
 		},
+		AllowEmptyCommits: true,
 	})
 	assert.NoError(t, err)
 
@@ -66,6 +64,7 @@ func TestGitClone(t *testing.T) {
 			Name:  "testo",
 			Email: "testo@example.com",
 		},
+		AllowEmptyCommits: true,
 	})
 	assert.NoError(t, err)
 
@@ -111,7 +110,7 @@ func TestGitClone(t *testing.T) {
 			tmp, err := os.MkdirTemp(tmpDir, "testcase") // i.e., under the tmp dir from earlier
 			assert.NoError(t, err)
 
-			_, err = setupGitRepo(context.TODO(), tmp, repo)
+			_, err = setupGitRepo(context.Background(), tmp, repo)
 			assert.NoError(t, err)
 
 			r, err := git.PlainOpen(tmp)
@@ -145,7 +144,7 @@ func TestGitClone(t *testing.T) {
 			tmp, err := os.MkdirTemp(tmpDir, "testcase") // i.e., under the tmp dir from earlier
 			assert.NoError(t, err)
 
-			_, err = setupGitRepo(context.TODO(), tmp, repo)
+			_, err = setupGitRepo(context.Background(), tmp, repo)
 			assert.Error(t, err)
 		})
 	}

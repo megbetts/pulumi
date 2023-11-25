@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil"
@@ -45,14 +46,15 @@ func connectToLanguageRuntime(ctx *plugin.Context, address string) (plugin.Host,
 }
 
 func (host *clientLanguageRuntimeHost) LanguageRuntime(
-	root, pwd, runtime string, options map[string]interface{}) (plugin.LanguageRuntime, error) {
+	root, pwd, runtime string, options map[string]interface{},
+) (plugin.LanguageRuntime, error) {
 	return host.languageRuntime, nil
 }
 
 func langRuntimePluginDialOptions(ctx *plugin.Context, address string) []grpc.DialOption {
 	dialOpts := append(
 		rpcutil.OpenTracingInterceptorDialOptions(),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		rpcutil.GrpcChannelOptions(),
 	)
 

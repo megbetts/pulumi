@@ -18,10 +18,11 @@ import * as dynamic from "../../dynamic";
 import * as rpc from "../../runtime/rpc";
 import { version } from "../../version";
 
+import * as anyproto from "google-protobuf/google/protobuf/any_pb";
+import * as emptyproto from "google-protobuf/google/protobuf/empty_pb";
+import * as structproto from "google-protobuf/google/protobuf/struct_pb";
+
 const requireFromString = require("require-from-string");
-const anyproto = require("google-protobuf/google/protobuf/any_pb.js");
-const emptyproto = require("google-protobuf/google/protobuf/empty_pb.js");
-const structproto = require("google-protobuf/google/protobuf/struct_pb.js");
 const provproto = require("../../proto/provider_pb.js");
 const provrpc = require("../../proto/provider_grpc_pb.js");
 const plugproto = require("../../proto/plugin_pb.js");
@@ -38,7 +39,7 @@ const uncaughtErrors = new Set<Error>();
 const uncaughtHandler = (err: Error) => {
     if (!uncaughtErrors.has(err)) {
         uncaughtErrors.add(err);
-        console.error(err.stack || err.message || ("" + err));
+        console.error(err.stack || err.message || "" + err);
     }
 };
 
@@ -148,10 +149,13 @@ async function checkRPC(call: any, callback: any): Promise<void> {
 }
 
 function checkConfigRPC(call: any, callback: any): void {
-    callback({
-        code: grpc.status.UNIMPLEMENTED,
-        details: "CheckConfig is not implemented by the dynamic provider",
-    }, undefined);
+    callback(
+        {
+            code: grpc.status.UNIMPLEMENTED,
+            details: "CheckConfig is not implemented by the dynamic provider",
+        },
+        undefined,
+    );
 }
 
 async function diffRPC(call: any, callback: any): Promise<void> {
@@ -197,10 +201,13 @@ async function diffRPC(call: any, callback: any): Promise<void> {
 }
 
 function diffConfigRPC(call: any, callback: any): void {
-    callback({
-        code: grpc.status.UNIMPLEMENTED,
-        details: "DiffConfig is not implemented by the dynamic provider",
-    }, undefined);
+    callback(
+        {
+            code: grpc.status.UNIMPLEMENTED,
+            details: "DiffConfig is not implemented by the dynamic provider",
+        },
+        undefined,
+    );
 }
 
 async function createRPC(call: any, callback: any): Promise<void> {
@@ -261,7 +268,7 @@ async function updateRPC(call: any, callback: any): Promise<void> {
         let result: any = {};
         const provider = getProvider(news);
         if (provider.update) {
-            result = await provider.update(req.getId(), olds, news) || {};
+            result = (await provider.update(req.getId(), olds, news)) || {};
         }
 
         const resultProps = resultIncludingProvider(result.outs, news);
@@ -296,17 +303,23 @@ async function getPluginInfoRPC(call: any, callback: any): Promise<void> {
 }
 
 function getSchemaRPC(call: any, callback: any): void {
-    callback({
-        code: grpc.status.UNIMPLEMENTED,
-        details: "GetSchema is not implemented by the dynamic provider",
-    }, undefined);
+    callback(
+        {
+            code: grpc.status.UNIMPLEMENTED,
+            details: "GetSchema is not implemented by the dynamic provider",
+        },
+        undefined,
+    );
 }
 
 function constructRPC(call: any, callback: any): void {
-    callback({
-        code: grpc.status.UNIMPLEMENTED,
-        details: "Construct is not implemented by the dynamic provider",
-    }, undefined);
+    callback(
+        {
+            code: grpc.status.UNIMPLEMENTED,
+            details: "Construct is not implemented by the dynamic provider",
+        },
+        undefined,
+    );
 }
 
 function resultIncludingProvider(result: any, props: any): any {
@@ -320,7 +333,7 @@ function resultIncludingProvider(result: any, props: any): any {
 // rejected the resource, or an initialization error, where the API server has accepted the
 // resource, but it failed to initialize (e.g., the app code is continually crashing and the
 // resource has failed to become alive).
-function grpcResponseFromError(e: {id: string; properties: any; message: string; reasons?: string[]}) {
+function grpcResponseFromError(e: { id: string; properties: any; message: string; reasons?: string[] }) {
     // Create response object.
     const resp = new statusproto.Status();
     resp.setCode(grpc.status.UNKNOWN);
@@ -396,7 +409,8 @@ export async function main(args: string[]) {
     server.start();
 
     // Emit the address so the monitor can read it to connect.  The gRPC server will keep the message loop alive.
-    console.log(port);
+    // We explicitly convert the number to a string so that Node doesn't colorize the output.
+    console.log(port.toString());
 }
 
 main(process.argv.slice(2));

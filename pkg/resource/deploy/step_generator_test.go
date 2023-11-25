@@ -1,4 +1,4 @@
-// Copyright 2016-2021, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,13 @@
 package deploy
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -124,11 +126,11 @@ func TestIgnoreChanges(t *testing.T) {
 				expected = resource.NewPropertyMapFromMap(c.expected)
 			}
 
-			processed, res := processIgnoreChanges(news, olds, c.ignoreChanges)
+			processed, err := processIgnoreChanges(news, olds, c.ignoreChanges)
 			if c.expectFailure {
-				assert.NotNil(t, res)
+				assert.Error(t, err)
 			} else {
-				assert.Nil(t, res)
+				assert.NoError(t, err)
 				assert.Equal(t, expected, processed)
 			}
 		})
@@ -153,15 +155,24 @@ func TestApplyReplaceOnChangesEmptyDetailedDiff(t *testing.T) {
 			expected:         plugin.DiffResult{},
 		},
 		{
-			name:             "DiffSome and empty replaceOnChanges",
-			diff:             plugin.DiffResult{Changes: plugin.DiffSome, ChangedKeys: []resource.PropertyKey{"a"}},
+			name: "DiffSome and empty replaceOnChanges",
+			diff: plugin.DiffResult{
+				Changes:     plugin.DiffSome,
+				ChangedKeys: []resource.PropertyKey{"a"},
+			},
 			replaceOnChanges: []string{},
 			hasInitErrors:    false,
-			expected:         plugin.DiffResult{Changes: plugin.DiffSome, ChangedKeys: []resource.PropertyKey{"a"}},
+			expected: plugin.DiffResult{
+				Changes:     plugin.DiffSome,
+				ChangedKeys: []resource.PropertyKey{"a"},
+			},
 		},
 		{
-			name:             "DiffSome and non-empty replaceOnChanges",
-			diff:             plugin.DiffResult{Changes: plugin.DiffSome, ChangedKeys: []resource.PropertyKey{"a"}},
+			name: "DiffSome and non-empty replaceOnChanges",
+			diff: plugin.DiffResult{
+				Changes:     plugin.DiffSome,
+				ChangedKeys: []resource.PropertyKey{"a"},
+			},
 			replaceOnChanges: []string{"a"},
 			hasInitErrors:    false,
 			expected: plugin.DiffResult{
@@ -178,15 +189,24 @@ func TestApplyReplaceOnChangesEmptyDetailedDiff(t *testing.T) {
 			expected:         plugin.DiffResult{},
 		},
 		{
-			name:             "DiffSome and empty replaceOnChanges w/ init errors",
-			diff:             plugin.DiffResult{Changes: plugin.DiffSome, ChangedKeys: []resource.PropertyKey{"a"}},
+			name: "DiffSome and empty replaceOnChanges w/ init errors",
+			diff: plugin.DiffResult{
+				Changes:     plugin.DiffSome,
+				ChangedKeys: []resource.PropertyKey{"a"},
+			},
 			replaceOnChanges: []string{},
 			hasInitErrors:    true,
-			expected:         plugin.DiffResult{Changes: plugin.DiffSome, ChangedKeys: []resource.PropertyKey{"a"}},
+			expected: plugin.DiffResult{
+				Changes:     plugin.DiffSome,
+				ChangedKeys: []resource.PropertyKey{"a"},
+			},
 		},
 		{
-			name:             "DiffSome and non-empty replaceOnChanges w/ init errors",
-			diff:             plugin.DiffResult{Changes: plugin.DiffSome, ChangedKeys: []resource.PropertyKey{"a"}},
+			name: "DiffSome and non-empty replaceOnChanges w/ init errors",
+			diff: plugin.DiffResult{
+				Changes:     plugin.DiffSome,
+				ChangedKeys: []resource.PropertyKey{"a"},
+			},
 			replaceOnChanges: []string{"a"},
 			hasInitErrors:    true,
 			expected: plugin.DiffResult{
@@ -217,7 +237,6 @@ func TestApplyReplaceOnChangesEmptyDetailedDiff(t *testing.T) {
 			assert.Equal(t, c.expected, newdiff)
 		})
 	}
-
 }
 
 func TestEngineDiff(t *testing.T) {
@@ -313,4 +332,147 @@ func TestEngineDiff(t *testing.T) {
 			assert.EqualValues(t, c.expected, diff.ChangedKeys)
 		})
 	}
+}
+
+func TestGenerateAliases(t *testing.T) {
+	t.Parallel()
+
+	const (
+		project = "project"
+	)
+	stack := tokens.MustParseStackName("stack")
+
+	parentTypeAlias := resource.CreateURN("myres", "test:resource:type2", "", project, stack.String())
+	parentNameAlias := resource.CreateURN("myres2", "test:resource:type", "", project, stack.String())
+
+	cases := []struct {
+		name         string
+		parentAlias  *resource.URN
+		childAliases []resource.Alias
+		expected     []resource.URN
+	}{
+		{
+			name:     "no aliases",
+			expected: nil,
+		},
+		{
+			name: "child alias (type), no parent aliases",
+			childAliases: []resource.Alias{
+				{Type: "test:resource:child2"},
+			},
+			expected: []resource.URN{
+				"urn:pulumi:stack::project::test:resource:type$test:resource:child2::myres-child",
+			},
+		},
+		{
+			name: "child alias (name), no parent aliases",
+			childAliases: []resource.Alias{
+				{Name: "child2"},
+			},
+			expected: []resource.URN{
+				"urn:pulumi:stack::project::test:resource:type$test:resource:child::child2",
+			},
+		},
+		{
+			name: "child alias (type, noParent), no parent aliases",
+			childAliases: []resource.Alias{
+				{
+					Type:     "test:resource:child2",
+					NoParent: true,
+				},
+			},
+			expected: []resource.URN{
+				"urn:pulumi:stack::project::test:resource:child2::myres-child",
+			},
+		},
+		{
+			name: "child alias (type, parent), no parent aliases",
+			childAliases: []resource.Alias{
+				{
+					Type:   "test:resource:child2",
+					Parent: resource.CreateURN("originalparent", "test:resource:original", "", project, stack.String()),
+				},
+			},
+			expected: []resource.URN{
+				"urn:pulumi:stack::project::test:resource:original$test:resource:child2::myres-child",
+			},
+		},
+		{
+			name:        "child alias (name), parent alias (type)",
+			parentAlias: &parentTypeAlias,
+			childAliases: []resource.Alias{
+				{Name: "myres-child2"},
+			},
+			expected: []resource.URN{
+				"urn:pulumi:stack::project::test:resource:type$test:resource:child::myres-child2",
+				"urn:pulumi:stack::project::test:resource:type2$test:resource:child::myres-child",
+				"urn:pulumi:stack::project::test:resource:type2$test:resource:child::myres-child2",
+			},
+		},
+		{
+			name:        "child alias (name), parent alias (name)",
+			parentAlias: &parentNameAlias,
+			childAliases: []resource.Alias{
+				{Name: "myres-child2"},
+			},
+			expected: []resource.URN{
+				"urn:pulumi:stack::project::test:resource:type$test:resource:child::myres-child2",
+				"urn:pulumi:stack::project::test:resource:type$test:resource:child::myres2-child",
+				"urn:pulumi:stack::project::test:resource:type$test:resource:child::myres2-child2",
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			parentURN := resource.CreateURN("myres", "test:resource:type", "", project, stack.String())
+			goal := &resource.Goal{
+				Parent:  parentURN,
+				Name:    "myres-child",
+				Type:    "test:resource:child",
+				Aliases: tt.childAliases,
+			}
+
+			sg := newStepGenerator(&Deployment{
+				target: &Target{
+					Name: stack,
+				},
+				source: NewNullSource(project),
+			}, Options{}, NewUrnTargets(nil), NewUrnTargets(nil))
+
+			if tt.parentAlias != nil {
+				sg.aliases = map[resource.URN]resource.URN{
+					parentURN: *tt.parentAlias,
+				}
+			}
+
+			actual := sg.generateAliases(goal)
+			assert.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+func TestDeleteProtectedErrorUsesCorrectQuotesOnOS(t *testing.T) {
+	t.Parallel()
+	err := deleteProtectedError{urn: "resource:urn"}
+
+	expectations := map[string]string{
+		`windows`: `"`,
+		`linux`:   `'`,
+		`darwin`:  `'`,
+	}
+
+	t.Run(runtime.GOOS, func(t *testing.T) {
+		t.Parallel()
+		gotErrMsg := err.Error()
+		contains, ok := expectations[runtime.GOOS]
+		if !ok {
+			t.Skipf("no quoting expectation for %s", runtime.GOOS)
+			return
+		}
+		assert.Contains(t, gotErrMsg, contains)
+	})
 }

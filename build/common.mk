@@ -95,9 +95,10 @@ PULUMI_ROOT ?= $$HOME/.pulumi-dev
 PYTHON ?= python3
 PIP ?= pip3
 
+ROOT_DIR := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
+
 PULUMI_BIN          := $(PULUMI_ROOT)/bin
 PULUMI_NODE_MODULES := $(PULUMI_ROOT)/node_modules
-PULUMI_NUGET        := $(PULUMI_ROOT)/nuget
 
 # Extra options to pass to `go test` command, for example:
 #
@@ -108,13 +109,19 @@ GO_TEST_PARALLELISM     ?= 10   # -parallel, number of parallel tests to run wit
 GO_TEST_PKG_PARALLELISM ?= 2    # -p flag, number of parallel packages to test
 GO_TEST_SHUFFLE         ?= off  # -shuffle flag, randomizes order of tests within a package
 GO_TEST_TAGS            ?= all
+GO_TEST_RACE            ?= true
 
 GO_TEST_FLAGS = -count=1 -cover -tags="${GO_TEST_TAGS}" -timeout 1h \
 	-parallel=${GO_TEST_PARALLELISM} \
 	-shuffle=${GO_TEST_SHUFFLE} \
 	-p=${GO_TEST_PKG_PARALLELISM} \
+	-race=${GO_TEST_RACE} \
 	${GO_TEST_OPTIONS}
 GO_TEST_FAST_FLAGS = -short ${GO_TEST_FLAGS}
+
+GO_TEST      = $(PYTHON) $(ROOT_DIR)/../scripts/go-test.py $(GO_TEST_FLAGS)
+GO_TEST_FAST = $(PYTHON) $(ROOT_DIR)/../scripts/go-test.py $(GO_TEST_FAST_FLAGS)
+
 GOPROXY = 'https://proxy.golang.org'
 
 .PHONY: default all only_build only_test lint install test_all core build
@@ -170,7 +177,6 @@ install::
 	@# Implicitly creates PULUMI_ROOT.
 	@mkdir -p $(PULUMI_BIN)
 	@mkdir -p $(PULUMI_NODE_MODULES)
-	@mkdir -p $(PULUMI_NUGET)
 
 dist::
 	$(call STEP_MESSAGE)
@@ -242,7 +248,7 @@ format::
 		-path "./vendor/*" -or \
 		-path "./*/compilation_error/*" -or \
 		-path "./*/testdata/*" \
-	\) | xargs gofmt -s -w
+	\) | xargs gofumpt -w
 
 # Defines the target `%.ensure` where `%` is an executable to check for. For
 # example, the target `ensure.foo` will check that `foo` is available on the

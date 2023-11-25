@@ -71,10 +71,14 @@ func TestConfigCommands(t *testing.T) {
 
 		// check that the nested config does not exist because we didn't use path
 		_, stderr := e.RunCommandExpectError("pulumi", "config", "get", "outer")
-		assert.Equal(t, "error: configuration key 'outer' not found for stack 'test'", strings.Trim(stderr, "\r\n"))
+		assert.Equal(t,
+			"error: configuration key 'outer' not found for stack 'test'",
+			strings.Trim(stderr, "\r\n"))
 
 		_, stderr = e.RunCommandExpectError("pulumi", "config", "get", "myList")
-		assert.Equal(t, "error: configuration key 'myList' not found for stack 'test'", strings.Trim(stderr, "\r\n"))
+		assert.Equal(t,
+			"error: configuration key 'myList' not found for stack 'test'",
+			strings.Trim(stderr, "\r\n"))
 
 		// set the nested config using --path
 		e.RunCommand("pulumi", "config", "set-all", "--path",
@@ -243,7 +247,7 @@ config:
   pulumi-test:d:
     a: D
   pulumi-test:e:
-  - E
+    - E
 $`
 		b, err = os.ReadFile(filepath.Join(e.CWD, "Pulumi.test.yaml"))
 		assert.NoError(t, err)
@@ -263,10 +267,10 @@ config:
   pulumi-test:d:
     a: D
   pulumi-test:e:
-  - E
+    - E
   pulumi-test:f:
     g:
-    - F
+      - F
 $`
 		b, err = os.ReadFile(filepath.Join(e.CWD, "Pulumi.test.yaml"))
 		assert.NoError(t, err)

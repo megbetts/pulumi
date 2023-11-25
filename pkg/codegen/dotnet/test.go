@@ -95,7 +95,6 @@ func (pkg dep) install(t *testing.T, ex, dir string) {
 	err := integration.RunCommand(t, "Add package",
 		args, dir, &integration.ProgramTestOptions{})
 	require.NoError(t, err, "Failed to add dependency %q %q", pkg.Name, pkg.Version)
-
 }
 
 // Converts from the hcl2 dependency format to the dotnet format.
@@ -134,7 +133,7 @@ func GenerateProgramBatchTest(t *testing.T, testCases []test.ProgramTest) {
 			Extension:  "cs",
 			OutputFile: "Program.cs",
 			Check: func(t *testing.T, path string, dependencies codegen.StringSet) {
-				Check(t, path, dependencies, "../../../../../../../sdk/dotnet/Pulumi")
+				Check(t, path, dependencies, "")
 			},
 			GenProgram: GenerateProgram,
 			TestCases:  testCases,

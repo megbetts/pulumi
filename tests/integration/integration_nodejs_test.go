@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (nodejs || all) && !smoke
+//go:build (nodejs || all) && !xplatform_acceptance
 
 package ints
 
@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/passphrase"
@@ -92,7 +93,6 @@ func TestEngineEvents(t *testing.T) {
 			assert.Contains(t, preEventResourceTypes, "pulumi-nodejs:dynamic:Resource")
 		},
 	})
-
 }
 
 // TestProjectMainNodejs tests out the ability to override the main entrypoint.
@@ -125,7 +125,7 @@ func TestProjectMainNodejs(t *testing.T) {
 			e.RootPath,
 		)
 		t.Logf("writing new Pulumi.yaml: \npath: %s\ncontents:%s", yamlPath, absYamlContents)
-		if err := os.WriteFile(yamlPath, []byte(absYamlContents), 0644); err != nil {
+		if err := os.WriteFile(yamlPath, []byte(absYamlContents), 0o644); err != nil {
 			t.Error(err)
 			return
 		}
@@ -397,6 +397,32 @@ func TestConfigBasicNodeJS(t *testing.T) {
 			{Key: "a.b[1].c", Value: "false", Path: true},
 			{Key: "tokens[0]", Value: "shh", Path: true, Secret: true},
 			{Key: "foo.bar", Value: "don't tell", Path: true, Secret: true},
+		},
+	})
+}
+
+// Tests configuration error from the perspective of a Pulumi program.
+func TestConfigMissingJS(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:           filepath.Join("config_missing", "nodejs"),
+		Dependencies:  []string{"@pulumi/pulumi"},
+		Quick:         true,
+		ExpectFailure: true,
+		ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
+			assert.NotEmpty(t, stackInfo.Events)
+			text1 := "Missing required configuration variable 'config_missing_js:notFound'"
+			text2 := "\tplease set a value using the command `pulumi config set --secret config_missing_js:notFound <value>`"
+			var found1, found2 bool
+			for _, event := range stackInfo.Events {
+				if event.DiagnosticEvent != nil && strings.Contains(event.DiagnosticEvent.Message, text1) {
+					found1 = true
+				}
+				if event.DiagnosticEvent != nil && strings.Contains(event.DiagnosticEvent.Message, text2) {
+					found2 = true
+				}
+			}
+			assert.True(t, found1, "expected error %q", text1)
+			assert.True(t, found2, "expected error %q", text2)
 		},
 	})
 }
@@ -705,7 +731,7 @@ func TestPasswordlessPassphraseSecretsProvider(t *testing.T) {
 			assert.NotNil(t, secretsProvider)
 			assert.Equal(t, secretsProvider.Type, "passphrase")
 
-			_, err := passphrase.NewPromptingPassphaseSecretsManagerFromState(secretsProvider.State)
+			_, err := passphrase.NewPromptingPassphraseSecretsManagerFromState(secretsProvider.State)
 			assert.NoError(t, err)
 
 			out, ok := stackInfo.Outputs["out"].(map[string]interface{})
@@ -722,7 +748,7 @@ func TestPasswordlessPassphraseSecretsProvider(t *testing.T) {
 			assert.NotNil(t, secretsProvider)
 			assert.Equal(t, secretsProvider.Type, "passphrase")
 
-			_, err := passphrase.NewPromptingPassphaseSecretsManagerFromState(secretsProvider.State)
+			_, err := passphrase.NewPromptingPassphraseSecretsManagerFromState(secretsProvider.State)
 			assert.Error(t, err)
 		},
 	})
@@ -803,7 +829,6 @@ func TestCloudSecretProvider(t *testing.T) {
 
 	// Also run with local backend
 	t.Run("local", func(t *testing.T) { integration.ProgramTest(t, &localTestOptions) })
-
 }
 
 // Tests a resource with a large (>4mb) string prop in Node.js
@@ -883,11 +908,9 @@ func TestConstructPlainNode(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.componentDir, func(t *testing.T) {
-			localProviders :=
-				[]integration.LocalDependency{
-					{Package: "testprovider", Path: buildTestProvider(t, filepath.Join("..", "testprovider"))},
-					{Package: "testcomponent", Path: filepath.Join(testDir, test.componentDir)},
-				}
+			localProviders := []integration.LocalDependency{
+				{Package: "testcomponent", Path: filepath.Join(testDir, test.componentDir)},
+			}
 			integration.ProgramTest(t,
 				optsForConstructPlainNode(t, test.expectedResourceCount, localProviders))
 		})
@@ -961,6 +984,10 @@ func TestConstructMethodsResourcesNode(t *testing.T) {
 
 func TestConstructMethodsErrorsNode(t *testing.T) {
 	testConstructMethodsErrors(t, "nodejs", "@pulumi/pulumi")
+}
+
+func TestConstructMethodsProviderNode(t *testing.T) {
+	testConstructMethodsProvider(t, "nodejs", "@pulumi/pulumi")
 }
 
 func TestConstructProviderNode(t *testing.T) {
@@ -1135,6 +1162,59 @@ func TestESMTS(t *testing.T) {
 	})
 }
 
+func TestTSWithPackageJsonInParentDir(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:             filepath.Join("nodejs", "ts-with-package-json-in-parent-dir"),
+		RelativeWorkDir: filepath.Join("myprogram"),
+		Dependencies:    []string{"@pulumi/pulumi"},
+		Quick:           true,
+	})
+}
+
+func TestESMWithPackageJsonInParentDir(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:             filepath.Join("nodejs", "esm-with-package-json-in-parent-dir"),
+		RelativeWorkDir: filepath.Join("myprogram"),
+		Dependencies:    []string{"@pulumi/pulumi"},
+		Quick:           true,
+	})
+}
+
+func TestESMWithoutPackageJsonInParentDir(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:             filepath.Join("nodejs", "esm-package-json-in-parent-dir-without-main"),
+		RelativeWorkDir: filepath.Join("myprogram"),
+		Dependencies:    []string{"@pulumi/pulumi"},
+		Quick:           true,
+	})
+}
+
+func TestPackageJsonInParentDirWithoutMain(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:             filepath.Join("nodejs", "package-json-in-parent-dir-without-main"),
+		RelativeWorkDir: filepath.Join("myprogram"),
+		Dependencies:    []string{"@pulumi/pulumi"},
+		Quick:           true,
+	})
+}
+
+func TestESMTSNestedSrc(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("nodejs", "esm-ts-nested-src"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		Quick:        true,
+		Config: map[string]string{
+			"test": "hello world",
+		},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			assert.Len(t, stack.Outputs, 1)
+			test, ok := stack.Outputs["test"]
+			assert.True(t, ok)
+			assert.Equal(t, "hello world", test)
+		},
+	})
+}
+
 func TestESMTSDefaultExport(t *testing.T) {
 	integration.ProgramTest(t, &integration.ProgramTestOptions{
 		Dir:          filepath.Join("nodejs", "esm-ts-default-export"),
@@ -1164,6 +1244,34 @@ func TestESMTSCompiled(t *testing.T) {
 		RunBuild:     true,
 		Quick:        true,
 	})
+}
+
+// Test that the resource stopwatch doesn't contain a negative time.
+func TestNoNegativeTimingsOnRefresh(t *testing.T) {
+	if runtime.GOOS == WindowsOS {
+		t.Skip("Skip on windows because we lack yarn")
+	}
+	t.Parallel()
+
+	dir := filepath.Join("empty", "nodejs")
+	e := ptesting.NewEnvironment(t)
+	defer func() {
+		if !t.Failed() {
+			e.DeleteEnvironment()
+		}
+	}()
+	e.ImportDirectory(dir)
+
+	e.RunCommand("yarn", "link", "@pulumi/pulumi")
+	e.RunCommand("yarn", "install")
+	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
+	e.RunCommand("pulumi", "stack", "init", "negative-timings")
+	e.RunCommand("pulumi", "stack", "select", "negative-timings")
+	e.RunCommand("pulumi", "up", "--yes")
+	stdout, _ := e.RunCommand("pulumi", "destroy", "--skip-preview", "--refresh=true")
+	// Assert there are no negative times in the output.
+	assert.NotContainsf(t, stdout, " (-",
+		"`pulumi destroy --skip-preview --refresh=true` contains a negative time")
 }
 
 // Test that the about command works as expected. Because about parses the
@@ -1242,6 +1350,257 @@ func TestUnsafeSnapshotManagerRetainsResourcesOnError(t *testing.T) {
 			// - NOT a resource that failed to be created dependent on the `base` resource output
 			assert.NotNil(t, stackInfo.Deployment)
 			assert.Equal(t, 3+1000, len(stackInfo.Deployment.Resources))
+		},
+	})
+}
+
+// TestResourceRefsGetResourceNode tests that invoking the built-in 'pulumi:pulumi:getResource' function
+// returns resource references for any resource reference in a resource's state.
+func TestResourceRefsGetResourceNode(t *testing.T) {
+	t.Skip() // TODO[pulumi/pulumi#11677]
+
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("resource_refs_get_resource", "nodejs"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		Quick:        true,
+	})
+}
+
+// TestDeletedWithNode tests the DeletedWith resource option.
+func TestDeletedWithNode(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("deleted_with", "nodejs"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		LocalProviders: []integration.LocalDependency{
+			{Package: "testprovider", Path: filepath.Join("..", "testprovider")},
+		},
+		Quick: true,
+	})
+}
+
+// Tests custom resource type name of dynamic provider.
+func TestCustomResourceTypeNameDynamicNode(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("dynamic", "nodejs-resource-type-name"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			urnOut := stack.Outputs["urn"].(string)
+			urn := resource.URN(urnOut)
+			typ := urn.Type().String()
+			assert.Equal(t, "pulumi-nodejs:dynamic/custom-provider:CustomResource", typ)
+		},
+	})
+}
+
+// Tests errors in dynamic provider methods
+func TestErrorCreateDynamicNode(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:           filepath.Join("dynamic", "nodejs-error-create"),
+		Dependencies:  []string{"@pulumi/pulumi"},
+		ExpectFailure: true,
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			foundError := false
+			for _, event := range stack.Events {
+				if event.ResOpFailedEvent != nil {
+					foundError = true
+					assert.Equal(t, apitype.OpType("create"), event.ResOpFailedEvent.Metadata.Op)
+				}
+			}
+			assert.True(t, foundError, "Did not see create error")
+		},
+	})
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/12301
+func TestRegression12301Node(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("nodejs", "regression-12301"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		PostPrepareProject: func(project *engine.Projinfo) error {
+			// Move the bad JSON file up one directory
+			jsonPath := filepath.Join(project.Root, "regression-12301.json")
+			dirName := filepath.Base(project.Root)
+			newPath := filepath.Join(project.Root, "..", dirName+".json")
+			return os.Rename(jsonPath, newPath)
+		},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			assert.Len(t, stack.Outputs, 1)
+			assert.Contains(t, stack.Outputs, "bar")
+			assert.Equal(t, 3.0, stack.Outputs["bar"].(float64))
+		},
+	})
+}
+
+// Tests provider config is passed through to provider processes.
+func TestPulumiConfig(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("dynamic", "nodejs-pulumi-config"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		Config: map[string]string{
+			"pulumi-nodejs:id": "testing123",
+		},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			assert.Len(t, stack.Outputs, 1)
+			assert.Contains(t, stack.Outputs, "rid")
+			assert.Equal(t, "testing123", stack.Outputs["rid"].(string))
+		},
+	})
+}
+
+func TestConstructProviderPropagationNode(t *testing.T) {
+	t.Parallel()
+
+	testConstructProviderPropagation(t, "nodejs", []string{"@pulumi/pulumi"})
+}
+
+func TestConstructProviderExplicitNode(t *testing.T) {
+	t.Parallel()
+
+	testConstructProviderExplicit(t, "nodejs", []string{"@pulumi/pulumi"})
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/7376
+func TestUndefinedStackOutputNode(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:          filepath.Join("nodejs", "undefined-stack-output"),
+		Dependencies: []string{"@pulumi/pulumi"},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			assert.Equal(t, nil, stack.Outputs["nil"])
+			assert.Equal(t, []interface{}{0.0, nil, nil}, stack.Outputs["list"])
+			assert.Equal(t, map[string]interface{}{
+				"nil2":    nil,
+				"number2": 0.0,
+			}, stack.Outputs["map"])
+
+			var found bool
+			for _, event := range stack.Events {
+				if event.DiagnosticEvent != nil {
+					if event.DiagnosticEvent.Severity == "warning" &&
+						strings.Contains(event.DiagnosticEvent.Message, "will not show as a stack output") {
+
+						assert.Equal(t,
+							"Undefined value (undef) will not show as a stack output.\n",
+							event.DiagnosticEvent.Message)
+						found = true
+					}
+				}
+			}
+			assert.True(t, found, "Did not see undef warning")
+		},
+	})
+}
+
+// Tests basic environments from the perspective of a Pulumi program.
+func TestEnvironmentsBasicNodeJS(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:            filepath.Join("environments_basic"),
+		Dependencies:   []string{"@pulumi/pulumi"},
+		Quick:          true,
+		RequireService: true,
+		CreateEnvironments: []integration.Environment{{
+			Name: "basic",
+			Definition: map[string]any{
+				"values": map[string]any{
+					"pulumiConfig": map[string]any{
+						"aConfigValue": "this value is a value",
+						"bEncryptedSecret": map[string]any{
+							"fn::secret": "this super secret is encrypted",
+						},
+						"outer": map[string]any{
+							"inner": "value",
+						},
+						"names": []any{"a", "b", "c", map[string]any{"fn::secret": "super secret name"}},
+						"servers": []any{
+							map[string]any{
+								"port": 80,
+								"host": "example",
+							},
+						},
+						"a": map[string]any{
+							"b": []any{
+								map[string]any{"c": true},
+								map[string]any{"c": false},
+							},
+						},
+						"tokens": []any{
+							map[string]any{
+								"fn::secret": "shh",
+							},
+						},
+						"foo": map[string]any{
+							"bar": map[string]any{
+								"fn::secret": "don't tell",
+							},
+						},
+					},
+				},
+			},
+		}},
+		Environments: []string{"basic"},
+	})
+}
+
+// Tests merged environments from the perspective of a Pulumi program.
+func TestEnvironmentsMergeNodeJS(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir:            filepath.Join("environments_merge"),
+		Dependencies:   []string{"@pulumi/pulumi"},
+		Quick:          true,
+		RequireService: true,
+		CreateEnvironments: []integration.Environment{
+			{
+				Name: "merge-0",
+				Definition: map[string]any{
+					"values": map[string]any{
+						"pulumiConfig": map[string]any{
+							"outer": map[string]any{
+								"inner": "not-a-value",
+							},
+							"names": []any{"a", "b", "c", map[string]any{"fn::secret": "super secret name"}},
+							"servers": []any{
+								map[string]any{
+									"port": 80,
+									"host": "example",
+								},
+							},
+						},
+					},
+				},
+			},
+			{
+				Name: "merge-1",
+				Definition: map[string]any{
+					"values": map[string]any{
+						"pulumiConfig": map[string]any{
+							"a": map[string]any{
+								"b": []any{
+									map[string]any{"c": true},
+									map[string]any{"c": false},
+								},
+							},
+							"tokens": []any{
+								map[string]any{
+									"fn::secret": "shh",
+								},
+							},
+							"foo": map[string]any{
+								"bar": "not so secret",
+							},
+						},
+					},
+				},
+			},
+		},
+		Environments: []string{"merge-0", "merge-1"},
+		Config: map[string]string{
+			"aConfigValue": "this value is a value",
+		},
+		Secrets: map[string]string{
+			"bEncryptedSecret": "this super secret is encrypted",
+		},
+		OrderedConfig: []integration.ConfigValue{
+			{Key: "outer.inner", Value: "value", Path: true},
+			{Key: "foo.bar", Value: "don't tell", Path: true, Secret: true},
 		},
 	})
 }

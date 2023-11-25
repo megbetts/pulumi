@@ -1,4 +1,3 @@
-//nolint:goconst
 package lifecycletest
 
 import (
@@ -10,15 +9,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	. "github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/display"
+	. "github.com/pulumi/pulumi/pkg/v3/engine" //nolint:revive
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
@@ -54,19 +52,20 @@ func TestSingleResourceDefaultProviderGolangLifecycle(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}, nil
 		}),
 	}
 
-	program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 			Project:     info.Project,
 			Stack:       info.Stack,
@@ -94,10 +93,10 @@ func TestSingleResourceDefaultProviderGolangLifecycle(t *testing.T) {
 			return nil
 		})
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps:   MakeBasicLifecycleSteps(t, 4),
 	}
 	p.Run(t, nil)
@@ -111,12 +110,13 @@ func TestSingleResourceDefaultProviderGolangTransformations(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}, nil
@@ -143,7 +143,7 @@ func TestSingleResourceDefaultProviderGolangTransformations(t *testing.T) {
 		}, &resChild, pulumi.Parent(&res))
 	}
 
-	program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 			Project:     info.Project,
 			Stack:       info.Stack,
@@ -235,15 +235,17 @@ func TestSingleResourceDefaultProviderGolangTransformations(t *testing.T) {
 		})
 	})
 
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 	}
 	p.Steps = []TestStep{{
 		Op: Update,
 		Validate: func(project workspace.Project, target deploy.Target, entries JournalEntries,
-			_ []Event, res result.Result) result.Result {
+			_ []Event, err error,
+		) error {
+			require.NoError(t, err)
 
 			foundRes1 := false
 			foundRes2 := false
@@ -269,7 +271,7 @@ func TestSingleResourceDefaultProviderGolangTransformations(t *testing.T) {
 				}
 				if res.URN.Name() == "res2Child" {
 					foundRes2Child = true
-					assert.Equal(t, res.Parent.Name(), tokens.QName("res2"))
+					assert.Equal(t, res.Parent.Name(), "res2")
 					assert.Equal(t, res.Type, tokens.Type("pkgA:m:typA"))
 					assert.Contains(t, res.AdditionalSecretOutputs, resource.PropertyKey("output"))
 					assert.Contains(t, res.AdditionalSecretOutputs, resource.PropertyKey("output2"))
@@ -287,7 +289,7 @@ func TestSingleResourceDefaultProviderGolangTransformations(t *testing.T) {
 				// result should be "baz".
 				if res.URN.Name() == "res4Child" {
 					foundRes4Child = true
-					assert.Equal(t, res.Parent.Name(), tokens.QName("res4"))
+					assert.Equal(t, res.Parent.Name(), "res4")
 					assert.Equal(t, "baz", res.Inputs["foo"].StringValue())
 				}
 			}
@@ -297,7 +299,7 @@ func TestSingleResourceDefaultProviderGolangTransformations(t *testing.T) {
 			assert.True(t, foundRes2Child)
 			assert.True(t, foundRes3)
 			assert.True(t, foundRes4Child)
-			return res
+			return err
 		},
 	}}
 
@@ -315,16 +317,18 @@ func TestIgnoreChangesGolangLifecycle(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 				DiffF: func(urn resource.URN, id resource.ID,
-					olds, news resource.PropertyMap, ignoreChanges []string) (plugin.DiffResult, error) {
+					oldInputs, oldOutputs, newInputs resource.PropertyMap, ignoreChanges []string,
+				) (plugin.DiffResult, error) {
 					// just verify that the IgnoreChanges prop made it through
 					assert.Equal(t, expectedIgnoreChanges, ignoreChanges)
 					return plugin.DiffResult{}, nil
@@ -334,7 +338,7 @@ func TestIgnoreChangesGolangLifecycle(t *testing.T) {
 	}
 
 	setupAndRunProgram := func(ignoreChanges []string) *deploy.Snapshot {
-		program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+		programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 			ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 				Project:     info.Project,
 				Stack:       info.Stack,
@@ -353,21 +357,22 @@ func TestIgnoreChangesGolangLifecycle(t *testing.T) {
 			})
 		})
 
-		host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+		hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 		p := &TestPlan{
-			Options: UpdateOptions{Host: host},
+			Options: TestUpdateOptions{HostF: hostF},
 			Steps: []TestStep{
 				{
 					Op: Update,
 					Validate: func(project workspace.Project, target deploy.Target, entries JournalEntries,
-						events []Event, res result.Result) result.Result {
+						events []Event, err error,
+					) error {
 						for _, event := range events {
 							if event.Type == ResourcePreEvent {
 								payload := event.Payload().(ResourcePreEventPayload)
 								assert.Equal(t, []display.StepOp{deploy.OpCreate}, []display.StepOp{payload.Metadata.Op})
 							}
 						}
-						return res
+						return err
 					},
 				},
 			},
@@ -392,9 +397,10 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 	loaders := []*deploytest.ProviderLoader{
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
-				DiffConfigF: func(urn resource.URN, olds, news resource.PropertyMap,
-					ignoreChanges []string) (plugin.DiffResult, error) {
-					if !olds["foo"].DeepEquals(news["foo"]) {
+				DiffConfigF: func(urn resource.URN, oldInputs, oldOutputs, newInputs resource.PropertyMap,
+					ignoreChanges []string,
+				) (plugin.DiffResult, error) {
+					if !oldOutputs["foo"].DeepEquals(newInputs["foo"]) {
 						return plugin.DiffResult{
 							ReplaceKeys:         []resource.PropertyKey{"foo"},
 							DeleteBeforeReplace: true,
@@ -403,9 +409,9 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 					return plugin.DiffResult{}, nil
 				},
 				DiffF: func(urn resource.URN, id resource.ID,
-					olds, news resource.PropertyMap, ignoreChanges []string) (plugin.DiffResult, error) {
-
-					if !olds["foo"].DeepEquals(news["foo"]) {
+					oldInputs, oldOutputs, newInputs resource.PropertyMap, ignoreChanges []string,
+				) (plugin.DiffResult, error) {
+					if !oldOutputs["foo"].DeepEquals(newInputs["foo"]) {
 						return plugin.DiffResult{ReplaceKeys: []resource.PropertyKey{"foo"}}, nil
 					}
 					return plugin.DiffResult{}, nil
@@ -426,7 +432,7 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 
 	var stackURN, provURN, urnA resource.URN = "urn:pulumi:test::test::pulumi:pulumi:Stack::test-test",
 		"urn:pulumi:test::test::pulumi:providers:pkgA::provA", "urn:pulumi:test::test::pkgA:m:typA::resA"
-	program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 			Project:     info.Project,
 			Stack:       info.Stack,
@@ -448,10 +454,9 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 
 			return nil
 		})
-
 	})
 
-	p.Options.Host = deploytest.NewPluginHost(nil, nil, program, loaders...)
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 	p.Steps = []TestStep{{Op: Update}}
 	snap := p.Run(t, nil)
 
@@ -461,9 +466,9 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 		Op: Update,
 
 		Validate: func(project workspace.Project, target deploy.Target, entries JournalEntries,
-			evts []Event, res result.Result) result.Result {
-
-			assert.Nil(t, res)
+			evts []Event, err error,
+		) error {
+			assert.NoError(t, err)
 
 			AssertSameSteps(t, []StepSummary{
 				{Op: deploy.OpSame, URN: stackURN},
@@ -473,7 +478,7 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 				{Op: deploy.OpDeleteReplaced, URN: urnA},
 			}, SuccessfulSteps(entries))
 
-			return res
+			return err
 		},
 	}}
 	snap = p.Run(t, snap)
@@ -485,9 +490,9 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 		Op: Update,
 
 		Validate: func(project workspace.Project, target deploy.Target, entries JournalEntries,
-			evts []Event, res result.Result) result.Result {
-
-			assert.Nil(t, res)
+			evts []Event, err error,
+		) error {
+			assert.NoError(t, err)
 			AssertSameSteps(t, []StepSummary{
 				{Op: deploy.OpSame, URN: stackURN},
 				{Op: deploy.OpSame, URN: provURN},
@@ -496,7 +501,7 @@ func TestExplicitDeleteBeforeReplaceGoSDK(t *testing.T) {
 				{Op: deploy.OpCreateReplacement, URN: urnA},
 			}, SuccessfulSteps(entries))
 
-			return res
+			return err
 		},
 	}}
 	p.Run(t, snap)
@@ -509,7 +514,8 @@ func TestReadResourceGolangLifecycle(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					assert.Equal(t, resource.ID("someId"), id)
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
@@ -521,7 +527,7 @@ func TestReadResourceGolangLifecycle(t *testing.T) {
 		"urn:pulumi:test::test::pulumi:providers:pkgA::default", "urn:pulumi:test::test::pkgA:m:typA::resA"
 
 	setupAndRunProgram := func() *deploy.Snapshot {
-		program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+		programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 			ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 				Project:     info.Project,
 				Stack:       info.Stack,
@@ -540,16 +546,16 @@ func TestReadResourceGolangLifecycle(t *testing.T) {
 			})
 		})
 
-		host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+		hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 		p := &TestPlan{
-			Options: UpdateOptions{Host: host},
+			Options: TestUpdateOptions{HostF: hostF},
 			Steps: []TestStep{
 				{
 					Op: Update,
 					Validate: func(project workspace.Project, target deploy.Target, entries JournalEntries,
-						evts []Event, res result.Result) result.Result {
-
-						assert.Nil(t, res)
+						evts []Event, err error,
+					) error {
+						assert.NoError(t, err)
 
 						AssertSameSteps(t, []StepSummary{
 							{Op: deploy.OpCreate, URN: stackURN},
@@ -557,7 +563,7 @@ func TestReadResourceGolangLifecycle(t *testing.T) {
 							{Op: deploy.OpRead, URN: urnA},
 						}, SuccessfulSteps(entries))
 
-						return res
+						return err
 					},
 				},
 			},
@@ -583,17 +589,19 @@ func TestProviderInheritanceGolangLifecycle(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			v := &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}
 			v.InvokeF = func(tok tokens.ModuleMember,
-				inputs resource.PropertyMap) (resource.PropertyMap, []plugin.CheckFailure, error) {
+				inputs resource.PropertyMap,
+			) (resource.PropertyMap, []plugin.CheckFailure, error) {
 				assert.True(t, v.Config.DeepEquals(inputs))
 				return nil, nil, nil
 			}
@@ -602,17 +610,19 @@ func TestProviderInheritanceGolangLifecycle(t *testing.T) {
 		deploytest.NewProviderLoader("pkgB", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			v := &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}
 			v.InvokeF = func(tok tokens.ModuleMember,
-				inputs resource.PropertyMap) (resource.PropertyMap, []plugin.CheckFailure, error) {
+				inputs resource.PropertyMap,
+			) (resource.PropertyMap, []plugin.CheckFailure, error) {
 				assert.True(t, v.Config.DeepEquals(inputs))
 				return nil, nil, nil
 			}
@@ -620,7 +630,7 @@ func TestProviderInheritanceGolangLifecycle(t *testing.T) {
 		}),
 	}
 
-	program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 			Project:     info.Project,
 			Stack:       info.Stack,
@@ -734,10 +744,10 @@ func TestProviderInheritanceGolangLifecycle(t *testing.T) {
 			return nil
 		})
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps:   []TestStep{{Op: Update}},
 	}
 	p.Run(t, nil)
@@ -751,8 +761,8 @@ func TestReplaceOnChangesGolangLifecycle(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 			}, nil
@@ -763,7 +773,7 @@ func TestReplaceOnChangesGolangLifecycle(t *testing.T) {
 		Foo: pulumi.String("bar"),
 	}
 
-	program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 			Project:     info.Project,
 			Stack:       info.Stack,
@@ -785,15 +795,15 @@ func TestReplaceOnChangesGolangLifecycle(t *testing.T) {
 
 	expectedOps := []display.StepOp{deploy.OpCreate}
 
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps: []TestStep{
 			{
 				Op: Update,
 				Validate: func(project workspace.Project, target deploy.Target, entries JournalEntries,
-					events []Event, res result.Result) result.Result {
-
+					events []Event, err error,
+				) error {
 					collectedOps := make([]display.StepOp, 0)
 					for _, event := range events {
 						if event.Type == ResourcePreEvent {
@@ -806,7 +816,7 @@ func TestReplaceOnChangesGolangLifecycle(t *testing.T) {
 
 					assert.Equal(t, expectedOps, collectedOps)
 
-					return res
+					return err
 				},
 			},
 		},
@@ -853,8 +863,8 @@ func TestRemoteComponentGolang(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 			}, nil
@@ -862,8 +872,8 @@ func TestRemoteComponentGolang(t *testing.T) {
 		deploytest.NewProviderLoader("pkgB", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				ConstructF: func(monitor *deploytest.ResourceMonitor, typ, name string, parent resource.URN,
-					inputs resource.PropertyMap, options plugin.ConstructOptions) (plugin.ConstructResult, error) {
-
+					inputs resource.PropertyMap, info plugin.ConstructInfo, options plugin.ConstructOptions,
+				) (plugin.ConstructResult, error) {
 					_, ok := inputs["bar"]
 					assert.False(t, ok)
 
@@ -884,7 +894,7 @@ func TestRemoteComponentGolang(t *testing.T) {
 		}),
 	}
 
-	program := deploytest.NewLanguageRuntime(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(info plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		ctx, err := pulumi.NewContext(context.Background(), pulumi.RunInfo{
 			Project:     info.Project,
 			Stack:       info.Stack,
@@ -911,10 +921,10 @@ func TestRemoteComponentGolang(t *testing.T) {
 		})
 	})
 
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps:   []TestStep{{Op: Update}},
 	}
 	p.Run(t, nil)

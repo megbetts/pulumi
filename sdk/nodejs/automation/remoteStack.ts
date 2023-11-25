@@ -14,15 +14,7 @@
 
 import { EngineEvent } from "./events";
 import { LocalWorkspace } from "./localWorkspace";
-import {
-    DestroyResult,
-    OutputMap,
-    PreviewResult,
-    RefreshResult,
-    Stack,
-    UpdateSummary,
-    UpResult,
-} from "./stack";
+import { DestroyResult, OutputMap, PreviewResult, RefreshResult, Stack, UpdateSummary, UpResult } from "./stack";
 import { Deployment } from "./workspace";
 
 /**
@@ -51,7 +43,7 @@ export class RemoteStack {
 
     /**
      * Creates or updates the resources in a stack by executing the program in the Workspace.
-     * https://www.pulumi.com/docs/reference/cli/pulumi_up/
+     * https://www.pulumi.com/docs/cli/commands/pulumi_up/
      * This operation runs remotely.
      *
      * @param opts Options to customize the behavior of the update.
@@ -62,7 +54,7 @@ export class RemoteStack {
 
     /**
      * Performs a dry-run update to a stack, returning pending changes.
-     * https://www.pulumi.com/docs/reference/cli/pulumi_preview/
+     * https://www.pulumi.com/docs/cli/commands/pulumi_preview/
      * This operation runs remotely.
      *
      * @param opts Options to customize the behavior of the preview.

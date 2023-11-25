@@ -8,7 +8,10 @@ import (
 	"reflect"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"plain-object-defaults/example/internal"
 )
+
+var _ = internal.GetEnvOrDefault
 
 // A test for namespaces (mod 1)
 type Typ struct {
@@ -21,9 +24,11 @@ func (val *Typ) Defaults() *Typ {
 		return nil
 	}
 	tmp := *val
-	if isZero(tmp.Val) {
-		val_ := getEnvOrDefault("mod1", nil, "PULUMI_EXAMPLE_MOD1_DEFAULT").(string)
-		tmp.Val = &val_
+	if tmp.Val == nil {
+		if d := internal.GetEnvOrDefault("mod1", nil, "PULUMI_EXAMPLE_MOD1_DEFAULT"); d != nil {
+			val_ := d.(string)
+			tmp.Val = &val_
+		}
 	}
 	return &tmp
 }
@@ -50,8 +55,10 @@ func (val *TypArgs) Defaults() *TypArgs {
 		return nil
 	}
 	tmp := *val
-	if isZero(tmp.Val) {
-		tmp.Val = pulumi.StringPtr(getEnvOrDefault("mod1", nil, "PULUMI_EXAMPLE_MOD1_DEFAULT").(string))
+	if tmp.Val == nil {
+		if d := internal.GetEnvOrDefault("mod1", nil, "PULUMI_EXAMPLE_MOD1_DEFAULT"); d != nil {
+			tmp.Val = pulumi.StringPtr(d.(string))
+		}
 	}
 	return &tmp
 }

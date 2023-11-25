@@ -24,8 +24,35 @@ permissions:
   contents: read
 
 jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.ref }}
+      - name: build matrix
+        id: matrix
+        run: |
+          echo "::group::Version set variable"
+          VERSION_SET=$(./scripts/get-job-matrix.py \
+            generate-version-set \
+            --version-set current
+          )
+          echo "::endgroup::"
+
+          echo "::group::Version set"
+          echo "$VERSION_SET" | yq -P '.'
+          echo "::endgroup::"
+
+          echo "::group::Set outputs"
+          ./.github/scripts/set-output version-set "${VERSION_SET}"
+          echo "::endgroup::"
+    outputs:
+      version-set: "${{ fromJson(steps.matrix.outputs.version-set) }}"
+
   aws:
     name: Resource Docs
+    needs: [matrix]
     # Verify that the event is not triggered by a fork since forks cannot
     # access secrets other than the default GITHUB_TOKEN. Specifically,
     # this workflow relies on the secret PULUMI_BOT_GH_PAT_DOCS to create a
@@ -37,19 +64,19 @@ jobs:
       - name: Install Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.19.x # TODO(friel) use version_set
+          go-version: ${{ fromJson(needs.matrix.outputs.version-set).go }}
       - name: Install Node.js
         uses: actions/setup-node@v1
         with:
-          node-version: 14.x # TODO(friel) use version_set
+          node-version: ${{ fromJson(needs.matrix.outputs.version-set).nodejs }}
       - name: Install Python
         uses: actions/setup-python@v3
         with:
-          python-version: 3.9.x # TODO(friel) use version_set
+          python-version: ${{ fromJson(needs.matrix.outputs.version-set).python }}
       - name: Set up DotNet
-        uses: actions/setup-dotnet@607fce577a46308457984d59e4954e075820f10a # v3.0.3
+        uses: actions/setup-dotnet@v3
         with:
-          dotnet-version: 6.0.x # TODO(friel) use version_set
+          dotnet-version: ${{ fromJson(needs.matrix.outputs.version-set).dotnet }}
           dotnet-quality: ga
       - name: Install Pulumi CLI
         uses: pulumi/action-install-pulumi-cli@v1.0.1
@@ -95,7 +122,7 @@ jobs:
           go mod edit -replace github.com/pulumi/pulumi/sdk/v3=../../../pulumi/sdk
           popd
 
-          ./scripts/gen_resource_docs.sh aws true
+          ./scripts/gen_resource_docs.sh aws true v5.42.0
           ./scripts/gen_resource_docs.sh kubernetes true
 
           # Undo the changes to the go.mod and go.sum files since we don't want the PR
@@ -106,8 +133,8 @@ jobs:
 
           popd
 
-          echo "::set-output name=branchName::${BRANCH_NAME}"
-          echo "::set-output name=prNumber::${PR_NUMBER}"
+          echo "branchName=${BRANCH_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "prNumber=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
 
       - name: Create draft docs PR
         uses: peter-evans/create-pull-request@v3

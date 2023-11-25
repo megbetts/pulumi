@@ -1,4 +1,4 @@
-# Copyright 2016-2022, Pulumi Corporation.
+# Copyright 2016-2023, Pulumi Corporation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,29 +14,31 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
-import json
 from datetime import datetime
-from typing import Optional, List, Mapping, Callable, Union, TYPE_CHECKING
-from semver import VersionInfo
-import yaml
+from typing import TYPE_CHECKING, Callable, List, Mapping, Optional, Union
 
-from ._config import ConfigMap, ConfigValue, _SECRET_SENTINEL
+import yaml
+from semver import VersionInfo
+
+from ._cmd import CommandResult, OnOutput, _run_pulumi_cmd
+from ._config import _SECRET_SENTINEL, ConfigMap, ConfigValue
+from ._minimum_version import _MINIMUM_VERSION
+from ._output import OutputMap, OutputValue
 from ._project_settings import ProjectSettings
+from ._stack import _DATETIME_FORMAT, Stack
 from ._stack_settings import StackSettings
+from ._tag import TagMap
 from ._workspace import (
-    Workspace,
+    Deployment,
     PluginInfo,
+    PulumiFn,
     StackSummary,
     WhoAmIResult,
-    PulumiFn,
-    Deployment,
+    Workspace,
 )
-from ._stack import _DATETIME_FORMAT, Stack
-from ._output import OutputMap, OutputValue
-from ._cmd import _run_pulumi_cmd, CommandResult, OnOutput
-from ._minimum_version import _MINIMUM_VERSION
 from .errors import InvalidVersionError
 
 if TYPE_CHECKING:
@@ -97,6 +99,7 @@ class LocalWorkspace(Workspace):
     _remote: bool = False
     _remote_env_vars: Optional[Mapping[str, Union[str, Secret]]]
     _remote_pre_run_commands: Optional[List[str]]
+    _remote_skip_install_dependencies: Optional[bool]
     _remote_git_url: str
     _remote_git_project_path: Optional[str]
     _remote_git_branch: Optional[str]
@@ -213,10 +216,14 @@ class LocalWorkspace(Workspace):
         # Not used by LocalWorkspace
         return
 
-    def get_config(self, stack_name: str, key: str) -> ConfigValue:
-        result = self._run_pulumi_cmd_sync(
-            ["config", "get", key, "--json", "--stack", stack_name]
-        )
+    def get_config(
+        self, stack_name: str, key: str, *, path: bool = False
+    ) -> ConfigValue:
+        args = ["config", "get"]
+        if path:
+            args.append("--path")
+        args.extend([key, "--json", "--stack", stack_name])
+        result = self._run_pulumi_cmd_sync(args)
         val = json.loads(result.stdout)
         return ConfigValue(value=val["value"], secret=val["secret"])
 
@@ -233,12 +240,15 @@ class LocalWorkspace(Workspace):
             )
         return config_map
 
-    def set_config(self, stack_name: str, key: str, value: ConfigValue) -> None:
+    def set_config(
+        self, stack_name: str, key: str, value: ConfigValue, *, path: bool = False
+    ) -> None:
+        args = ["config", "set"]
+        if path:
+            args.append("--path")
         secret_arg = "--secret" if value.secret else "--plaintext"
-        self._run_pulumi_cmd_sync(
+        args.extend(
             [
-                "config",
-                "set",
                 key,
                 secret_arg,
                 "--stack",
@@ -248,9 +258,14 @@ class LocalWorkspace(Workspace):
                 value.value,
             ]
         )
+        self._run_pulumi_cmd_sync(args)
 
-    def set_all_config(self, stack_name: str, config: ConfigMap) -> None:
+    def set_all_config(
+        self, stack_name: str, config: ConfigMap, *, path: bool = False
+    ) -> None:
         args = ["config", "set-all", "--stack", stack_name]
+        if path:
+            args.append("--path")
 
         for key, value in config.items():
             secret_arg = "--secret" if value.secret else "--plaintext"
@@ -258,11 +273,18 @@ class LocalWorkspace(Workspace):
 
         self._run_pulumi_cmd_sync(args)
 
-    def remove_config(self, stack_name: str, key: str) -> None:
-        self._run_pulumi_cmd_sync(["config", "rm", key, "--stack", stack_name])
+    def remove_config(self, stack_name: str, key: str, *, path: bool = False) -> None:
+        args = ["config", "rm", key, "--stack", stack_name]
+        if path:
+            args.append("--path")
+        self._run_pulumi_cmd_sync(args)
 
-    def remove_all_config(self, stack_name: str, keys: List[str]) -> None:
+    def remove_all_config(
+        self, stack_name: str, keys: List[str], *, path: bool = False
+    ) -> None:
         args = ["config", "rm-all", "--stack", stack_name]
+        if path:
+            args.append("--path")
         args.extend(keys)
         self._run_pulumi_cmd_sync(args)
 
@@ -272,7 +294,38 @@ class LocalWorkspace(Workspace):
         )
         self.get_all_config(stack_name)
 
+    def get_tag(self, stack_name: str, key: str) -> str:
+        result = self._run_pulumi_cmd_sync(
+            ["stack", "tag", "get", key, "--stack", stack_name]
+        )
+        return result.stdout.strip()
+
+    def set_tag(self, stack_name: str, key: str, value: str) -> None:
+        self._run_pulumi_cmd_sync(
+            ["stack", "tag", "set", key, value, "--stack", stack_name]
+        )
+
+    def remove_tag(self, stack_name: str, key: str) -> None:
+        self._run_pulumi_cmd_sync(["stack", "tag", "rm", key, "--stack", stack_name])
+
+    def list_tags(self, stack_name: str) -> TagMap:
+        result = self._run_pulumi_cmd_sync(
+            ["stack", "tag", "ls", "--json", "--stack", stack_name]
+        )
+        return json.loads(result.stdout)
+
     def who_am_i(self) -> WhoAmIResult:
+        # Assume an old version. Doesn't really matter what this is as long as it's pre-3.58.
+        ver = VersionInfo(3)
+        if self.__pulumi_version is not None:
+            ver = VersionInfo.parse(self.__pulumi_version)
+
+        # 3.58 added the --json flag (https://github.com/pulumi/pulumi/releases/tag/v3.58.0)
+        if ver >= VersionInfo(3, 58):
+            result = self._run_pulumi_cmd_sync(["whoami", "--json"])
+            who_am_i_json = json.loads(result.stdout)
+            return WhoAmIResult(**who_am_i_json)
+
         result = self._run_pulumi_cmd_sync(["whoami"])
         return WhoAmIResult(user=result.stdout.strip())
 
@@ -312,7 +365,9 @@ class LocalWorkspace(Workspace):
             stack = StackSummary(
                 name=stack_json["name"],
                 current=stack_json["current"],
-                update_in_progress=stack_json["updateInProgress"],
+                update_in_progress=stack_json["updateInProgress"]
+                if "updateInProgress" in stack_json
+                else None,
                 last_update=datetime.strptime(
                     stack_json["lastUpdate"], _DATETIME_FORMAT
                 )
@@ -479,6 +534,9 @@ class LocalWorkspace(Workspace):
             for command in self._remote_pre_run_commands:
                 args.append("--remote-pre-run-command")
                 args.append(command)
+
+        if self._remote_skip_install_dependencies:
+            args.append("--remote-skip-install-dependencies")
 
         return args
 

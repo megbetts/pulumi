@@ -15,14 +15,14 @@ __all__ = ['ModuleResourceArgs', 'ModuleResource']
 @pulumi.input_type
 class ModuleResourceArgs:
     def __init__(__self__, *,
-                 plain_required_bool: bool,
-                 plain_required_const: str,
-                 plain_required_number: float,
-                 plain_required_string: str,
-                 required_bool: pulumi.Input[bool],
-                 required_enum: pulumi.Input['EnumThing'],
-                 required_number: pulumi.Input[float],
-                 required_string: pulumi.Input[str],
+                 plain_required_bool: Optional[bool] = None,
+                 plain_required_const: Optional[str] = None,
+                 plain_required_number: Optional[float] = None,
+                 plain_required_string: Optional[str] = None,
+                 required_bool: Optional[pulumi.Input[bool]] = None,
+                 required_enum: Optional[pulumi.Input['EnumThing']] = None,
+                 required_number: Optional[pulumi.Input[float]] = None,
+                 required_string: Optional[pulumi.Input[str]] = None,
                  optional_bool: Optional[pulumi.Input[bool]] = None,
                  optional_const: Optional[pulumi.Input[str]] = None,
                  optional_enum: Optional[pulumi.Input['EnumThing']] = None,
@@ -416,5 +416,11 @@ class ModuleResource(pulumi.CustomResource):
 
         __props__ = ModuleResourceArgs.__new__(ModuleResourceArgs)
 
+        __props__.__dict__["optional_bool"] = None
         return ModuleResource(resource_name, opts=opts, __props__=__props__)
+
+    @property
+    @pulumi.getter
+    def optional_bool(self) -> pulumi.Output[Optional[bool]]:
+        return pulumi.get(self, "optional_bool")
 

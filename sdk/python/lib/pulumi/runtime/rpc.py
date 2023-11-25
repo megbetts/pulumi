@@ -16,44 +16,50 @@ Support for serializing and deserializing properties going into or flowing
 out of RPC calls.
 """
 import asyncio
-from collections import abc
 import functools
 import inspect
 from abc import ABC, abstractmethod
+from collections import abc
+from enum import Enum
+import os
 from typing import (
-    List,
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
+    Iterable,
+    List,
     Mapping,
     Optional,
     Sequence,
     Set,
-    TYPE_CHECKING,
+    Union,
     cast,
 )
-from enum import Enum
 
+import six
 from google.protobuf import struct_pb2
 from semver import VersionInfo as Version
-import six
-from . import known_types, settings
-from .resource import _expand_dependencies
-from .. import log
-from .. import _types
+
+from .. import _types, log
 from .. import urn as urn_util
+from . import known_types, settings
+from .resource_cycle_breaker import declare_dependency
 
 if TYPE_CHECKING:
-    from ..output import Inputs, Input, Output
-    from ..resource import CustomResource, Resource, ProviderResource
     from ..asset import (
+        AssetArchive,
+        FileArchive,
         FileAsset,
+        RemoteArchive,
         RemoteAsset,
         StringAsset,
-        FileArchive,
-        RemoteArchive,
-        AssetArchive,
     )
+    from ..output import Input, Inputs, Output
+    from ..resource import CustomResource, ProviderResource, Resource
+
+ERROR_ON_DEPENDENCY_CYCLES_VAR = "PULUMI_ERROR_ON_DEPENDENCY_CYCLES"
+"""The name of the environment variable to set to false if you want to disable erroring on dependency cycles."""
 
 UNKNOWN = "04da6b54-80e4-46f7-96ec-b56ff0331ba9"
 """If a value is None, we serialize as UNKNOWN, which tells the engine that it may be computed later."""
@@ -225,6 +231,88 @@ async def serialize_properties(
     return struct
 
 
+async def _add_dependency(
+    deps: Set[str], res: "Resource", from_resource: Optional["Resource"]
+):
+    """
+    _add_dependency adds a dependency on the given resource to the set of deps.
+
+    The behavior of this method depends on whether or not the resource is a custom resource, a local component resource,
+    or a remote component resource:
+
+    - Custom resources are added directly to the set, as they are "real" nodes in the dependency graph.
+    - Local component resources act as aggregations of their descendents. Rather than adding the component resource
+      itself, each child resource is added as a dependency.
+    - Remote component resources are added directly to the set, as they naturally act as aggregations of their children
+      with respect to dependencies: the construction of a remote component always waits on the construction of its
+      children.
+
+    In other words, if we had:
+
+                     Comp1
+                 |     |     |
+             Cust1   Comp2  Remote1
+                     |   |       |
+                 Cust2   Cust3  Comp3
+                 |                 |
+             Cust4                Cust5
+
+    Then the transitively reachable resources of Comp1 will be [Cust1, Cust2, Cust3, Remote1].
+    It will *not* include:
+    * Cust4 because it is a child of a custom resource
+    * Comp2 because it is a non-remote component resoruce
+    * Comp3 and Cust5 because Comp3 is a child of a remote component resource
+    """
+
+    # Exit early if there are cycles to avoid hangs.
+    no_cycles = declare_dependency(from_resource, res) if from_resource else True
+    if not no_cycles:
+        error_on_cycles = (
+            os.getenv(ERROR_ON_DEPENDENCY_CYCLES_VAR, "true").lower() == "true"
+        )
+        if not error_on_cycles:
+            return
+        raise RuntimeError(
+            "We have detected a circular dependency involving a resource of type"
+            + f" {res._type} named {res._name}.\n"
+            + "Please review any `depends_on`, `parent` or other dependency relationships between your resources to ensure "
+            + "no cycles have been introduced in your program."
+        )
+
+    from .. import ComponentResource  # pylint: disable=import-outside-toplevel
+
+    # Local component resources act as aggregations of their descendents.
+    # Rather than adding the component resource itself, each child resource
+    # is added as a dependency.
+    if isinstance(res, ComponentResource) and not res._remote:
+        # Copy the set before iterating so that any concurrent child additions during
+        # the dependency computation (which is async, so can be interleaved with other
+        # operations including child resource construction which adds children to this
+        # resource) do not trigger modification during iteration errors.
+        child_resources = res._childResources.copy()
+        for child in child_resources:
+            await _add_dependency(deps, child, from_resource)
+        return
+
+    urn = await res.urn.future()
+    if urn:
+        deps.add(urn)
+
+
+async def _expand_dependencies(
+    deps: Iterable["Resource"], from_resource: Optional["Resource"]
+) -> Set[str]:
+    """
+    _expand_dependencies expands the given iterable of Resources into a set of URNs.
+    """
+
+    urns: Set[str] = set()
+    for d in deps:
+        await _add_dependency(urns, d, from_resource)
+
+    return urns
+
+
 # pylint: disable=too-many-return-statements, too-many-branches
 async def serialize_property(
     value: "Input[Any]",
@@ -254,7 +342,7 @@ async def serialize_property(
     # Exclude some built-in types that are instances of Sequence that we don't want to treat as sequences here.
     # From: https://github.com/python/cpython/blob/master/Lib/_collections_abc.py
     if isinstance(value, abc.Sequence) and not isinstance(
-        value, (tuple, str, range, memoryview, bytes, bytearray)
+        value, (str, range, memoryview, bytes, bytearray)
     ):
         element_type = _get_list_element_type(typ)
         props = []
@@ -507,22 +595,22 @@ def deserialize_properties(
     # which has type `Struct` in our gRPC proto definition.
     if _special_sig_key in props_struct:
         from .. import (  # pylint: disable=import-outside-toplevel
-            FileAsset,
-            StringAsset,
-            RemoteAsset,
             AssetArchive,
             FileArchive,
+            FileAsset,
             RemoteArchive,
+            RemoteAsset,
+            StringAsset,
         )
 
         if props_struct[_special_sig_key] == _special_asset_sig:
             # This is an asset. Re-hydrate this object into an Asset.
             if "path" in props_struct:
-                return FileAsset(props_struct["path"])
+                return FileAsset(str(props_struct["path"]))
             if "text" in props_struct:
-                return StringAsset(props_struct["text"])
+                return StringAsset(str(props_struct["text"]))
             if "uri" in props_struct:
-                return RemoteAsset(props_struct["uri"])
+                return RemoteAsset(str(props_struct["uri"]))
             raise AssertionError(
                 "Invalid asset encountered when unmarshalling resource property"
             )
@@ -531,9 +619,9 @@ def deserialize_properties(
             if "assets" in props_struct:
                 return AssetArchive(deserialize_property(props_struct["assets"]))
             if "path" in props_struct:
-                return FileArchive(props_struct["path"])
+                return FileArchive(str(props_struct["path"]))
             if "uri" in props_struct:
-                return RemoteArchive(props_struct["uri"])
+                return RemoteArchive(str(props_struct["uri"]))
             raise AssertionError(
                 "Invalid archive encountered when unmarshalling resource property"
             )
@@ -570,9 +658,11 @@ def deserialize_properties(
 
 def deserialize_resource(
     ref_struct: struct_pb2.Struct, keep_unknowns: Optional[bool] = None
-) -> "Resource":
-    urn = ref_struct["urn"]
-    version = ref_struct["packageVersion"] if "packageVersion" in ref_struct else ""
+) -> Union["Resource", str]:
+    urn = str(ref_struct["urn"])
+    version = (
+        str(ref_struct["packageVersion"]) if "packageVersion" in ref_struct else ""
+    )
 
     urn_parts = urn_util._parse_urn(urn)
     urn_name = urn_parts.urn_name
@@ -748,7 +838,6 @@ def transfer_properties(res: "Resource", props: "Inputs") -> Dict[str, Resolver]
             deps: Set["Resource"],
             failed: Optional[Exception],
         ):
-
             # Create a union of deps and the resource.
             deps_union = set(deps) if deps else set()
             deps_union.add(r)
@@ -1008,7 +1097,6 @@ def resolve_outputs(
     resolvers: Dict[str, Resolver],
     transform_using_type_metadata: bool = False,
 ):
-
     # Produce a combined set of property states, starting with inputs and then applying
     # outputs.  If the same property exists in the inputs and outputs states, the output wins.
     all_properties = {}

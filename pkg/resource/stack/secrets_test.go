@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 
@@ -24,7 +24,7 @@ type testSecretsManager struct {
 
 func (t *testSecretsManager) Type() string { return "test" }
 
-func (t *testSecretsManager) State() interface{} { return nil }
+func (t *testSecretsManager) State() json.RawMessage { return nil }
 
 func (t *testSecretsManager) Encrypter() (config.Encrypter, error) {
 	return t, nil
@@ -35,13 +35,15 @@ func (t *testSecretsManager) Decrypter() (config.Decrypter, error) {
 }
 
 func (t *testSecretsManager) EncryptValue(
-	ctx context.Context, plaintext string) (string, error) {
+	ctx context.Context, plaintext string,
+) (string, error) {
 	t.encryptCalls++
 	return fmt.Sprintf("%v:%v", t.encryptCalls, plaintext), nil
 }
 
 func (t *testSecretsManager) DecryptValue(
-	ctx context.Context, ciphertext string) (string, error) {
+	ctx context.Context, ciphertext string,
+) (string, error) {
 	t.decryptCalls++
 	i := strings.Index(ciphertext, ":")
 	if i == -1 {
@@ -51,7 +53,8 @@ func (t *testSecretsManager) DecryptValue(
 }
 
 func (t *testSecretsManager) BulkDecrypt(
-	ctx context.Context, ciphertexts []string) (map[string]string, error) {
+	ctx context.Context, ciphertexts []string,
+) (map[string]string, error) {
 	return config.DefaultBulkDecrypt(ctx, t, ciphertexts)
 }
 
@@ -208,7 +211,7 @@ type mapTestSecretsManager struct {
 
 func (t *mapTestSecretsManager) Type() string { return t.sm.Type() }
 
-func (t *mapTestSecretsManager) State() interface{} { return t.sm.State() }
+func (t *mapTestSecretsManager) State() json.RawMessage { return t.sm.State() }
 
 func (t *mapTestSecretsManager) Encrypter() (config.Encrypter, error) {
 	return t.sm.Encrypter()
@@ -231,13 +234,15 @@ type mapTestDecrypter struct {
 }
 
 func (t *mapTestDecrypter) DecryptValue(
-	ctx context.Context, ciphertext string) (string, error) {
+	ctx context.Context, ciphertext string,
+) (string, error) {
 	t.decryptCalls++
 	return t.d.DecryptValue(ctx, ciphertext)
 }
 
 func (t *mapTestDecrypter) BulkDecrypt(
-	ctx context.Context, ciphertexts []string) (map[string]string, error) {
+	ctx context.Context, ciphertexts []string,
+) (map[string]string, error) {
 	t.bulkDecryptCalls++
 	return config.DefaultBulkDecrypt(ctx, t.d, ciphertexts)
 }
@@ -247,7 +252,7 @@ func TestMapCrypter(t *testing.T) {
 
 	ctx := context.Background()
 
-	bytes, err := ioutil.ReadFile("testdata/checkpoint-secrets.json")
+	bytes, err := os.ReadFile("testdata/checkpoint-secrets.json")
 	require.NoError(t, err)
 
 	chk, err := UnmarshalVersionedCheckpointToLatestCheckpoint(encoding.JSON, bytes)

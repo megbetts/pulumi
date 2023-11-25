@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import * as fs from "fs";
+import * as util from "util";
 import * as minimist from "minimist";
 import * as path from "path";
 import * as tsnode from "ts-node";
@@ -108,9 +109,7 @@ function throwOrPrintModuleLoadError(program: string, error: Error): void {
 
     if ("build" in scripts) {
         const command = scripts["build"];
-        console.error(
-            `  * Your program looks like it has a build script associated with it ('${command}').\n`,
-        );
+        console.error(`  * Your program looks like it has a build script associated with it ('${command}').\n`);
         console.error(
             "Pulumi does not run build scripts before running your program. " +
                 `Please run '${command}', 'yarn build', or 'npm run build' and try again.`,
@@ -207,21 +206,21 @@ export function run(opts: RunOpts): Promise<Record<string, any> | undefined> | P
 
         errorSet.add(err);
 
+        // colorize stack trace if exists
+        const stackMessage = err.stack && util.inspect(err, { colors: true });
+
         // Default message should be to include the full stack (which includes the message), or
         // fallback to just the message if we can't get the stack.
         //
         // If both the stack and message are empty, then just stringify the err object itself. This
         // is also necessary as users can throw arbitrary things in JS (including non-Errors).
-        const defaultMessage = err.stack || err.message || ("" + err);
+        const defaultMessage = stackMessage || err.message || "" + err;
 
         // First, log the error.
         if (RunError.isInstance(err)) {
             // Always hide the stack for RunErrors.
             log.error(err.message);
-        } else if (
-            err.name === tsnode.TSError.name
-            || err.name === SyntaxError.name) {
-
+        } else if (err.name === tsnode.TSError.name || err.name === SyntaxError.name) {
             // Hide stack frames as TSError/SyntaxError have messages containing
             // where the error is located
             const errOut = err.stack?.toString() || "";
@@ -229,12 +228,13 @@ export function run(opts: RunOpts): Promise<Record<string, any> | undefined> | P
 
             const errParts = errOut.split(err.message);
             if (errParts.length === 2) {
-                errMsg = errParts[0]+err.message;
+                errMsg = errParts[0] + err.message;
             }
 
             log.error(
                 `Running program '${program}' failed with an unhandled exception:
-${errMsg}`);
+${errMsg}`,
+            );
         } else if (ResourceError.isInstance(err)) {
             // Hide the stack if requested to by the ResourceError creator.
             const message = err.hideStack ? err.message : defaultMessage;
@@ -255,6 +255,8 @@ ${errMsg}`);
     process.on("unhandledRejection", uncaughtHandler);
     process.on("exit", settings.disconnectSync);
 
+    // Trigger callback to update a sentinel variable tracking
+    // whether the program is running.
     opts.programStarted();
 
     // Construct a `Stack` resource to represent the outputs of the program.
@@ -275,9 +277,7 @@ ${errMsg}`);
             // back.  That way, if it is async and throws an exception, we properly capture it here
             // and handle it.
             const reqResult = require(program);
-            const invokeResult = reqResult instanceof Function
-                ? reqResult()
-                : reqResult;
+            const invokeResult = reqResult instanceof Function ? reqResult() : reqResult;
 
             return await invokeResult;
         } catch (e) {

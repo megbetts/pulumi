@@ -1,6 +1,5 @@
 {
     "compilerOptions": {
-        "baseUrl": ".",
         "outDir": "bin",
         "target": "es2016",
         "module": "commonjs",
@@ -11,13 +10,14 @@
         "experimentalDecorators": true,
         "noFallthroughCasesInSwitch": true,
         "forceConsistentCasingInFileNames": true,
-        "paths": {
-            "@/*": ["*"]
-        },
         "strict": true
     },
     "files": [
         "index.ts",
+        "mainComponent.ts",
+        "mod/component.ts",
+        "mod/component2.ts",
+        "mod/index.ts",
         "provider.ts",
         "resource.ts",
         "resourceInput.ts",

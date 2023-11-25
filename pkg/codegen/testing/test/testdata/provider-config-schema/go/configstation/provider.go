@@ -7,7 +7,9 @@ import (
 	"context"
 	"reflect"
 
+	"config"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"internal"
 )
 
 type Provider struct {
@@ -21,9 +23,15 @@ func NewProvider(ctx *pulumi.Context,
 		args = &ProviderArgs{}
 	}
 
-	if isZero(args.FavoriteColor) {
-		args.FavoriteColor = pulumi.StringPtr(getEnvOrDefault("", nil, "FAVE_COLOR").(string))
+	if args.FavoriteColor == nil {
+		if d := internal.GetEnvOrDefault(nil, nil, "FAVE_COLOR"); d != nil {
+			args.FavoriteColor = pulumi.StringPtr(d.(string))
+		}
 	}
+	if args.SecretSandwiches != nil {
+		args.SecretSandwiches = pulumi.ToSecret(args.SecretSandwiches).(config.SandwichArrayInput)
+	}
+	opts = internal.PkgResourceDefaultOpts(opts)
 	var resource Provider
 	err := ctx.RegisterResource("pulumi:providers:configstation", name, args, &resource, opts...)
 	if err != nil {
@@ -35,12 +43,16 @@ func NewProvider(ctx *pulumi.Context,
 type providerArgs struct {
 	// this is a relaxed string enum which can also be set via env var
 	FavoriteColor *string `pulumi:"favoriteColor"`
+	// Super duper secret sandwiches.
+	SecretSandwiches []config.Sandwich `pulumi:"secretSandwiches"`
 }
 
 // The set of arguments for constructing a Provider resource.
 type ProviderArgs struct {
 	// this is a relaxed string enum which can also be set via env var
 	FavoriteColor pulumi.StringPtrInput
+	// Super duper secret sandwiches.
+	SecretSandwiches config.SandwichArrayInput
 }
 
 func (ProviderArgs) ElementType() reflect.Type {

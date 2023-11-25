@@ -1,4 +1,4 @@
-// nolint: lll
+//nolint:lll
 package nodejs
 
 import (
@@ -56,7 +56,6 @@ func testGeneratePackageBatch(t *testing.T, testCases []*test.SDKTest) {
 
 // Runs unit tests against the generated code.
 func testGeneratedPackage(t *testing.T, pwd string) {
-
 	// Some tests have do not have mocha as a dependency.
 	hasMocha := false
 	for _, c := range getYarnCommands(t, pwd) {
@@ -234,53 +233,5 @@ func Test_isStringType(t *testing.T) {
 				t.Errorf("isStringType() = %v, want %v", got, tt.expected)
 			}
 		})
-	}
-}
-
-// This test asserts that getRelativePath()
-// returns the right relative path. This smoke test
-// functions to pin the expected behavior to prevent regressions.
-func TestGetRelativePath(t *testing.T) {
-	t.Parallel()
-	type TestCase struct {
-		filename string
-		expected string
-	}
-	// Recall that arguments are assumed to be directory names,
-	// even if they contain an extension.
-	var cases = []TestCase{
-		{
-			filename: "foo.ts",
-			expected: "..",
-		}, {
-			filename: "foo/bar",
-			expected: "../..",
-		}, {
-			filename: "types/accessanalyzer/input",
-			expected: "../../..",
-		}, {
-			filename: "types/accessanalyzer/nested/input.ts",
-			expected: "../../../..",
-		}, {
-			filename: "types",
-			expected: "..",
-		}, {
-			filename: "./types/aws",
-			expected: "../..",
-		}, {
-			filename: "./types",
-			expected: "..",
-		}}
-	for _, tc := range cases {
-		var observed = getRelativePath(tc.filename)
-		require.Equal(
-			t,
-			tc.expected,
-			observed,
-			"Case (%s): Expected %s, Observed %s",
-			tc.filename,
-			tc.expected,
-			observed,
-		)
 	}
 }

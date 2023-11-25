@@ -1,4 +1,4 @@
-// Copyright 2016-2021, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,11 +33,14 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/state"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/pkg/v3/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
@@ -46,31 +49,33 @@ func newAboutCmd() *cobra.Command {
 	var transitiveDependencies bool
 	var stack string
 	short := "Print information about the Pulumi environment."
-	cmd :=
-		&cobra.Command{
-			Use:   "about",
-			Short: short,
-			Long: short + "\n" +
-				"\n" +
-				"Prints out information helpful for debugging the Pulumi CLI." +
-				"\n" +
-				"This includes information about:\n" +
-				" - the CLI and how it was built\n" +
-				" - which OS Pulumi was run from\n" +
-				" - the current project\n" +
-				" - the current stack\n" +
-				" - the current backend\n",
-			Args: cmdutil.MaximumNArgs(0),
-			Run: cmdutil.RunFunc(func(cmd *cobra.Command, args []string) error {
-				ctx := commandContext()
-				summary := getSummaryAbout(ctx, transitiveDependencies, stack)
-				if jsonOut {
-					return printJSON(summary)
-				}
-				summary.Print()
-				return nil
-			}),
-		}
+	cmd := &cobra.Command{
+		Use:   "about",
+		Short: short,
+		Long: short + "\n" +
+			"\n" +
+			"Prints out information helpful for debugging the Pulumi CLI." +
+			"\n" +
+			"This includes information about:\n" +
+			" - the CLI and how it was built\n" +
+			" - which OS Pulumi was run from\n" +
+			" - the current project\n" +
+			" - the current stack\n" +
+			" - the current backend\n",
+		Args: cmdutil.MaximumNArgs(0),
+		Run: cmdutil.RunFunc(func(cmd *cobra.Command, args []string) error {
+			ctx := commandContext()
+			summary := getSummaryAbout(ctx, transitiveDependencies, stack)
+			if jsonOut {
+				return printJSON(summary)
+			}
+			summary.Print()
+			return nil
+		}),
+	}
+
+	cmd.AddCommand(newAboutEnvCmd())
+
 	cmd.PersistentFlags().BoolVarP(
 		&jsonOut, "json", "j", false, "Emit output as JSON")
 	cmd.PersistentFlags().StringVarP(
@@ -127,7 +132,7 @@ func getSummaryAbout(ctx context.Context, transitiveDependencies bool, selectedS
 	} else {
 		projinfo := &engine.Projinfo{Proj: proj, Root: pwd}
 		pwd, program, pluginContext, err := engine.ProjectInfoContext(
-			projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil)
+			projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil, nil)
 		if err != nil {
 			addError(err, "Failed to create plugin context")
 		} else {
@@ -174,7 +179,7 @@ func getSummaryAbout(ctx context.Context, transitiveDependencies bool, selectedS
 	}
 
 	var backend backend.Backend
-	backend, err = nonInteractiveCurrentBackend(ctx)
+	backend, err = nonInteractiveCurrentBackend(ctx, proj)
 	if err != nil {
 		addError(err, "Could not access the backend")
 	} else if backend != nil {
@@ -238,7 +243,7 @@ func getPluginsAbout(ctx *plugin.Context, proj *workspace.Project, pwd, main str
 		return false
 	})
 
-	var plugins = make([]pluginAbout, len(pluginSpec))
+	plugins := make([]pluginAbout, len(pluginSpec))
 	for i, p := range pluginSpec {
 		plugins[i] = pluginAbout{
 			Name:    p.Name,
@@ -294,45 +299,65 @@ func (host hostAbout) String() string {
 			{"OS", host.Os},
 			{"Version", host.Version},
 			{"Arch", host.Arch},
-		})}.String()
-}
-
-type backendAbout struct {
-	Name          string   `json:"name"`
-	URL           string   `json:"url"`
-	User          string   `json:"user"`
-	Organizations []string `json:"organizations"`
-}
-
-func getBackendAbout(b backend.Backend) backendAbout {
-	currentUser, currentOrgs, err := b.CurrentUser()
-	if err != nil {
-		currentUser = "Unknown"
-	}
-	return backendAbout{
-		Name:          b.Name(),
-		URL:           b.URL(),
-		User:          currentUser,
-		Organizations: currentOrgs,
-	}
-}
-
-func (b backendAbout) String() string {
-	return cmdutil.Table{
-		Headers: []string{"Backend", ""},
-		Rows: simpleTableRows([][]string{
-			{"Name", b.Name},
-			{"URL", b.URL},
-			{"User", b.User},
-			{"Organizations", strings.Join(b.Organizations, ", ")},
 		}),
 	}.String()
 }
 
+type backendAbout struct {
+	Name             string                      `json:"name"`
+	URL              string                      `json:"url"`
+	User             string                      `json:"user"`
+	Organizations    []string                    `json:"organizations"`
+	TokenInformation *workspace.TokenInformation `json:"tokenInformation,omitempty"`
+}
+
+func getBackendAbout(b backend.Backend) backendAbout {
+	currentUser, currentOrgs, tokenInfo, err := b.CurrentUser()
+	if err != nil {
+		currentUser = "Unknown"
+	}
+	return backendAbout{
+		Name:             b.Name(),
+		URL:              b.URL(),
+		User:             currentUser,
+		Organizations:    currentOrgs,
+		TokenInformation: tokenInfo,
+	}
+}
+
+func (b backendAbout) String() string {
+	rows := [][]string{
+		{"Name", b.Name},
+		{"URL", b.URL},
+		{"User", b.User},
+		{"Organizations", strings.Join(b.Organizations, ", ")},
+	}
+
+	if b.TokenInformation != nil {
+		var tokenType string
+		if b.TokenInformation.Team != "" {
+			tokenType = fmt.Sprintf("team: %s", b.TokenInformation.Team)
+		} else {
+			contract.Assertf(b.TokenInformation.Organization != "", "token must have an organization or team")
+			tokenType = fmt.Sprintf("organization: %s", b.TokenInformation.Organization)
+		}
+		rows = append(rows, []string{"Token type", tokenType})
+		rows = append(rows, []string{"Token type", b.TokenInformation.Name})
+	} else {
+		rows = append(rows, []string{"Token type", "personal"})
+	}
+
+	return cmdutil.Table{
+		Headers: []string{"Backend", ""},
+		Rows:    simpleTableRows(rows),
+	}.String()
+}
+
 type currentStackAbout struct {
-	Name       string       `json:"name"`
-	Resources  []aboutState `json:"resources"`
-	PendingOps []aboutState `json:"pendingOps"`
+	Name               string       `json:"name"`
+	FullyQualifiedName string       `json:"fullyQualifiedName"`
+	Resources          []aboutState `json:"resources"`
+	PendingOps         []aboutState `json:"pendingOps"`
 }
 
 type aboutState struct {
@@ -341,28 +366,28 @@ type aboutState struct {
 }
 
 func getCurrentStackAbout(ctx context.Context, b backend.Backend, selectedStack string) (currentStackAbout, error) {
-	var stack backend.Stack
+	var s backend.Stack
 	var err error
 	if selectedStack == "" {
-		stack, err = state.CurrentStack(ctx, b)
+		s, err = state.CurrentStack(ctx, b)
 	} else {
 		var ref backend.StackReference
 		ref, err = b.ParseStackReference(selectedStack)
 		if err != nil {
 			return currentStackAbout{}, err
 		}
-		stack, err = b.GetStack(ctx, ref)
+		s, err = b.GetStack(ctx, ref)
 	}
 	if err != nil {
 		return currentStackAbout{}, err
 	}
-	if stack == nil {
+	if s == nil {
 		return currentStackAbout{}, errors.New("No current stack")
 	}
 
-	name := stack.Ref().String()
+	name := s.Ref().String()
 	var snapshot *deploy.Snapshot
-	snapshot, err = stack.Snapshot(ctx)
+	snapshot, err = s.Snapshot(ctx, stack.DefaultSecretsProvider)
 	if err != nil {
 		return currentStackAbout{}, err
 	} else if snapshot == nil {
@@ -371,14 +396,14 @@ func getCurrentStackAbout(ctx context.Context, b backend.Backend, selectedStack 
 	var resources []*resource.State = snapshot.Resources
 	var pendingOps []resource.Operation = snapshot.PendingOperations
 
-	var aboutResources = make([]aboutState, len(resources))
+	aboutResources := make([]aboutState, len(resources))
 	for i, r := range resources {
 		aboutResources[i] = aboutState{
 			Type: string(r.Type),
 			URN:  string(r.URN),
 		}
 	}
-	var aboutPending = make([]aboutState, len(pendingOps))
+	aboutPending := make([]aboutState, len(pendingOps))
 	for i, p := range pendingOps {
 		aboutPending[i] = aboutState{
 			Type: string(p.Type),
@@ -386,9 +411,10 @@ func getCurrentStackAbout(ctx context.Context, b backend.Backend, selectedStack 
 		}
 	}
 	return currentStackAbout{
-		Name:       name,
-		Resources:  aboutResources,
-		PendingOps: aboutPending,
+		Name:               name,
+		FullyQualifiedName: s.Ref().FullyQualifiedName().String(),
+		Resources:          aboutResources,
+		PendingOps:         aboutPending,
 	}, nil
 }
 
@@ -423,7 +449,11 @@ func (current currentStackAbout) String() string {
 			Rows:    rows,
 		}.String() + "\n"
 	}
-	return fmt.Sprintf("Current Stack: %s\n\n%s\n%s", current.Name, resources, pending)
+	stackName := current.Name
+	if current.FullyQualifiedName != "" {
+		stackName = current.FullyQualifiedName
+	}
+	return fmt.Sprintf("Current Stack: %s\n\n%s\n%s", stackName, resources, pending)
 }
 
 func simpleTableRows(arr [][]string) []cmdutil.TableRow {
@@ -526,7 +556,7 @@ func (runtime projectRuntimeAbout) MarshalJSON() ([]byte, error) {
 }
 
 func (runtime projectRuntimeAbout) String() string {
-	var params []string
+	params := slice.Prealloc[string](len(runtime.other))
 
 	if r := runtime.Executable; r != "" {
 		params = append(params, fmt.Sprintf("executable='%s'", r))
@@ -548,7 +578,8 @@ func (runtime projectRuntimeAbout) String() string {
 // This is necessary because dotnet invokes build during the call to
 // getProjectPlugins.
 func getProjectPluginsSilently(
-	ctx *plugin.Context, proj *workspace.Project, pwd, main string) ([]workspace.PluginSpec, error) {
+	ctx *plugin.Context, proj *workspace.Project, pwd, main string,
+) ([]workspace.PluginSpec, error) {
 	_, w, err := os.Pipe()
 	if err != nil {
 		return nil, err

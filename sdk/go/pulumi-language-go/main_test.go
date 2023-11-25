@@ -15,14 +15,109 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/testing/iotest"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/fsutil"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestParseRunParams(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		desc    string
+		give    []string
+		want    runParams
+		wantErr string // non-empty if we expect an error
+	}{
+		{
+			desc:    "no arguments",
+			wantErr: "missing required engine RPC address argument",
+		},
+		{
+			desc: "no options",
+			give: []string{"localhost:1234"},
+			want: runParams{
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc:    "binary buildTarget exclusivity",
+			give:    []string{"-binary", "foo", "-buildTarget=bar"},
+			wantErr: "binary and buildTarget cannot both be specified",
+		},
+		{
+			desc: "tracing",
+			give: []string{"-tracing", "foo.trace", "localhost:1234"},
+			want: runParams{
+				tracing:       "foo.trace",
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "binary",
+			give: []string{"-binary", "foo", "localhost:1234"},
+			want: runParams{
+				binary:        "foo",
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "buildTarget",
+			give: []string{"-buildTarget", "foo", "localhost:1234"},
+			want: runParams{
+				buildTarget:   "foo",
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "root",
+			give: []string{"-root", "path/to/root", "localhost:1234"},
+			want: runParams{
+				root:          "path/to/root",
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc:    "unknown option",
+			give:    []string{"-unknown-option", "bar", "localhost:1234"},
+			wantErr: "flag provided but not defined: -unknown-option",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
+
+			// Use a FlagSet with ContinueOnError for each case
+			// instead of using the global flag set.
+			//
+			// The global flag set uses flag.ExitOnError,
+			// so it cannot validate error cases during tests.
+			fset := flag.NewFlagSet(t.Name(), flag.ContinueOnError)
+			fset.SetOutput(iotest.LogWriter(t))
+
+			got, err := parseRunParams(fset, tt.give)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, &tt.want, got)
+			}
+		})
+	}
+}
 
 func TestGetPlugin(t *testing.T) {
 	t.Parallel()
@@ -205,19 +300,20 @@ func TestGetPlugin(t *testing.T) {
 			t.Parallel()
 
 			cwd := t.TempDir()
+			if c.Mod.Dir == "" {
+				c.Mod.Dir = cwd
+			}
 			if c.JSON != nil {
-				if c.Mod.Dir == "" {
-					c.Mod.Dir = cwd
-				}
 				path := filepath.Join(cwd, c.JSONPath)
-				err := os.MkdirAll(path, 0700)
+				err := os.MkdirAll(path, 0o700)
 				assert.NoErrorf(t, err, "Failed to setup test folder %s", path)
 				bytes, err := c.JSON.JSON()
 				assert.NoError(t, err, "Failed to setup test pulumi-plugin.json")
-				err = os.WriteFile(filepath.Join(path, "pulumi-plugin.json"), bytes, 0600)
+				err = os.WriteFile(filepath.Join(path, "pulumi-plugin.json"), bytes, 0o600)
 				assert.NoError(t, err, "Failed to write pulumi-plugin.json")
 			}
-			actual, err := c.Mod.getPlugin()
+
+			actual, err := c.Mod.getPlugin(t.TempDir())
 			if c.ShouldErr {
 				assert.Error(t, err)
 			} else {
@@ -230,4 +326,131 @@ func TestGetPlugin(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPluginsAndDependencies_moduleMode(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t,
+		fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+		"copy test data")
+
+	testPluginsAndDependencies(t, filepath.Join(root, "prog"))
+}
+
+// Test for https://github.com/pulumi/pulumi/issues/12526.
+// Validates that if a Pulumi program has vendored its dependencies,
+// the language host can still find the plugin and run the program.
+func TestPluginsAndDependencies_vendored(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t,
+		fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+		"copy test data")
+
+	progDir := filepath.Join(root, "prog")
+
+	// Vendor the dependencies and nuke the sources
+	// to ensure that the language host can only use the vendored version.
+	cmd := exec.Command("go", "mod", "vendor")
+	cmd.Dir = progDir
+	cmd.Stdout = iotest.LogWriter(t)
+	cmd.Stderr = iotest.LogWriter(t)
+	require.NoError(t, cmd.Run(), "vendor dependencies")
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "plugin")))
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "dep")))
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "indirect-dep")))
+
+	testPluginsAndDependencies(t, progDir)
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/12963.
+// Verifies that the language host can find plugins and dependencies
+// when the Pulumi program is in a subdirectory of the project root.
+func TestPluginsAndDependencies_subdir(t *testing.T) {
+	t.Parallel()
+
+	t.Run("moduleMode", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		require.NoError(t,
+			fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+			"copy test data")
+
+		testPluginsAndDependencies(t, filepath.Join(root, "prog-subdir", "infra"))
+	})
+
+	t.Run("vendored", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		require.NoError(t,
+			fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+			"copy test data")
+
+		progDir := filepath.Join(root, "prog-subdir", "infra")
+
+		// Vendor the dependencies and nuke the sources
+		// to ensure that the language host can only use the vendored version.
+		cmd := exec.Command("go", "mod", "vendor")
+		cmd.Dir = progDir
+		cmd.Stdout = iotest.LogWriter(t)
+		cmd.Stderr = iotest.LogWriter(t)
+		require.NoError(t, cmd.Run(), "vendor dependencies")
+		require.NoError(t, os.RemoveAll(filepath.Join(root, "plugin")))
+		require.NoError(t, os.RemoveAll(filepath.Join(root, "dep")))
+		require.NoError(t, os.RemoveAll(filepath.Join(root, "indirect-dep")))
+
+		testPluginsAndDependencies(t, progDir)
+	})
+}
+
+func testPluginsAndDependencies(t *testing.T, progDir string) {
+	host := newLanguageHost("0.0.0.0:0", progDir, "", "", "")
+	ctx := context.Background()
+
+	t.Run("GetRequiredPlugins", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		res, err := host.GetRequiredPlugins(ctx, &pulumirpc.GetRequiredPluginsRequest{
+			Project: "prog",
+			Pwd:     progDir,
+		})
+		require.NoError(t, err)
+
+		require.Len(t, res.Plugins, 1)
+		plug := res.Plugins[0]
+
+		assert.Equal(t, "example", plug.Name, "plugin name")
+		assert.Equal(t, "v1.2.3", plug.Version, "plugin version")
+		assert.Equal(t, "resource", plug.Kind, "plugin kind")
+		assert.Equal(t, "example.com/download", plug.Server, "plugin server")
+	})
+
+	t.Run("GetProgramDependencies", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		res, err := host.GetProgramDependencies(ctx, &pulumirpc.GetProgramDependenciesRequest{
+			Project:                "prog",
+			Pwd:                    progDir,
+			TransitiveDependencies: true,
+		})
+		require.NoError(t, err)
+
+		gotDeps := make(map[string]string) // name => version
+		for _, dep := range res.Dependencies {
+			gotDeps[dep.Name] = dep.Version
+		}
+
+		assert.Equal(t, map[string]string{
+			"example.com/plugin":          "v1.2.3",
+			"example.com/dep":             "v1.5.0",
+			"example.com/indirect-dep/v2": "v2.1.0",
+		}, gotDeps)
+	})
 }

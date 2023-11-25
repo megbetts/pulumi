@@ -98,9 +98,9 @@ package auto
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -110,10 +110,7 @@ import (
 
 	pbempty "github.com/golang/protobuf/ptypes/empty"
 	"github.com/nxadm/tail"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/debug"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
@@ -125,6 +122,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/constant"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -153,8 +151,7 @@ func FullyQualifiedStackName(org, project, stack string) string {
 // NewStack creates a new stack using the given workspace, and stack name.
 // It fails if a stack with that name already exists
 func NewStack(ctx context.Context, stackName string, ws Workspace) (Stack, error) {
-	var s Stack
-	s = Stack{
+	s := Stack{
 		workspace: ws,
 		stackName: stackName,
 	}
@@ -170,8 +167,7 @@ func NewStack(ctx context.Context, stackName string, ws Workspace) (Stack, error
 // SelectStack selects stack using the given workspace, and stack name.
 // It returns an error if the given Stack does not exist.
 func SelectStack(ctx context.Context, stackName string, ws Workspace) (Stack, error) {
-	var s Stack
-	s = Stack{
+	s := Stack{
 		workspace: ws,
 		stackName: stackName,
 	}
@@ -209,7 +205,7 @@ func (s *Stack) Workspace() Workspace {
 }
 
 // Preview preforms a dry-run update to a stack, returning pending changes.
-// https://www.pulumi.com/docs/reference/cli/pulumi_preview/
+// https://www.pulumi.com/docs/cli/commands/pulumi_preview/
 func (s *Stack) Preview(ctx context.Context, opts ...optpreview.Option) (PreviewResult, error) {
 	var res PreviewResult
 
@@ -218,7 +214,9 @@ func (s *Stack) Preview(ctx context.Context, opts ...optpreview.Option) (Preview
 		o.ApplyOption(preOpts)
 	}
 
-	var sharedArgs []string
+	bufferSizeHint := len(preOpts.Replace) + len(preOpts.Target) +
+		len(preOpts.PolicyPacks) + len(preOpts.PolicyPackConfigs)
+	sharedArgs := slice.Prealloc[string](bufferSizeHint)
 
 	sharedArgs = debug.AddArgs(&preOpts.DebugLogOpts, sharedArgs)
 	if preOpts.Message != "" {
@@ -296,7 +294,7 @@ func (s *Stack) Preview(ctx context.Context, opts ...optpreview.Option) (Preview
 
 	t, err := tailLogs("preview", eventChannels)
 	if err != nil {
-		return res, errors.Wrap(err, "failed to tail logs")
+		return res, fmt.Errorf("failed to tail logs: %w", err)
 	}
 	defer t.Close()
 	args = append(args, "--event-log", t.Filename)
@@ -308,7 +306,7 @@ func (s *Stack) Preview(ctx context.Context, opts ...optpreview.Option) (Preview
 		args...,
 	)
 	if err != nil {
-		return res, newAutoError(errors.Wrap(err, "failed to run preview"), stdout, stderr, code)
+		return res, newAutoError(fmt.Errorf("failed to run preview: %w", err), stdout, stderr, code)
 	}
 
 	// Close the file watcher wait for all events to send
@@ -330,7 +328,7 @@ func (s *Stack) Preview(ctx context.Context, opts ...optpreview.Option) (Preview
 }
 
 // Up creates or updates the resources in a stack by executing the program in the Workspace.
-// https://www.pulumi.com/docs/reference/cli/pulumi_up/
+// https://www.pulumi.com/docs/cli/commands/pulumi_up/
 func (s *Stack) Up(ctx context.Context, opts ...optup.Option) (UpResult, error) {
 	var res UpResult
 
@@ -339,7 +337,8 @@ func (s *Stack) Up(ctx context.Context, opts ...optup.Option) (UpResult, error) 
 		o.ApplyOption(upOpts)
 	}
 
-	var sharedArgs []string
+	bufferSizeHint := len(upOpts.Replace) + len(upOpts.Target) + len(upOpts.PolicyPacks) + len(upOpts.PolicyPackConfigs)
+	sharedArgs := slice.Prealloc[string](bufferSizeHint)
 
 	sharedArgs = debug.AddArgs(&upOpts.DebugLogOpts, sharedArgs)
 	if upOpts.Message != "" {
@@ -398,7 +397,7 @@ func (s *Stack) Up(ctx context.Context, opts ...optup.Option) (UpResult, error) 
 		eventChannels := upOpts.EventStreams
 		t, err := tailLogs("up", eventChannels)
 		if err != nil {
-			return res, errors.Wrap(err, "failed to tail logs")
+			return res, fmt.Errorf("failed to tail logs: %w", err)
 		}
 		defer t.Close()
 		args = append(args, "--event-log", t.Filename)
@@ -407,7 +406,7 @@ func (s *Stack) Up(ctx context.Context, opts ...optup.Option) (UpResult, error) 
 	args = append(args, sharedArgs...)
 	stdout, stderr, code, err := s.runPulumiCmdSync(ctx, upOpts.ProgressStreams, upOpts.ErrorProgressStreams, args...)
 	if err != nil {
-		return res, newAutoError(errors.Wrap(err, "failed to run update"), stdout, stderr, code)
+		return res, newAutoError(fmt.Errorf("failed to run update: %w", err), stdout, stderr, code)
 	}
 
 	outs, err := s.Outputs(ctx)
@@ -452,7 +451,7 @@ func (s *Stack) Refresh(ctx context.Context, opts ...optrefresh.Option) (Refresh
 		o.ApplyOption(refreshOpts)
 	}
 
-	var args []string
+	args := slice.Prealloc[string](len(refreshOpts.Target))
 
 	args = debug.AddArgs(&refreshOpts.DebugLogOpts, args)
 	args = append(args, "refresh", "--yes", "--skip-preview")
@@ -484,7 +483,7 @@ func (s *Stack) Refresh(ctx context.Context, opts ...optrefresh.Option) (Refresh
 		eventChannels := refreshOpts.EventStreams
 		t, err := tailLogs("refresh", eventChannels)
 		if err != nil {
-			return res, errors.Wrap(err, "failed to tail logs")
+			return res, fmt.Errorf("failed to tail logs: %w", err)
 		}
 		defer t.Close()
 		args = append(args, "--event-log", t.Filename)
@@ -500,7 +499,7 @@ func (s *Stack) Refresh(ctx context.Context, opts ...optrefresh.Option) (Refresh
 		args...,
 	)
 	if err != nil {
-		return res, newAutoError(errors.Wrap(err, "failed to refresh stack"), stdout, stderr, code)
+		return res, newAutoError(fmt.Errorf("failed to refresh stack: %w", err), stdout, stderr, code)
 	}
 
 	historyOpts := []opthistory.Option{}
@@ -514,7 +513,7 @@ func (s *Stack) Refresh(ctx context.Context, opts ...optrefresh.Option) (Refresh
 	}
 	history, err := s.History(ctx, 1 /*pageSize*/, 1 /*page*/, historyOpts...)
 	if err != nil {
-		return res, errors.Wrap(err, "failed to refresh stack")
+		return res, fmt.Errorf("failed to refresh stack: %w", err)
 	}
 
 	var summary UpdateSummary
@@ -540,7 +539,7 @@ func (s *Stack) Destroy(ctx context.Context, opts ...optdestroy.Option) (Destroy
 		o.ApplyOption(destroyOpts)
 	}
 
-	var args []string
+	args := slice.Prealloc[string](len(destroyOpts.Target))
 
 	args = debug.AddArgs(&destroyOpts.DebugLogOpts, args)
 	args = append(args, "destroy", "--yes", "--skip-preview")
@@ -572,7 +571,7 @@ func (s *Stack) Destroy(ctx context.Context, opts ...optdestroy.Option) (Destroy
 		eventChannels := destroyOpts.EventStreams
 		t, err := tailLogs("destroy", eventChannels)
 		if err != nil {
-			return res, errors.Wrap(err, "failed to tail logs")
+			return res, fmt.Errorf("failed to tail logs: %w", err)
 		}
 		defer t.Close()
 		args = append(args, "--event-log", t.Filename)
@@ -588,7 +587,7 @@ func (s *Stack) Destroy(ctx context.Context, opts ...optdestroy.Option) (Destroy
 		args...,
 	)
 	if err != nil {
-		return res, newAutoError(errors.Wrap(err, "failed to destroy stack"), stdout, stderr, code)
+		return res, newAutoError(fmt.Errorf("failed to destroy stack: %w", err), stdout, stderr, code)
 	}
 
 	historyOpts := []opthistory.Option{}
@@ -602,7 +601,7 @@ func (s *Stack) Destroy(ctx context.Context, opts ...optdestroy.Option) (Destroy
 	}
 	history, err := s.History(ctx, 1 /*pageSize*/, 1 /*page*/, historyOpts...)
 	if err != nil {
-		return res, errors.Wrap(err, "failed to destroy stack")
+		return res, fmt.Errorf("failed to destroy stack: %w", err)
 	}
 
 	var summary UpdateSummary
@@ -627,7 +626,8 @@ func (s *Stack) Outputs(ctx context.Context) (OutputMap, error) {
 // History returns a list summarizing all previous and current results from Stack lifecycle operations
 // (up/preview/refresh/destroy).
 func (s *Stack) History(ctx context.Context,
-	pageSize int, page int, opts ...opthistory.Option) ([]UpdateSummary, error) {
+	pageSize int, page int, opts ...opthistory.Option,
+) ([]UpdateSummary, error) {
 	var options opthistory.Options
 	for _, opt := range opts {
 		opt.ApplyOption(&options)
@@ -655,13 +655,13 @@ func (s *Stack) History(ctx context.Context,
 		args...,
 	)
 	if err != nil {
-		return nil, newAutoError(errors.Wrap(err, "failed to get stack history"), stdout, stderr, errCode)
+		return nil, newAutoError(fmt.Errorf("failed to get stack history: %w", err), stdout, stderr, errCode)
 	}
 
 	var history []UpdateSummary
 	err = json.Unmarshal([]byte(stdout), &history)
 	if err != nil {
-		return nil, errors.Wrap(err, "unable to unmarshal history result")
+		return nil, fmt.Errorf("unable to unmarshal history result: %w", err)
 	}
 
 	return history, nil
@@ -670,6 +670,11 @@ func (s *Stack) History(ctx context.Context,
 // GetConfig returns the config value associated with the specified key.
 func (s *Stack) GetConfig(ctx context.Context, key string) (ConfigValue, error) {
 	return s.Workspace().GetConfig(ctx, s.Name(), key)
+}
+
+// GetConfigWithOptions returns the config value associated with the specified key using the optional ConfigOptions.
+func (s *Stack) GetConfigWithOptions(ctx context.Context, key string, opts *ConfigOptions) (ConfigValue, error) {
+	return s.Workspace().GetConfigWithOptions(ctx, s.Name(), key, opts)
 }
 
 // GetAllConfig returns the full config map.
@@ -682,9 +687,19 @@ func (s *Stack) SetConfig(ctx context.Context, key string, val ConfigValue) erro
 	return s.Workspace().SetConfig(ctx, s.Name(), key, val)
 }
 
+// SetConfigWithOptions sets the specified config key-value pair using the optional ConfigOptions.
+func (s *Stack) SetConfigWithOptions(ctx context.Context, key string, val ConfigValue, opts *ConfigOptions) error {
+	return s.Workspace().SetConfigWithOptions(ctx, s.Name(), key, val, opts)
+}
+
 // SetAllConfig sets all values in the provided config map.
 func (s *Stack) SetAllConfig(ctx context.Context, config ConfigMap) error {
 	return s.Workspace().SetAllConfig(ctx, s.Name(), config)
+}
+
+// SetAllConfigWithOptions sets all values in the provided config map using the optional ConfigOptions.
+func (s *Stack) SetAllConfigWithOptions(ctx context.Context, config ConfigMap, opts *ConfigOptions) error {
+	return s.Workspace().SetAllConfigWithOptions(ctx, s.Name(), config, opts)
 }
 
 // RemoveConfig removes the specified config key-value pair.
@@ -692,9 +707,19 @@ func (s *Stack) RemoveConfig(ctx context.Context, key string) error {
 	return s.Workspace().RemoveConfig(ctx, s.Name(), key)
 }
 
+// RemoveConfigWithOptions removes the specified config key-value pair using the optional ConfigOptions.
+func (s *Stack) RemoveConfigWithOptions(ctx context.Context, key string, opts *ConfigOptions) error {
+	return s.Workspace().RemoveConfigWithOptions(ctx, s.Name(), key, opts)
+}
+
 // RemoveAllConfig removes all values in the provided list of keys.
 func (s *Stack) RemoveAllConfig(ctx context.Context, keys []string) error {
 	return s.Workspace().RemoveAllConfig(ctx, s.Name(), keys)
+}
+
+// RemoveAllConfigWithOptions removes all values in the provided list of keys using the optional ConfigOptions.
+func (s *Stack) RemoveAllConfigWithOptions(ctx context.Context, keys []string, opts *ConfigOptions) error {
+	return s.Workspace().RemoveAllConfigWithOptions(ctx, s.Name(), keys, opts)
 }
 
 // RefreshConfig gets and sets the config map used with the last Update.
@@ -702,17 +727,37 @@ func (s *Stack) RefreshConfig(ctx context.Context) (ConfigMap, error) {
 	return s.Workspace().RefreshConfig(ctx, s.Name())
 }
 
+// GetTag returns the tag value associated with specified key.
+func (s *Stack) GetTag(ctx context.Context, key string) (string, error) {
+	return s.Workspace().GetTag(ctx, s.Name(), key)
+}
+
+// SetTag sets a tag key-value pair on the stack.
+func (s *Stack) SetTag(ctx context.Context, key string, value string) error {
+	return s.Workspace().SetTag(ctx, s.Name(), key, value)
+}
+
+// RemoveTag removes the specified tag key-value pair from the stack.
+func (s *Stack) RemoveTag(ctx context.Context, key string) error {
+	return s.Workspace().RemoveTag(ctx, s.Name(), key)
+}
+
+// ListTags returns the full key-value tag map associated with the stack.
+func (s *Stack) ListTags(ctx context.Context) (map[string]string, error) {
+	return s.Workspace().ListTags(ctx, s.Name())
+}
+
 // Info returns a summary of the Stack including its URL.
 func (s *Stack) Info(ctx context.Context) (StackSummary, error) {
 	var info StackSummary
 	err := s.Workspace().SelectStack(ctx, s.Name())
 	if err != nil {
-		return info, errors.Wrap(err, "failed to fetch stack info")
+		return info, fmt.Errorf("failed to fetch stack info: %w", err)
 	}
 
 	summary, err := s.Workspace().Stack(ctx)
 	if err != nil {
-		return info, errors.Wrap(err, "failed to fetch stack info")
+		return info, fmt.Errorf("failed to fetch stack info: %w", err)
 	}
 
 	if summary != nil {
@@ -733,7 +778,7 @@ func (s *Stack) Cancel(ctx context.Context) error {
 		nil, /* additionalErrorOutput */
 		"cancel", "--yes")
 	if err != nil {
-		return newAutoError(errors.Wrap(err, "failed to cancel update"), stdout, stderr, errCode)
+		return newAutoError(fmt.Errorf("failed to cancel update: %w", err), stdout, stderr, errCode)
 	}
 
 	return nil
@@ -792,7 +837,7 @@ var ErrParsePermalinkFailed = errors.New("failed to get permalink")
 // GetPermalink returns the permalink URL in the Pulumi Console for the update
 // or refresh operation. This will error for alternate, local backends.
 func GetPermalink(stdout string) (string, error) {
-	const permalinkSearchStr = "View Live: |Permalink: "
+	const permalinkSearchStr = `View Live: |View in Browser: |View in Browser \(Ctrl\+O\): |Permalink: `
 	startRegex := regexp.MustCompile(permalinkSearchStr)
 	endRegex := regexp.MustCompile("\n")
 
@@ -913,7 +958,7 @@ func (s *Stack) runPulumiCmdSync(
 	}
 	additionalArgs, err := s.Workspace().SerializeArgsForOp(ctx, s.Name())
 	if err != nil {
-		return "", "", -1, errors.Wrap(err, "failed to exec command, error getting additional args")
+		return "", "", -1, fmt.Errorf("failed to exec command, error getting additional args: %w", err)
 	}
 	args = append(args, additionalArgs...)
 	args = append(args, "--stack", s.Name())
@@ -931,7 +976,7 @@ func (s *Stack) runPulumiCmdSync(
 	}
 	err = s.Workspace().PostCommandCallback(ctx, s.Name())
 	if err != nil {
-		return stdout, stderr, errCode, errors.Wrap(err, "command ran successfully, but error running PostCommandCallback")
+		return stdout, stderr, errCode, fmt.Errorf("command ran successfully, but error running PostCommandCallback: %w", err)
 	}
 	return stdout, stderr, errCode, nil
 }
@@ -949,17 +994,19 @@ func (s *Stack) remoteArgs() []string {
 	var repo *GitRepo
 	var preRunCommands []string
 	var envvars map[string]EnvVarValue
+	var skipInstallDependencies bool
 	if lws, isLocalWorkspace := s.Workspace().(*LocalWorkspace); isLocalWorkspace {
 		remote = lws.remote
 		repo = lws.repo
 		preRunCommands = lws.preRunCommands
 		envvars = lws.remoteEnvVars
+		skipInstallDependencies = lws.remoteSkipInstallDependencies
 	}
 	if !remote {
 		return nil
 	}
 
-	var args []string
+	args := slice.Prealloc[string](len(envvars) + len(preRunCommands))
 	args = append(args, "--remote")
 	if repo != nil {
 		if repo.URL != "" {
@@ -1006,6 +1053,10 @@ func (s *Stack) remoteArgs() []string {
 		args = append(args, fmt.Sprintf("--remote-pre-run-command=%s", command))
 	}
 
+	if skipInstallDependencies {
+		args = append(args, "--remote-skip-install-dependencies")
+	}
+
 	return args
 }
 
@@ -1017,6 +1068,8 @@ const (
 )
 
 type languageRuntimeServer struct {
+	pulumirpc.UnimplementedLanguageRuntimeServer
+
 	m sync.Mutex
 	c *sync.Cond
 
@@ -1095,7 +1148,8 @@ func (s *languageRuntimeServer) Close() error {
 }
 
 func (s *languageRuntimeServer) GetRequiredPlugins(ctx context.Context,
-	req *pulumirpc.GetRequiredPluginsRequest) (*pulumirpc.GetRequiredPluginsResponse, error) {
+	req *pulumirpc.GetRequiredPluginsRequest,
+) (*pulumirpc.GetRequiredPluginsResponse, error) {
 	return &pulumirpc.GetRequiredPluginsResponse{}, nil
 }
 
@@ -1103,7 +1157,7 @@ func (s *languageRuntimeServer) Run(ctx context.Context, req *pulumirpc.RunReque
 	s.m.Lock()
 	if s.state == stateCanceled {
 		s.m.Unlock()
-		return nil, errors.Errorf("program canceled")
+		return nil, errors.New("program canceled")
 	}
 	s.state = stateRunning
 	s.m.Unlock()
@@ -1135,12 +1189,13 @@ func (s *languageRuntimeServer) Run(ctx context.Context, req *pulumirpc.RunReque
 	if err != nil {
 		return nil, err
 	}
+	defer pulumiCtx.Close()
 
 	err = func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				if pErr, ok := r.(error); ok {
-					err = errors.Wrap(pErr, "go inline source runtime error, an unhandled error occurred")
+					err = fmt.Errorf("go inline source runtime error, an unhandled error occurred: %w", pErr)
 				} else {
 					err = errors.New("go inline source runtime error, an unhandled error occurred: unknown error")
 				}
@@ -1163,22 +1218,9 @@ func (s *languageRuntimeServer) GetPluginInfo(ctx context.Context, req *pbempty.
 
 func (s *languageRuntimeServer) InstallDependencies(
 	req *pulumirpc.InstallDependenciesRequest,
-	server pulumirpc.LanguageRuntime_InstallDependenciesServer) error {
+	server pulumirpc.LanguageRuntime_InstallDependenciesServer,
+) error {
 	return nil
-}
-
-func (s *languageRuntimeServer) About(_ context.Context, _ *pbempty.Empty) (*pulumirpc.AboutResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method About not implemented")
-}
-
-func (s *languageRuntimeServer) GetProgramDependencies(
-	_ context.Context, _ *pulumirpc.GetProgramDependenciesRequest) (*pulumirpc.GetProgramDependenciesResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetProgramDependencies not implemented")
-}
-
-func (s *languageRuntimeServer) RunPlugin(
-	_ *pulumirpc.RunPluginRequest, _ pulumirpc.LanguageRuntime_RunPluginServer) error {
-	return status.Errorf(codes.Unimplemented, "method RunPlugin not implemented")
 }
 
 type fileWatcher struct {
@@ -1231,15 +1273,15 @@ func watchFile(path string, receivers []chan<- events.EngineEvent) (*fileWatcher
 }
 
 func tailLogs(command string, receivers []chan<- events.EngineEvent) (*fileWatcher, error) {
-	logDir, err := ioutil.TempDir("", fmt.Sprintf("automation-logs-%s-", command))
+	logDir, err := os.MkdirTemp("", fmt.Sprintf("automation-logs-%s-", command))
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create logdir")
+		return nil, fmt.Errorf("failed to create logdir: %w", err)
 	}
 	logFile := filepath.Join(logDir, "eventlog.txt")
 
 	t, err := watchFile(logFile, receivers)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to watch file")
+		return nil, fmt.Errorf("failed to watch file: %w", err)
 	}
 
 	return t, nil
@@ -1252,7 +1294,7 @@ func (fw *fileWatcher) Close() {
 
 	// Tell the watcher to end on next EoF, wait for the done event, then cleanup.
 
-	// nolint: errcheck
+	//nolint:errcheck
 	fw.tail.StopAtEOF()
 	<-fw.done
 	logDir := filepath.Dir(fw.tail.Filename)

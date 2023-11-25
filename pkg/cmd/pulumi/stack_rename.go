@@ -30,7 +30,7 @@ import (
 
 func newStackRenameCmd() *cobra.Command {
 	var stack string
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "rename <new-stack-name>",
 		Args:  cmdutil.ExactArgs(1),
 		Short: "Rename an existing stack",
@@ -51,7 +51,7 @@ func newStackRenameCmd() *cobra.Command {
 			}
 
 			// Look up the stack to be moved, and find the path to the project file's location.
-			s, err := requireStack(ctx, stack, false, opts, false /*setCurrent*/)
+			s, err := requireStack(ctx, stack, stackLoadOnly, opts)
 			if err != nil {
 				return err
 			}

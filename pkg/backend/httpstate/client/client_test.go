@@ -14,11 +14,13 @@
 package client
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
@@ -50,14 +52,17 @@ func newMockServerRequestProcessor(statusCode int, processor func(req *http.Requ
 }
 
 func newMockClient(server *httptest.Server) *Client {
+	httpClient := http.DefaultClient
+
 	return &Client{
-		apiURL:   server.URL,
-		apiToken: "",
-		apiUser:  "",
-		diag:     nil,
-		client: &defaultRESTClient{
+		apiURL:     server.URL,
+		apiToken:   "",
+		apiUser:    "",
+		diag:       nil,
+		httpClient: httpClient,
+		restClient: &defaultRESTClient{
 			client: &defaultHTTPClient{
-				client: http.DefaultClient,
+				client: httpClient,
 			},
 		},
 	}
@@ -121,44 +126,44 @@ func TestGzip(t *testing.T) {
 	_, err := client.ImportStackDeployment(context.Background(), StackIdentifier{}, nil)
 	assert.NoError(t, err)
 
+	tok := updateTokenStaticSource("")
+
 	// PATCH /checkpoint
-	err = client.PatchUpdateCheckpoint(context.Background(), UpdateIdentifier{}, nil, "")
+	err = client.PatchUpdateCheckpoint(context.Background(), UpdateIdentifier{}, nil, tok)
 	assert.NoError(t, err)
 
 	// POST /events/batch
-	err = client.RecordEngineEvents(context.Background(), UpdateIdentifier{}, apitype.EngineEventBatch{}, "")
+	err = client.RecordEngineEvents(context.Background(), UpdateIdentifier{}, apitype.EngineEventBatch{}, tok)
 	assert.NoError(t, err)
 
 	// POST /events/batch
 	_, err = client.BulkDecryptValue(context.Background(), StackIdentifier{}, nil)
 	assert.NoError(t, err)
-
 }
 
-func TestPatchUpdateCheckpointVerbatimPreservesIndent(t *testing.T) {
+func TestPatchUpdateCheckpointVerbatimIndents(t *testing.T) {
 	t.Parallel()
 
 	deployment := apitype.DeploymentV3{
-		Resources: []apitype.ResourceV3{{URN: resource.URN("urn1")}},
+		Resources: []apitype.ResourceV3{
+			{URN: resource.URN("urn1")},
+			{URN: resource.URN("urn2")},
+		},
 	}
 
-	var indented json.RawMessage
-	{
-		indented1, err := json.MarshalIndent(deployment, "", "")
-		require.NoError(t, err)
-		untyped := apitype.UntypedDeployment{
-			Version:    3,
-			Deployment: indented1,
-		}
-		indented2, err := json.MarshalIndent(untyped, "", "")
-		require.NoError(t, err)
-		indented = indented2
-	}
+	var serializedDeployment json.RawMessage
+	serializedDeployment, err := json.Marshal(deployment)
+	assert.NoError(t, err)
+
+	untypedDeployment, err := json.Marshal(apitype.UntypedDeployment{
+		Version:    3,
+		Deployment: serializedDeployment,
+	})
+	assert.NoError(t, err)
 
 	var request apitype.PatchUpdateVerbatimCheckpointRequest
 
 	server := newMockServerRequestProcessor(200, func(req *http.Request) string {
-
 		reader, err := gzip.NewReader(req.Body)
 		assert.NoError(t, err)
 		defer reader.Close()
@@ -173,9 +178,68 @@ func TestPatchUpdateCheckpointVerbatimPreservesIndent(t *testing.T) {
 
 	sequenceNumber := 1
 
-	err := client.PatchUpdateCheckpointVerbatim(context.Background(),
-		UpdateIdentifier{}, sequenceNumber, indented, "token")
+	indented, err := marshalDeployment(&deployment)
+	require.NoError(t, err)
+
+	newlines := bytes.Count(indented, []byte{'\n'})
+
+	err = client.PatchUpdateCheckpointVerbatim(context.Background(),
+		UpdateIdentifier{}, sequenceNumber, indented, updateTokenStaticSource("token"))
 	assert.NoError(t, err)
 
-	assert.Equal(t, string(indented), string(request.UntypedDeployment))
+	compacted := func(raw json.RawMessage) string {
+		var buf bytes.Buffer
+		err := json.Compact(&buf, []byte(raw))
+		assert.NoError(t, err)
+		return buf.String()
+	}
+
+	// It should have more than one line as json.Marshal would produce.
+	assert.Equal(t, newlines+1, len(strings.Split(string(request.UntypedDeployment), "\n")))
+
+	// Compacting should recover the same form as json.Marshal would produce.
+	assert.Equal(t, string(untypedDeployment), compacted(request.UntypedDeployment))
+}
+
+func TestGetCapabilities(t *testing.T) {
+	t.Parallel()
+	t.Run("legacy-service-404", func(t *testing.T) {
+		t.Parallel()
+		s := newMockServer(404, "NOT FOUND")
+		defer s.Close()
+
+		c := newMockClient(s)
+		resp, err := c.GetCapabilities(context.Background())
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.Empty(t, resp.Capabilities)
+	})
+	t.Run("updated-service-with-delta-checkpoint-capability", func(t *testing.T) {
+		t.Parallel()
+		cfg := apitype.DeltaCheckpointUploadsConfigV1{
+			CheckpointCutoffSizeBytes: 1024 * 1024 * 4,
+		}
+		cfgJSON, err := json.Marshal(cfg)
+		require.NoError(t, err)
+		actualResp := apitype.CapabilitiesResponse{
+			Capabilities: []apitype.APICapabilityConfig{{
+				Version:       3,
+				Capability:    apitype.DeltaCheckpointUploads,
+				Configuration: json.RawMessage(cfgJSON),
+			}},
+		}
+		respJSON, err := json.Marshal(actualResp)
+		require.NoError(t, err)
+		s := newMockServer(200, string(respJSON))
+		defer s.Close()
+
+		c := newMockClient(s)
+		resp, err := c.GetCapabilities(context.Background())
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		assert.Len(t, resp.Capabilities, 1)
+		assert.Equal(t, apitype.DeltaCheckpointUploads, resp.Capabilities[0].Capability)
+		assert.Equal(t, `{"checkpointCutoffSizeBytes":4194304}`,
+			string(resp.Capabilities[0].Configuration))
+	})
 }

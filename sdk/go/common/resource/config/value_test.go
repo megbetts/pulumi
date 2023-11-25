@@ -99,13 +99,6 @@ func TestHasSecureValue(t *testing.T) {
 			Expected: false,
 		},
 		{
-			Value: map[string]interface{}{
-				"foo": "bar",
-				"hi":  map[string]interface{}{"secure": 1},
-			},
-			Expected: false,
-		},
-		{
 			Value:    []interface{}{"a", "b", map[string]interface{}{"secure": "securevalue"}},
 			Expected: true,
 		},
@@ -144,11 +137,11 @@ func TestHasSecureValue(t *testing.T) {
 			jsonBytes, err := json.Marshal(test.Value)
 			assert.NoError(t, err)
 
-			var val interface{}
+			var val object
 			err = json.Unmarshal(jsonBytes, &val)
 			assert.NoError(t, err)
 
-			assert.Equal(t, test.Expected, hasSecureValue(val))
+			assert.Equal(t, test.Expected, val.Secure())
 		})
 	}
 }
@@ -217,12 +210,14 @@ func TestDecryptingValue(t *testing.T) {
 type passThroughDecrypter struct{}
 
 func (d passThroughDecrypter) DecryptValue(
-	ctx context.Context, ciphertext string) (string, error) {
+	ctx context.Context, ciphertext string,
+) (string, error) {
 	return ciphertext, nil
 }
 
 func (d passThroughDecrypter) BulkDecrypt(
-	ctx context.Context, ciphertexts []string) (map[string]string, error) {
+	ctx context.Context, ciphertexts []string,
+) (map[string]string, error) {
 	return DefaultBulkDecrypt(ctx, d, ciphertexts)
 }
 
@@ -330,7 +325,8 @@ func roundtripValueJSON(v Value) (Value, error) {
 }
 
 func roundtripValue(v Value, marshal func(v interface{}) ([]byte, error),
-	unmarshal func([]byte, interface{}) error) (Value, error) {
+	unmarshal func([]byte, interface{}) error,
+) (Value, error) {
 	b, err := marshal(v)
 	if err != nil {
 		return Value{}, err

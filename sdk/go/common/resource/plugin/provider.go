@@ -16,7 +16,6 @@ package plugin
 
 import (
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
@@ -49,7 +48,7 @@ type Provider interface {
 	CheckConfig(urn resource.URN, olds, news resource.PropertyMap,
 		allowUnknowns bool) (resource.PropertyMap, []CheckFailure, error)
 	// DiffConfig checks what impacts a hypothetical change to this provider's configuration will have on the provider.
-	DiffConfig(urn resource.URN, olds, news resource.PropertyMap, allowUnknowns bool,
+	DiffConfig(urn resource.URN, oldInputs, oldOutputs, newInputs resource.PropertyMap, allowUnknowns bool,
 		ignoreChanges []string) (DiffResult, error)
 	// Configure configures the resource provider with "globals" that control its behavior.
 	Configure(inputs resource.PropertyMap) error
@@ -59,7 +58,7 @@ type Provider interface {
 	Check(urn resource.URN, olds, news resource.PropertyMap,
 		allowUnknowns bool, randomSeed []byte) (resource.PropertyMap, []CheckFailure, error)
 	// Diff checks what impacts a hypothetical update will have on the resource's properties.
-	Diff(urn resource.URN, id resource.ID, olds resource.PropertyMap, news resource.PropertyMap,
+	Diff(urn resource.URN, id resource.ID, oldInputs, oldOutputs, newInputs resource.PropertyMap,
 		allowUnknowns bool, ignoreChanges []string) (DiffResult, error)
 	// Create allocates a new instance of the provided resource and returns its unique resource.ID.
 	Create(urn resource.URN, news resource.PropertyMap, timeout float64, preview bool) (resource.ID,
@@ -71,13 +70,14 @@ type Provider interface {
 		inputs, state resource.PropertyMap) (ReadResult, resource.Status, error)
 	// Update updates an existing resource with new values.
 	Update(urn resource.URN, id resource.ID,
-		olds resource.PropertyMap, news resource.PropertyMap, timeout float64,
+		oldInputs, oldOutputs, newInputs resource.PropertyMap, timeout float64,
 		ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error)
-	// Delete tears down an existing resource.
-	Delete(urn resource.URN, id resource.ID, props resource.PropertyMap, timeout float64) (resource.Status, error)
+	// Delete tears down an existing resource. The inputs and outputs are the last recorded ones from state.
+	Delete(urn resource.URN, id resource.ID,
+		inputs, outputs resource.PropertyMap, timeout float64) (resource.Status, error)
 
 	// Construct creates a new component resource.
-	Construct(info ConstructInfo, typ tokens.Type, name tokens.QName, parent resource.URN, inputs resource.PropertyMap,
+	Construct(info ConstructInfo, typ tokens.Type, name string, parent resource.URN, inputs resource.PropertyMap,
 		options ConstructOptions) (ConstructResult, error)
 
 	// Invoke dynamically executes a built-in function in the provider.
@@ -101,6 +101,15 @@ type Provider interface {
 	// non-blocking; it is up to the host to decide how long to wait after SignalCancellation is
 	// called before (e.g.) hard-closing any gRPC connection.
 	SignalCancellation() error
+
+	// GetMapping returns the mapping (if any) for the provider. A provider should return an empty response
+	// (not an error) if it doesn't have a mapping for the given key.
+	GetMapping(key string, provider string) ([]byte, string, error)
+
+	// GetMappings returns the mappings (if any) for the providers. A provider should return an empty list (not an
+	// error) if it doesn't have any mappings for the given key.
+	// If a provider implements this method GetMapping will be called using the results from this method.
+	GetMappings(key string) ([]string, error)
 }
 
 type GrpcProvider interface {
@@ -228,67 +237,70 @@ type DiffResult struct {
 }
 
 // NewDetailedDiffFromObjectDiff computes the detailed diff of Updated, Added and Deleted keys.
-func NewDetailedDiffFromObjectDiff(diff *resource.ObjectDiff) map[string]PropertyDiff {
+func NewDetailedDiffFromObjectDiff(diff *resource.ObjectDiff, inputDiff bool) map[string]PropertyDiff {
 	if diff == nil {
 		return map[string]PropertyDiff{}
 	}
 	out := map[string]PropertyDiff{}
-	objectDiffToDetailedDiff("", diff, out)
+	objectDiffToDetailedDiff(nil, diff, inputDiff, out)
 	return out
 }
 
-func objectDiffToDetailedDiff(prefix string, diff *resource.ObjectDiff, acc map[string]PropertyDiff) {
-
-	getPrefix := func(k resource.PropertyKey) string {
-		if prefix == "" {
-			return string(k)
-		}
-		return fmt.Sprintf("%s.%s", prefix, string(k))
+func objectDiffToDetailedDiff(
+	prefix resource.PropertyPath, diff *resource.ObjectDiff, inputDiff bool, acc map[string]PropertyDiff,
+) {
+	getPrefix := func(k resource.PropertyKey) resource.PropertyPath {
+		return append(prefix, string(k))
 	}
 
 	for k, vd := range diff.Updates {
 		nestedPrefix := getPrefix(k)
-		valueDiffToDetailedDiff(nestedPrefix, vd, acc)
+		valueDiffToDetailedDiff(nestedPrefix, vd, inputDiff, acc)
 	}
 
 	for k := range diff.Adds {
 		nestedPrefix := getPrefix(k)
-		acc[nestedPrefix] = PropertyDiff{Kind: DiffAdd}
+		acc[nestedPrefix.String()] = PropertyDiff{Kind: DiffAdd, InputDiff: inputDiff}
 	}
 
 	for k := range diff.Deletes {
 		nestedPrefix := getPrefix(k)
-		acc[nestedPrefix] = PropertyDiff{Kind: DiffDelete}
+		acc[nestedPrefix.String()] = PropertyDiff{Kind: DiffDelete, InputDiff: inputDiff}
 	}
 }
 
-func arrayDiffToDetailedDiff(prefix string, d *resource.ArrayDiff, acc map[string]PropertyDiff) {
-	nestedPrefix := func(i int) string { return fmt.Sprintf("%s[%d]", prefix, i) }
+func arrayDiffToDetailedDiff(
+	prefix resource.PropertyPath, d *resource.ArrayDiff, inputDiff bool, acc map[string]PropertyDiff,
+) {
+	nestedPrefix := func(i int) resource.PropertyPath {
+		return append(prefix, i)
+	}
 	for i, vd := range d.Updates {
-		valueDiffToDetailedDiff(nestedPrefix(i), vd, acc)
+		valueDiffToDetailedDiff(nestedPrefix(i), vd, inputDiff, acc)
 	}
 	for i := range d.Adds {
-		acc[nestedPrefix(i)] = PropertyDiff{Kind: DiffAdd}
+		acc[nestedPrefix(i).String()] = PropertyDiff{Kind: DiffAdd, InputDiff: inputDiff}
 	}
 	for i := range d.Deletes {
-		acc[nestedPrefix(i)] = PropertyDiff{Kind: DiffDelete}
+		acc[nestedPrefix(i).String()] = PropertyDiff{Kind: DiffDelete, InputDiff: inputDiff}
 	}
-
 }
 
-func valueDiffToDetailedDiff(prefix string, vd resource.ValueDiff, acc map[string]PropertyDiff) {
+func valueDiffToDetailedDiff(
+	prefix resource.PropertyPath, vd resource.ValueDiff, inputDiff bool, acc map[string]PropertyDiff,
+) {
 	if vd.Object != nil {
-		objectDiffToDetailedDiff(prefix, vd.Object, acc)
+		objectDiffToDetailedDiff(prefix, vd.Object, inputDiff, acc)
 	} else if vd.Array != nil {
-		arrayDiffToDetailedDiff(prefix, vd.Array, acc)
+		arrayDiffToDetailedDiff(prefix, vd.Array, inputDiff, acc)
 	} else {
 		switch {
 		case vd.Old.V == nil && vd.New.V != nil:
-			acc[prefix] = PropertyDiff{Kind: DiffAdd}
+			acc[prefix.String()] = PropertyDiff{Kind: DiffAdd, InputDiff: inputDiff}
 		case vd.Old.V != nil && vd.New.V == nil:
-			acc[prefix] = PropertyDiff{Kind: DiffDelete}
+			acc[prefix.String()] = PropertyDiff{Kind: DiffDelete, InputDiff: inputDiff}
 		default:
-			acc[prefix] = PropertyDiff{Kind: DiffUpdate}
+			acc[prefix.String()] = PropertyDiff{Kind: DiffUpdate, InputDiff: inputDiff}
 		}
 	}
 }
@@ -346,14 +358,53 @@ type ConstructInfo struct {
 type ConstructOptions struct {
 	// Aliases is the set of aliases for the component.
 	Aliases []resource.Alias
+
 	// Dependencies is the list of resources this component depends on.
 	Dependencies []resource.URN
+
 	// Protect is true if the component is protected.
 	Protect bool
+
 	// Providers is a map from package name to provider reference.
 	Providers map[string]string
+
 	// PropertyDependencies is a map from property name to a list of resources that property depends on.
 	PropertyDependencies map[resource.PropertyKey][]resource.URN
+
+	// AdditionalSecretOutputs lists extra output properties
+	// that should be treated as secrets.
+	AdditionalSecretOutputs []string
+
+	// CustomTimeouts overrides default timeouts for resource operations.
+	CustomTimeouts *CustomTimeouts
+
+	// DeletedWith specifies that if the given resource is deleted,
+	// it will also delete this resource.
+	DeletedWith resource.URN
+
+	// DeleteBeforeReplace specifies that replacements of this resource
+	// should delete the old resource before creating the new resource.
+	DeleteBeforeReplace bool
+
+	// IgnoreChanges lists properties that should be ignored
+	// when determining whether the resource should has changed.
+	IgnoreChanges []string
+
+	// ReplaceOnChanges lists properties changing which should cause
+	// the resource to be replaced.
+	ReplaceOnChanges []string
+
+	// RetainOnDelete is true if deletion of the resource should not
+	// delete the resource in the provider.
+	RetainOnDelete bool
+}
+
+// CustomTimeouts overrides default timeouts for resource operations.
+// Timeout values are strings in the format accepted by time.ParseDuration.
+type CustomTimeouts struct {
+	Create string
+	Update string
+	Delete string
 }
 
 // ConstructResult is the result of a call to Construct.

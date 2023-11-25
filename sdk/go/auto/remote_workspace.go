@@ -16,10 +16,9 @@ package auto
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // PREVIEW: NewRemoteStackGitSource creates a Stack backed by a RemoteWorkspace with source code from the specified
@@ -30,7 +29,7 @@ func NewRemoteStackGitSource(
 	opts ...RemoteWorkspaceOption,
 ) (RemoteStack, error) {
 	if !isFullyQualifiedStackName(stackName) {
-		return RemoteStack{}, fmt.Errorf("%q stack name must be fully qualified", stackName)
+		return RemoteStack{}, fmt.Errorf("stack name %q must be fully qualified", stackName)
 	}
 
 	localOpts, err := remoteToLocalOptions(repo, opts...)
@@ -39,7 +38,7 @@ func NewRemoteStackGitSource(
 	}
 	w, err := NewLocalWorkspace(ctx, localOpts...)
 	if err != nil {
-		return RemoteStack{}, errors.Wrap(err, "failed to create stack")
+		return RemoteStack{}, fmt.Errorf("failed to create stack: %w", err)
 	}
 
 	s, err := NewStack(ctx, stackName, w)
@@ -58,7 +57,7 @@ func UpsertRemoteStackGitSource(
 	opts ...RemoteWorkspaceOption,
 ) (RemoteStack, error) {
 	if !isFullyQualifiedStackName(stackName) {
-		return RemoteStack{}, fmt.Errorf("%q stack name must be fully qualified", stackName)
+		return RemoteStack{}, fmt.Errorf("stack name %q must be fully qualified", stackName)
 	}
 
 	localOpts, err := remoteToLocalOptions(repo, opts...)
@@ -67,7 +66,7 @@ func UpsertRemoteStackGitSource(
 	}
 	w, err := NewLocalWorkspace(ctx, localOpts...)
 	if err != nil {
-		return RemoteStack{}, errors.Wrap(err, "failed to create stack")
+		return RemoteStack{}, fmt.Errorf("failed to create stack: %w", err)
 	}
 
 	s, err := UpsertStack(ctx, stackName, w)
@@ -85,7 +84,7 @@ func SelectRemoteStackGitSource(
 	opts ...RemoteWorkspaceOption,
 ) (RemoteStack, error) {
 	if !isFullyQualifiedStackName(stackName) {
-		return RemoteStack{}, fmt.Errorf("%q stack name must be fully qualified", stackName)
+		return RemoteStack{}, fmt.Errorf("stack name %q must be fully qualified", stackName)
 	}
 
 	localOpts, err := remoteToLocalOptions(repo, opts...)
@@ -94,7 +93,7 @@ func SelectRemoteStackGitSource(
 	}
 	w, err := NewLocalWorkspace(ctx, localOpts...)
 	if err != nil {
-		return RemoteStack{}, errors.Wrap(err, "failed to select stack")
+		return RemoteStack{}, fmt.Errorf("failed to select stack: %w", err)
 	}
 
 	s, err := SelectStack(ctx, stackName, w)
@@ -111,11 +110,11 @@ func remoteToLocalOptions(repo GitRepo, opts ...RemoteWorkspaceOption) ([]LocalW
 	if repo.URL == "" {
 		return nil, errors.New("repo.URL is required")
 	}
-	if repo.CommitHash != "" && repo.Branch != "" {
-		return nil, errors.New("repo.CommitHash and repo.Branch cannot both be specified")
+	if repo.Branch != "" && repo.CommitHash != "" {
+		return nil, errors.New("repo.Branch and repo.CommitHash cannot both be specified")
 	}
-	if repo.CommitHash == "" && repo.Branch == "" {
-		return nil, errors.New("at least repo.CommitHash or repo.Branch are required")
+	if repo.Branch == "" && repo.CommitHash == "" {
+		return nil, errors.New("either repo.Branch or repo.CommitHash is required")
 	}
 	if repo.Auth != nil {
 		if repo.Auth.SSHPrivateKey != "" && repo.Auth.SSHPrivateKeyPath != "" {
@@ -147,6 +146,7 @@ func remoteToLocalOptions(repo GitRepo, opts ...RemoteWorkspaceOption) ([]LocalW
 		remote(true),
 		remoteEnvVars(remoteOpts.EnvVars),
 		preRunCommands(remoteOpts.PreRunCommands...),
+		remoteSkipInstallDependencies(remoteOpts.SkipInstallDependencies),
 		Repo(repo),
 	}
 	return localOpts, nil
@@ -158,6 +158,8 @@ type remoteWorkspaceOptions struct {
 	EnvVars map[string]EnvVarValue
 	// PreRunCommands is an optional list of arbitrary commands to run before the remote Pulumi operation is invoked.
 	PreRunCommands []string
+	// SkipInstallDependencies sets whether to skip the default dependency installation step. Defaults to false.
+	SkipInstallDependencies bool
 }
 
 // LocalWorkspaceOption is used to customize and configure a LocalWorkspace at initialization time.
@@ -184,6 +186,13 @@ func RemoteEnvVars(envvars map[string]EnvVarValue) RemoteWorkspaceOption {
 func RemotePreRunCommands(commands ...string) RemoteWorkspaceOption {
 	return remoteWorkspaceOption(func(opts *remoteWorkspaceOptions) {
 		opts.PreRunCommands = commands
+	})
+}
+
+// RemoteSkipInstallDependencies sets whether to skip the default dependency installation step. Defaults to false.
+func RemoteSkipInstallDependencies(skipInstallDependencies bool) RemoteWorkspaceOption {
+	return remoteWorkspaceOption(func(opts *remoteWorkspaceOptions) {
+		opts.SkipInstallDependencies = skipInstallDependencies
 	})
 }
 

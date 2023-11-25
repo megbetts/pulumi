@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
@@ -45,7 +46,7 @@ func newReplayEventsCmd() *cobra.Command {
 	var delay time.Duration
 	var period time.Duration
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "replay-events [kind] [events-file]",
 		Short: "Replay events from a prior update, refresh, or destroy",
 		Long: "Replay events from a prior update, refresh, or destroy.\n" +
@@ -76,7 +77,7 @@ func newReplayEventsCmd() *cobra.Command {
 				return fmt.Errorf("unrecognized update kind '%v'", args[0])
 			}
 
-			var displayType = display.DisplayProgress
+			displayType := display.DisplayProgress
 			if diffDisplay {
 				displayType = display.DisplayDiff
 			}
@@ -106,7 +107,7 @@ func newReplayEventsCmd() *cobra.Command {
 			}
 
 			go display.ShowEvents(
-				"replay", action, "replay", "replay",
+				"replay", action, tokens.MustParseStackName("replay"), "replay", "",
 				eventChannel, doneChannel, displayOpts, preview)
 
 			for _, e := range events {
@@ -186,7 +187,7 @@ func loadEvents(path string) ([]engine.Event, error) {
 	// If there are no events or if the event stream does not terminate with a cancel event,
 	// synthesize one here.
 	if len(events) == 0 || events[len(events)-1].Type != engine.CancelEvent {
-		events = append(events, engine.NewEvent(engine.CancelEvent, nil))
+		events = append(events, engine.NewCancelEvent())
 	}
 
 	return events, nil

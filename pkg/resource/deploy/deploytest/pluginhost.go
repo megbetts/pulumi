@@ -26,10 +26,12 @@ import (
 	pbempty "github.com/golang/protobuf/ptypes/empty"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil"
@@ -37,16 +39,24 @@ import (
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 )
 
+var ErrHostIsClosed = errors.New("plugin host is shutting down")
+
 var UseGrpcPluginsByDefault = false
 
-type LoadPluginFunc func(opts interface{}) (interface{}, error)
-type LoadPluginWithHostFunc func(opts interface{}, host plugin.Host) (interface{}, error)
+type (
+	LoadPluginFunc         func(opts interface{}) (interface{}, error)
+	LoadPluginWithHostFunc func(opts interface{}, host plugin.Host) (interface{}, error)
+)
 
-type LoadProviderFunc func() (plugin.Provider, error)
-type LoadProviderWithHostFunc func(host plugin.Host) (plugin.Provider, error)
+type (
+	LoadProviderFunc         func() (plugin.Provider, error)
+	LoadProviderWithHostFunc func(host plugin.Host) (plugin.Provider, error)
+)
 
-type LoadAnalyzerFunc func(opts *plugin.PolicyAnalyzerOptions) (plugin.Analyzer, error)
-type LoadAnalyzerWithHostFunc func(opts *plugin.PolicyAnalyzerOptions, host plugin.Host) (plugin.Analyzer, error)
+type (
+	LoadAnalyzerFunc         func(opts *plugin.PolicyAnalyzerOptions) (plugin.Analyzer, error)
+	LoadAnalyzerWithHostFunc func(opts *plugin.PolicyAnalyzerOptions, host plugin.Host) (plugin.Analyzer, error)
+)
 
 type PluginOption func(p *PluginLoader)
 
@@ -74,12 +84,14 @@ type PluginLoader struct {
 	useGRPC      bool
 }
 
-type ProviderOption = PluginOption
-type ProviderLoader = PluginLoader
+type (
+	ProviderOption = PluginOption
+	ProviderLoader = PluginLoader
+)
 
 func NewProviderLoader(pkg tokens.Package, version semver.Version, load LoadProviderFunc,
-	opts ...ProviderOption) *ProviderLoader {
-
+	opts ...ProviderOption,
+) *ProviderLoader {
 	p := &ProviderLoader{
 		kind:    workspace.ResourcePlugin,
 		name:    string(pkg),
@@ -94,8 +106,8 @@ func NewProviderLoader(pkg tokens.Package, version semver.Version, load LoadProv
 }
 
 func NewProviderLoaderWithHost(pkg tokens.Package, version semver.Version,
-	load LoadProviderWithHostFunc, opts ...ProviderOption) *ProviderLoader {
-
+	load LoadProviderWithHostFunc, opts ...ProviderOption,
+) *ProviderLoader {
 	p := &ProviderLoader{
 		kind:         workspace.ResourcePlugin,
 		name:         string(pkg),
@@ -169,7 +181,7 @@ func wrapProviderWithGrpc(provider plugin.Provider) (plugin.Provider, io.Closer,
 	}
 	conn, err := grpc.Dial(
 		fmt.Sprintf("127.0.0.1:%v", handle.Port),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithUnaryInterceptor(rpcutil.OpenTracingClientInterceptor()),
 		grpc.WithStreamInterceptor(rpcutil.OpenTracingStreamClientInterceptor()),
 		rpcutil.GrpcChannelOptions(),
@@ -183,6 +195,8 @@ func wrapProviderWithGrpc(provider plugin.Provider) (plugin.Provider, io.Closer,
 }
 
 type hostEngine struct {
+	pulumirpc.UnsafeEngineServer // opt out of forward compat
+
 	sink       diag.Sink
 	statusSink diag.Sink
 
@@ -212,14 +226,20 @@ func (e *hostEngine) Log(_ context.Context, req *pulumirpc.LogRequest) (*pbempty
 	}
 	return &pbempty.Empty{}, nil
 }
+
 func (e *hostEngine) GetRootResource(_ context.Context,
-	req *pulumirpc.GetRootResourceRequest) (*pulumirpc.GetRootResourceResponse, error) {
+	req *pulumirpc.GetRootResourceRequest,
+) (*pulumirpc.GetRootResourceResponse, error) {
 	return nil, errors.New("unsupported")
 }
+
 func (e *hostEngine) SetRootResource(_ context.Context,
-	req *pulumirpc.SetRootResourceRequest) (*pulumirpc.SetRootResourceResponse, error) {
+	req *pulumirpc.SetRootResourceRequest,
+) (*pulumirpc.SetRootResourceResponse, error) {
 	return nil, errors.New("unsupported")
 }
+
+type PluginHostFactory func() plugin.Host
 
 type pluginHost struct {
 	pluginLoaders   []*ProviderLoader
@@ -236,9 +256,22 @@ type pluginHost struct {
 	m         sync.Mutex
 }
 
-func NewPluginHost(sink, statusSink diag.Sink, languageRuntime plugin.LanguageRuntime,
-	pluginLoaders ...*ProviderLoader) plugin.Host {
+// NewPluginHostF returns a factory that produces a plugin host for an operation.
+func NewPluginHostF(sink, statusSink diag.Sink, languageRuntimeF LanguageRuntimeFactory,
+	pluginLoaders ...*ProviderLoader,
+) PluginHostFactory {
+	return func() plugin.Host {
+		var lr plugin.LanguageRuntime
+		if languageRuntimeF != nil {
+			lr = languageRuntimeF()
+		}
+		return NewPluginHost(sink, statusSink, lr, pluginLoaders...)
+	}
+}
 
+func NewPluginHost(sink, statusSink diag.Sink, languageRuntime plugin.LanguageRuntime,
+	pluginLoaders ...*ProviderLoader,
+) plugin.Host {
 	engine := &hostEngine{
 		sink:       sink,
 		statusSink: statusSink,
@@ -274,8 +307,8 @@ func (host *pluginHost) isClosed() bool {
 }
 
 func (host *pluginHost) plugin(kind workspace.PluginKind, name string, version *semver.Version,
-	opts interface{}) (interface{}, error) {
-
+	opts interface{},
+) (interface{}, error) {
 	var best *PluginLoader
 	for _, l := range host.pluginLoaders {
 		if l.kind != kind || l.name != name {
@@ -330,6 +363,9 @@ func (host *pluginHost) plugin(kind workspace.PluginKind, name string, version *
 }
 
 func (host *pluginHost) Provider(pkg tokens.Package, version *semver.Version) (plugin.Provider, error) {
+	if host.isClosed() {
+		return nil, ErrHostIsClosed
+	}
 	plug, err := host.plugin(workspace.ResourcePlugin, string(pkg), version, nil)
 	if err != nil {
 		return nil, err
@@ -345,11 +381,18 @@ func (host *pluginHost) Provider(pkg tokens.Package, version *semver.Version) (p
 }
 
 func (host *pluginHost) LanguageRuntime(
-	root, pwd, runtime string, options map[string]interface{}) (plugin.LanguageRuntime, error) {
+	root, pwd, runtime string, options map[string]interface{},
+) (plugin.LanguageRuntime, error) {
+	if host.isClosed() {
+		return nil, ErrHostIsClosed
+	}
 	return host.languageRuntime, nil
 }
 
 func (host *pluginHost) SignalCancellation() error {
+	if host.isClosed() {
+		return ErrHostIsClosed
+	}
 	host.m.Lock()
 	defer host.m.Unlock()
 
@@ -361,7 +404,11 @@ func (host *pluginHost) SignalCancellation() error {
 	}
 	return err
 }
+
 func (host *pluginHost) Close() error {
+	if host.isClosed() {
+		return nil // Close is idempotent
+	}
 	host.m.Lock()
 	defer host.m.Unlock()
 
@@ -376,46 +423,58 @@ func (host *pluginHost) Close() error {
 	host.closed = true
 	return err
 }
+
 func (host *pluginHost) ServerAddr() string {
 	return host.engine.address
 }
+
 func (host *pluginHost) Log(sev diag.Severity, urn resource.URN, msg string, streamID int32) {
 	if !host.isClosed() {
 		host.sink.Logf(sev, diag.StreamMessage(urn, msg, streamID))
 	}
 }
+
 func (host *pluginHost) LogStatus(sev diag.Severity, urn resource.URN, msg string, streamID int32) {
 	if !host.isClosed() {
 		host.statusSink.Logf(sev, diag.StreamMessage(urn, msg, streamID))
 	}
 }
+
 func (host *pluginHost) Analyzer(nm tokens.QName) (plugin.Analyzer, error) {
 	return host.PolicyAnalyzer(nm, "", nil)
 }
+
 func (host *pluginHost) CloseProvider(provider plugin.Provider) error {
+	if host.isClosed() {
+		return ErrHostIsClosed
+	}
 	host.m.Lock()
 	defer host.m.Unlock()
 
 	delete(host.plugins, provider)
 	return nil
 }
+
 func (host *pluginHost) EnsurePlugins(plugins []workspace.PluginSpec, kinds plugin.Flags) error {
+	if host.isClosed() {
+		return ErrHostIsClosed
+	}
 	return nil
 }
-func (host *pluginHost) InstallPlugin(plugin workspace.PluginSpec) error {
-	return nil
-}
+
 func (host *pluginHost) ResolvePlugin(
-	kind workspace.PluginKind, name string, version *semver.Version) (*workspace.PluginInfo, error) {
-	plugins := make([]workspace.PluginInfo, 0, len(host.pluginLoaders))
+	kind workspace.PluginKind, name string, version *semver.Version,
+) (*workspace.PluginInfo, error) {
+	plugins := slice.Prealloc[workspace.PluginInfo](len(host.pluginLoaders))
 
 	for _, v := range host.pluginLoaders {
+		v := v
 		p := workspace.PluginInfo{
 			Kind:       v.kind,
 			Name:       v.name,
 			Path:       v.path,
 			Version:    &v.version,
-			SchemaPath: filepath.Join(v.path, name+"-"+v.version.String()+".json"),
+			SchemaPath: filepath.Join(v.path, v.name+"-"+v.version.String()+".json"),
 			// SchemaTime not set as caching is indefinite.
 		}
 		plugins = append(plugins, p)
@@ -440,7 +499,8 @@ func (host *pluginHost) ResolvePlugin(
 }
 
 func (host *pluginHost) GetRequiredPlugins(info plugin.ProgInfo,
-	kinds plugin.Flags) ([]workspace.PluginSpec, error) {
+	kinds plugin.Flags,
+) ([]workspace.PluginSpec, error) {
 	return host.languageRuntime.GetRequiredPlugins(info)
 }
 
@@ -449,8 +509,11 @@ func (host *pluginHost) GetProjectPlugins() []workspace.ProjectPlugin {
 }
 
 func (host *pluginHost) PolicyAnalyzer(name tokens.QName, path string,
-	opts *plugin.PolicyAnalyzerOptions) (plugin.Analyzer, error) {
-
+	opts *plugin.PolicyAnalyzerOptions,
+) (plugin.Analyzer, error) {
+	if host.isClosed() {
+		return nil, ErrHostIsClosed
+	}
 	plug, err := host.plugin(workspace.AnalyzerPlugin, string(name), nil, opts)
 	if err != nil || plug == nil {
 		return nil, err

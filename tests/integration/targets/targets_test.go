@@ -1,5 +1,5 @@
 // Copyright 2016-2018, Pulumi Corporation.  All rights reserved.
-//go:build !smoke
+//go:build !xplatform_acceptance
 
 package ints
 
@@ -45,7 +45,6 @@ func TestUntargetedCreateDuringTargetedUpdate(t *testing.T) {
 	if err := fsutil.CopyFile(
 		path.Join(e.RootPath, "untargeted_create", "index.ts"),
 		path.Join("untargeted_create", "step1", "index.ts"), nil); err != nil {
-
 		t.Fatalf("error copying index.ts file: %v", err)
 	}
 
@@ -82,7 +81,7 @@ func TestDeleteManyTargets(t *testing.T) {
 
 	// Create a handy mkURN func to create URNs for dynamic resources in this project/stack.
 	resourceType := tokens.Type("pulumi-nodejs:dynamic:Resource")
-	mkURNStr := func(resourceName tokens.QName, parentType tokens.Type) string {
+	mkURNStr := func(resourceName string, parentType tokens.Type) string {
 		return string(resource.NewURN(
 			tokens.QName(stackName), tokens.PackageName(projName), parentType, resourceType, resourceName))
 	}

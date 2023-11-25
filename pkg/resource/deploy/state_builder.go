@@ -29,6 +29,11 @@ func newStateBuilder(state *resource.State) *stateBuilder {
 	return &stateBuilder{*state, state, false}
 }
 
+func (sb *stateBuilder) withUpdatedURN(update func(resource.URN) resource.URN) *stateBuilder {
+	sb.setURN(&sb.state.URN, update(sb.state.URN))
+	return sb
+}
+
 func (sb *stateBuilder) withUpdatedParent(update func(resource.URN) resource.URN) *stateBuilder {
 	if sb.state.Parent != "" {
 		sb.setURN(&sb.state.Parent, update(sb.state.Parent))
@@ -65,6 +70,15 @@ func (sb *stateBuilder) withUpdatedPropertyDependencies(update func(resource.URN
 	return sb
 }
 
+// Removes all "Aliases" from the state. Once URN normalisation is done we don't want to write aliases out.
+func (sb *stateBuilder) withUpdatedAliases() *stateBuilder {
+	if len(sb.state.Aliases) > 0 {
+		sb.state.Aliases = nil
+		sb.edited = true
+	}
+	return sb
+}
+
 func (sb *stateBuilder) build() *resource.State {
 	if !sb.edited {
 		return sb.original
@@ -93,7 +107,8 @@ func (sb *stateBuilder) setURN(loc *resource.URN, value resource.URN) {
 // internal
 func (sb *stateBuilder) updateURNSlice(
 	slice []resource.URN,
-	update func(resource.URN) resource.URN) (bool, []resource.URN) {
+	update func(resource.URN) resource.URN,
+) (bool, []resource.URN) {
 	needsUpdate := false
 	for _, urn := range slice {
 		if update(urn) != urn {
@@ -104,9 +119,9 @@ func (sb *stateBuilder) updateURNSlice(
 	if !needsUpdate {
 		return false, slice
 	}
-	copy := make([]resource.URN, len(slice))
+	updated := make([]resource.URN, len(slice))
 	for i, urn := range slice {
-		copy[i] = update(urn)
+		updated[i] = update(urn)
 	}
-	return true, copy
+	return true, updated
 }

@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (go || all) && !smoke
+//go:build (go || all) && !xplatform_acceptance
 
 package ints
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,12 +26,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/grapl-security/pulumi-hcp/sdk/go/hcp"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"sourcegraph.com/sourcegraph/appdash"
 
 	"github.com/pulumi/pulumi/pkg/v3/testing/integration"
+	"github.com/pulumi/pulumi/sdk/v3/go/auto"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	ptesting "github.com/pulumi/pulumi/sdk/v3/go/common/testing"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
 // This checks that the buildTarget option for Pulumi Go programs does build a binary.
@@ -68,6 +74,52 @@ func TestNoEmitExitStatus(t *testing.T) {
 		ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
 			// ensure exit status is not emitted by the program
 			assert.NotContains(t, stderr.String(), "exit status")
+		},
+	})
+}
+
+func TestPanickingProgram(t *testing.T) {
+	var stderr bytes.Buffer
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("go", "program-panic"),
+		Dependencies: []string{
+			"github.com/pulumi/pulumi/sdk/v3",
+		},
+		Stderr:        &stderr,
+		ExpectFailure: true,
+		Quick:         true,
+		SkipRefresh:   true,
+		ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
+			assert.Contains(t, stderr.String(), "panic: great sadness\n")
+		},
+	})
+}
+
+func TestPanickingComponentConfigure(t *testing.T) {
+	var (
+		testDir      = filepath.Join("go", "component-configure-panic")
+		componentDir = "testcomponent-go"
+	)
+	runComponentSetup(t, testDir)
+
+	var stderr bytes.Buffer
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("go", "component-configure-panic", "go"),
+		Dependencies: []string{
+			"github.com/pulumi/pulumi/sdk/v3",
+		},
+		LocalProviders: []integration.LocalDependency{
+			{
+				Package: "testcomponent",
+				Path:    filepath.Join(testDir, componentDir),
+			},
+		},
+		Stderr:        &stderr,
+		ExpectFailure: true,
+		Quick:         true,
+		SkipRefresh:   true,
+		ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
+			assert.Contains(t, stderr.String(), "panic: great sadness\n")
 		},
 	})
 }
@@ -153,11 +205,9 @@ func TestPrintfGo(t *testing.T) {
 // Tests basic configuration from the perspective of a Pulumi Go program.
 func TestConfigBasicGo(t *testing.T) {
 	integration.ProgramTest(t, &integration.ProgramTestOptions{
-		Dir: filepath.Join("config_basic", "go"),
-		Dependencies: []string{
-			"github.com/pulumi/pulumi/sdk/v3",
-		},
-		Quick: true,
+		Dir:          filepath.Join("config_basic", "go"),
+		Dependencies: []string{"github.com/pulumi/pulumi/sdk/v3"},
+		Quick:        true,
 		Config: map[string]string{
 			"aConfigValue": "this value is a value",
 		},
@@ -176,6 +226,34 @@ func TestConfigBasicGo(t *testing.T) {
 			{Key: "a.b[1].c", Value: "false", Path: true},
 			{Key: "tokens[0]", Value: "shh", Path: true, Secret: true},
 			{Key: "foo.bar", Value: "don't tell", Path: true, Secret: true},
+		},
+	})
+}
+
+// Tests configuration error from the perspective of a Pulumi Go program.
+func TestConfigMissingGo(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("config_missing", "go"),
+		Dependencies: []string{
+			"github.com/pulumi/pulumi/sdk/v3",
+		},
+		Quick:         true,
+		ExpectFailure: true,
+		ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
+			assert.NotEmpty(t, stackInfo.Events)
+			text1 := "Missing required configuration variable 'config_missing_go:notFound'"
+			text2 := "\tplease set a value using the command `pulumi config set --secret config_missing_go:notFound <value>`"
+			var found1, found2 bool
+			for _, event := range stackInfo.Events {
+				if event.DiagnosticEvent != nil && strings.Contains(event.DiagnosticEvent.Message, text1) {
+					found1 = true
+				}
+				if event.DiagnosticEvent != nil && strings.Contains(event.DiagnosticEvent.Message, text2) {
+					found2 = true
+				}
+			}
+			assert.True(t, found1, "expected error %q", text1)
+			assert.True(t, found2, "expected error %q", text2)
 		},
 	})
 }
@@ -543,11 +621,9 @@ func TestConstructPlainGo(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.componentDir, func(t *testing.T) {
-			localProviders :=
-				[]integration.LocalDependency{
-					{Package: "testprovider", Path: buildTestProvider(t, filepath.Join("..", "testprovider"))},
-					{Package: "testcomponent", Path: filepath.Join(testDir, test.componentDir)},
-				}
+			localProviders := []integration.LocalDependency{
+				{Package: "testcomponent", Path: filepath.Join(testDir, test.componentDir)},
+			}
 			integration.ProgramTest(t,
 				optsForConstructPlainGo(t, test.expectedResourceCount, localProviders, test.env...))
 		})
@@ -611,6 +687,19 @@ func TestConstructMethodsGo(t *testing.T) {
 				Quick:          true,
 				ExtraRuntimeValidation: func(t *testing.T, stackInfo integration.RuntimeValidationStackInfo) {
 					assert.Equal(t, "Hello World, Alice!", stackInfo.Outputs["message"])
+
+					// TODO[pulumi/pulumi#12471]: Only the Go SDK has been fixed such that rehydrated
+					// components are kept as dependencies. So only check this for the provider written
+					// in Go. Once the other SDKs are fixed, we can test the other providers as well.
+					if test.componentDir == "testcomponent-go" {
+						var componentURN string
+						for _, res := range stackInfo.Deployment.Resources {
+							if res.URN.Name() == "component" {
+								componentURN = string(res.URN)
+							}
+						}
+						assert.Contains(t, stackInfo.Outputs["messagedeps"], componentURN)
+					}
 				},
 			})
 		})
@@ -627,6 +716,10 @@ func TestConstructMethodsResourcesGo(t *testing.T) {
 
 func TestConstructMethodsErrorsGo(t *testing.T) {
 	testConstructMethodsErrors(t, "go", "github.com/pulumi/pulumi/sdk/v3")
+}
+
+func TestConstructMethodsProviderGo(t *testing.T) {
+	testConstructMethodsProvider(t, "go", "github.com/pulumi/pulumi/sdk/v3")
 }
 
 func TestConstructProviderGo(t *testing.T) {
@@ -670,7 +763,11 @@ func TestConstructProviderGo(t *testing.T) {
 }
 
 func TestGetResourceGo(t *testing.T) {
+	// This uses the random plugin so needs to be able to download it
+	t.Setenv("PULUMI_DISABLE_AUTOMATIC_PLUGIN_ACQUISITION", "false")
+
 	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		NoParallel: true,
 		Dependencies: []string{
 			"github.com/pulumi/pulumi/sdk/v3",
 		},
@@ -693,9 +790,10 @@ func TestGetResourceGo(t *testing.T) {
 }
 
 func TestComponentProviderSchemaGo(t *testing.T) {
-	// We no longer build the go-component in component_setup.sh so there's no native binary for the
-	// testComponentProviderSchema to just exec. It _ought_ to be rewritten to use the plugin host framework
-	// so that it starts the component up the same as all the other tests are doing (via shimless).
+	// TODO[https://github.com/pulumi/pulumi/issues/12365] We no longer build the go-component in
+	// component_setup.sh so there's no native binary for the testComponentProviderSchema to just exec. It
+	// _ought_ to be rewritten to use the plugin host framework so that it starts the component up the same as
+	// all the other tests are doing (via shimless).
 	t.Skip("testComponentProviderSchema needs to be updated to use a plugin host to deal with non-native-binary providers")
 
 	path := filepath.Join("component_provider_schema", "testcomponent-go", "pulumi-resource-testcomponent")
@@ -707,9 +805,7 @@ func TestComponentProviderSchemaGo(t *testing.T) {
 
 // TestTracePropagationGo checks that --tracing flag lets golang sub-process to emit traces.
 func TestTracePropagationGo(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pulumi-tracefiles")
-	assert.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	opts := &integration.ProgramTestOptions{
 		Dir:                    filepath.Join("empty", "go"),
@@ -730,20 +826,16 @@ func TestTracePropagationGo(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, store)
 
-	t.Run("traced `go list -m -json -mod=mod all`", func(t *testing.T) {
+	t.Run("traced `go list -m -json`", func(t *testing.T) {
 		isGoListTrace := func(t *appdash.Trace) bool {
 			m := t.Span.Annotations.StringMap()
 
 			isGoCmd := strings.HasSuffix(m["command"], "go") ||
 				strings.HasSuffix(m["command"], "go.exe")
 
-			if m["component"] == "exec.Command" &&
-				m["args"] == "[list -m -json -mod=mod all]" &&
-				isGoCmd {
-				return true
-			}
-
-			return false
+			return isGoCmd &&
+				m["component"] == "exec.Command" &&
+				strings.Contains(m["args"], "list -m -json")
 		}
 		tr, err := FindTrace(store, isGoListTrace)
 		assert.NoError(t, err)
@@ -815,4 +907,140 @@ func TestRefreshGo(t *testing.T) {
 		},
 		Quick: true,
 	})
+}
+
+// TestResourceRefsGetResourceGo tests that invoking the built-in 'pulumi:pulumi:getResource' function
+// returns resource references for any resource reference in a resource's state.
+func TestResourceRefsGetResourceGo(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("resource_refs_get_resource", "go"),
+		Dependencies: []string{
+			"github.com/pulumi/pulumi/sdk/v3",
+		},
+		Quick: true,
+	})
+}
+
+// TestDeletedWithGo tests the DeletedWith resource option.
+func TestDeletedWithGo(t *testing.T) {
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("deleted_with", "go"),
+		Dependencies: []string{
+			"github.com/pulumi/pulumi/sdk/v3",
+		},
+		LocalProviders: []integration.LocalDependency{
+			{Package: "testprovider", Path: filepath.Join("..", "testprovider")},
+		},
+		Quick: true,
+	})
+}
+
+func TestConstructProviderPropagationGo(t *testing.T) {
+	t.Parallel()
+
+	testConstructProviderPropagation(t, "go", []string{"github.com/pulumi/pulumi/sdk/v3"})
+}
+
+func TestConstructResourceOptionsGo(t *testing.T) {
+	t.Parallel()
+
+	testConstructResourceOptions(t, "go", []string{"github.com/pulumi/pulumi/sdk/v3"})
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/13301.
+// The reproduction is a bit involved:
+//
+//   - Set up a fake Pulumi Go project that imports a specific non-Pulumi plugin.
+//     Specifically, the plugin MUST NOT be imported by any Go file in the project.
+//   - Install that plugin with 'pulumi plugin install'.
+//   - Run a Go Automation program that uses that plugin.
+//
+// The issue in #13301 was that this plugin would not be downloaded by `pulumi plugin install`,
+// causing a failure when the Automation program tried to use it.
+func TestAutomation_externalPluginDownload_issue13301(t *testing.T) {
+	// Context scoped to the lifetime of the test.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	e := ptesting.NewEnvironment(t)
+	defer func() {
+		if !t.Failed() {
+			e.DeleteEnvironmentFallible()
+		}
+	}()
+	e.ImportDirectory(filepath.Join("go", "regress-13301"))
+
+	// Rename go.mod.bad to go.mod so that the Go toolchain uses it.
+	require.NoError(t, os.Rename(
+		filepath.Join(e.CWD, "go.mod.bad"),
+		filepath.Join(e.CWD, "go.mod"),
+	))
+
+	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
+
+	// Plugins are installed globally in PULUMI_HOME.
+	// We will set that to a temporary directory,
+	// so this is not polluted by other tests.
+	pulumiHome := filepath.Join(e.RootPath, ".pulumi-home")
+	require.NoError(t, os.MkdirAll(pulumiHome, 0o700))
+
+	// The commands that follow will make gRPC requests that
+	// we don't have a lot of visibility into.
+	// If we run the Pulumi CLI with PULUMI_DEBUG_GRPC set to a path,
+	// it will log the gRPC requests and responses to that file.
+	//
+	// Capture these and print them if the test fails.
+	grpcLog := filepath.Join(e.RootPath, "debug-grpc.log")
+	defer func() {
+		if !t.Failed() {
+			return
+		}
+
+		if bs, err := os.ReadFile(grpcLog); err == nil {
+			t.Logf("grpc debug log:\n%s", bs)
+		}
+	}()
+
+	e.Env = append(e.Env,
+		"PULUMI_HOME="+pulumiHome,
+		"PULUMI_DEBUG_GRPC="+grpcLog)
+	e.RunCommand("pulumi", "plugin", "install")
+
+	ws, err := auto.NewLocalWorkspace(ctx,
+		auto.Project(workspace.Project{
+			Name:    "issue-13301",
+			Runtime: workspace.NewProjectRuntimeInfo("go", nil),
+		}),
+		auto.WorkDir(e.CWD),
+		auto.PulumiHome(pulumiHome),
+		auto.EnvVars(map[string]string{
+			"PULUMI_CONFIG_PASSPHRASE": "not-a-real-passphrase",
+			"PULUMI_DEBUG_COMMANDS":    "true",
+			"PULUMI_CREDENTIALS_PATH":  e.RootPath,
+			"PULUMI_DEBUG_GRPC":        grpcLog,
+		}),
+	)
+	require.NoError(t, err)
+
+	ws.SetProgram(func(ctx *pulumi.Context) error {
+		provider, err := hcp.NewProvider(ctx, "hcp", &hcp.ProviderArgs{})
+		if err != nil {
+			return err
+		}
+
+		_ = provider // unused
+		return nil
+	})
+
+	stack, err := auto.UpsertStack(ctx, "foo", ws)
+	require.NoError(t, err)
+
+	_, err = stack.Preview(ctx)
+	require.NoError(t, err)
+}
+
+func TestConstructProviderExplicitGo(t *testing.T) {
+	t.Parallel()
+
+	testConstructProviderExplicit(t, "go", []string{"github.com/pulumi/pulumi/sdk/v3"})
 }

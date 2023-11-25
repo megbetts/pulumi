@@ -33,7 +33,7 @@ let programRunning = false;
 const uncaughtHandler = (err: Error) => {
     uncaughtErrors.add(err);
     if (!programRunning) {
-        console.error(err.stack || err.message || ("" + err));
+        console.error(err.stack || err.message || "" + err);
     }
 };
 
@@ -106,7 +106,9 @@ function main(args: string[]): void {
     v8Hooks.isInitializedAsync().then(() => {
         const promise: Promise<void> = require("./run").run({
             argv,
-            programStarted: () => (programRunning = true),
+            programStarted: () => {
+                programRunning = true;
+            },
             reportLoggedError: (err: Error) => loggedErrors.add(err),
             runInStack: false,
             typeScript: true, // Should have no deleterious impact on JS codebases.

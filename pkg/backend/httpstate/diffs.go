@@ -15,27 +15,22 @@
 package httpstate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sync"
-
-	"github.com/hexops/gotextdiff/myers"
-	"github.com/hexops/gotextdiff/span"
-
-	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/promise"
 )
 
 type deploymentDiffState struct {
-	lastSavedDeployment json.RawMessage
+	lastSavedDeployment deployment
 	sequenceNumber      int
-	noChecksums         bool
-	strictMode          bool
 	minimalDiffSize     int
+	buffer              *bytes.Buffer
 }
 
 type deploymentDiff struct {
@@ -44,8 +39,11 @@ type deploymentDiff struct {
 	deploymentDelta json.RawMessage
 }
 
-func newDeploymentDiffState() *deploymentDiffState {
-	return &deploymentDiffState{sequenceNumber: 1}
+func newDeploymentDiffState(minimalDiffSize int) *deploymentDiffState {
+	return &deploymentDiffState{
+		sequenceNumber:  1,
+		minimalDiffSize: minimalDiffSize,
+	}
 }
 
 func (dds *deploymentDiffState) SequenceNumber() int {
@@ -53,66 +51,48 @@ func (dds *deploymentDiffState) SequenceNumber() int {
 }
 
 func (dds *deploymentDiffState) CanDiff() bool {
-	return dds.lastSavedDeployment != nil
+	return dds.lastSavedDeployment.raw != nil
 }
 
 // Size-based heuristics trying to estimate if the diff method will be
 // worth it and take less time than sending the entire deployment.
-func (dds *deploymentDiffState) ShouldDiff(new *apitype.UntypedDeployment) bool {
+func (dds *deploymentDiffState) ShouldDiff(new deployment) bool {
 	if !dds.CanDiff() {
 		return false
 	}
-	small := dds.minimalDiffSize
-	if small == 0 {
-		small = 1024 * 32
-	}
-	if len(dds.lastSavedDeployment) < small {
+	if len(dds.lastSavedDeployment.raw) < dds.minimalDiffSize {
 		return false
 	}
-	if len(new.Deployment) < small {
+	if len(new.raw) < dds.minimalDiffSize {
 		return false
 	}
 	return true
 }
 
-func (dds *deploymentDiffState) Diff(ctx context.Context,
-	deployment *apitype.UntypedDeployment) (deploymentDiff, error) {
-
+func (dds *deploymentDiffState) Diff(ctx context.Context, deployment deployment) (deploymentDiff, error) {
 	if !dds.CanDiff() {
 		return deploymentDiff{}, fmt.Errorf("Diff() cannot be called before Saved()")
-	}
-
-	if deployment.Version == 0 {
-		return deploymentDiff{}, fmt.Errorf("deployment.Version should be set")
 	}
 
 	tracingSpan, childCtx := opentracing.StartSpanFromContext(ctx, "Diff")
 	defer tracingSpan.Finish()
 
-	before := dds.lastSavedDeployment
+	before := dds.lastSavedDeployment.raw
+	after := deployment.raw
 
-	after, err := marshalUntypedDeployment(deployment)
-	if err != nil {
-		return deploymentDiff{}, fmt.Errorf("marshalUntypedDeployment failed: %v", err)
-	}
+	checkpointHashPromise := promise.Run(func() (string, error) {
+		return dds.computeHash(childCtx, after), nil
+	})
 
-	var checkpointHash string
-	checkpointHashReady := &sync.WaitGroup{}
-
-	if !dds.noChecksums {
-		checkpointHashReady.Add(1)
-		go func() {
-			defer checkpointHashReady.Done()
-			checkpointHash = dds.computeHash(childCtx, after)
-		}()
-	}
-
-	delta, err := dds.computeEdits(childCtx, string(before), string(after))
+	delta, err := dds.computeEdits(childCtx, dds.lastSavedDeployment, deployment)
 	if err != nil {
 		return deploymentDiff{}, fmt.Errorf("Cannot marshal the edits: %v", err)
 	}
 
-	checkpointHashReady.Wait()
+	checkpointHash, err := checkpointHashPromise.Result(ctx)
+	if err != nil {
+		return deploymentDiff{}, fmt.Errorf("Cannot compute the checkpoint hash: %v", err)
+	}
 
 	tracingSpan.SetTag("before", len(before))
 	tracingSpan.SetTag("after", len(after))
@@ -130,12 +110,12 @@ func (dds *deploymentDiffState) Diff(ctx context.Context,
 }
 
 // Indicates that a deployment was just saved to the service.
-func (dds *deploymentDiffState) Saved(ctx context.Context, deployment *apitype.UntypedDeployment) error {
-	d, err := marshalUntypedDeployment(deployment)
-	if err != nil {
-		return err
+func (dds *deploymentDiffState) Saved(ctx context.Context, deployment deployment) error {
+	if dds.lastSavedDeployment.buf != nil {
+		dds.buffer = dds.lastSavedDeployment.buf
+		dds.buffer.Reset()
 	}
-	dds.lastSavedDeployment = d
+	dds.lastSavedDeployment = deployment
 	dds.sequenceNumber++
 
 	return nil
@@ -146,18 +126,4 @@ func (*deploymentDiffState) computeHash(ctx context.Context, deployment json.Raw
 	defer tracingSpan.Finish()
 	hash := sha256.Sum256(deployment)
 	return hex.EncodeToString(hash[:])
-}
-
-func (*deploymentDiffState) computeEdits(ctx context.Context, before, after string) (json.RawMessage, error) {
-	tracingSpan, _ := opentracing.StartSpanFromContext(ctx, "computeEdits")
-	defer tracingSpan.Finish()
-
-	edits := myers.ComputeEdits(span.URIFromURI(""), before, after)
-
-	delta, err := json.Marshal(edits)
-	if err != nil {
-		return nil, fmt.Errorf("Cannot marshal the edits: %v", err)
-	}
-
-	return delta, nil
 }

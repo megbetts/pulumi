@@ -8,6 +8,7 @@ import (
 	"reflect"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"simple-resource-schema/example/internal"
 )
 
 type Resource struct {
@@ -25,14 +26,14 @@ func NewResource(ctx *pulumi.Context,
 	}
 
 	if args.Bar != nil {
-		args.Bar = pulumi.ToSecret(args.Bar).(pulumi.StringPtrOutput)
+		args.Bar = pulumi.ToSecret(args.Bar).(pulumi.StringPtrInput)
 	}
 	secrets := pulumi.AdditionalSecretOutputs([]string{
 		"bar",
 		"baz",
 	})
 	opts = append(opts, secrets)
-	opts = pkgResourceDefaultOpts(opts)
+	opts = internal.PkgResourceDefaultOpts(opts)
 	var resource Resource
 	err := ctx.RegisterResource("example::Resource", name, args, &resource, opts...)
 	if err != nil {

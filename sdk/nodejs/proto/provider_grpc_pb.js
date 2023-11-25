@@ -21,6 +21,7 @@ var pulumi_provider_pb = require('./provider_pb.js');
 var pulumi_plugin_pb = require('./plugin_pb.js');
 var google_protobuf_empty_pb = require('google-protobuf/google/protobuf/empty_pb.js');
 var google_protobuf_struct_pb = require('google-protobuf/google/protobuf/struct_pb.js');
+var pulumi_source_pb = require('./source_pb.js');
 
 function serialize_google_protobuf_Empty(arg) {
   if (!(arg instanceof google_protobuf_empty_pb.Empty)) {
@@ -174,6 +175,50 @@ function serialize_pulumirpc_DiffResponse(arg) {
 
 function deserialize_pulumirpc_DiffResponse(buffer_arg) {
   return pulumi_provider_pb.DiffResponse.deserializeBinary(new Uint8Array(buffer_arg));
+}
+
+function serialize_pulumirpc_GetMappingRequest(arg) {
+  if (!(arg instanceof pulumi_provider_pb.GetMappingRequest)) {
+    throw new Error('Expected argument of type pulumirpc.GetMappingRequest');
+  }
+  return Buffer.from(arg.serializeBinary());
+}
+
+function deserialize_pulumirpc_GetMappingRequest(buffer_arg) {
+  return pulumi_provider_pb.GetMappingRequest.deserializeBinary(new Uint8Array(buffer_arg));
+}
+
+function serialize_pulumirpc_GetMappingResponse(arg) {
+  if (!(arg instanceof pulumi_provider_pb.GetMappingResponse)) {
+    throw new Error('Expected argument of type pulumirpc.GetMappingResponse');
+  }
+  return Buffer.from(arg.serializeBinary());
+}
+
+function deserialize_pulumirpc_GetMappingResponse(buffer_arg) {
+  return pulumi_provider_pb.GetMappingResponse.deserializeBinary(new Uint8Array(buffer_arg));
+}
+
+function serialize_pulumirpc_GetMappingsRequest(arg) {
+  if (!(arg instanceof pulumi_provider_pb.GetMappingsRequest)) {
+    throw new Error('Expected argument of type pulumirpc.GetMappingsRequest');
+  }
+  return Buffer.from(arg.serializeBinary());
+}
+
+function deserialize_pulumirpc_GetMappingsRequest(buffer_arg) {
+  return pulumi_provider_pb.GetMappingsRequest.deserializeBinary(new Uint8Array(buffer_arg));
+}
+
+function serialize_pulumirpc_GetMappingsResponse(arg) {
+  if (!(arg instanceof pulumi_provider_pb.GetMappingsResponse)) {
+    throw new Error('Expected argument of type pulumirpc.GetMappingsResponse');
+  }
+  return Buffer.from(arg.serializeBinary());
+}
+
+function deserialize_pulumirpc_GetMappingsResponse(buffer_arg) {
+  return pulumi_provider_pb.GetMappingsResponse.deserializeBinary(new Uint8Array(buffer_arg));
 }
 
 function serialize_pulumirpc_GetSchemaRequest(arg) {
@@ -504,6 +549,33 @@ attach: {
     requestDeserialize: deserialize_pulumirpc_PluginAttach,
     responseSerialize: serialize_google_protobuf_Empty,
     responseDeserialize: deserialize_google_protobuf_Empty,
+  },
+  // GetMapping fetches the mapping for this resource provider, if any. A provider should return an empty
+// response (not an error) if it doesn't have a mapping for the given key.
+getMapping: {
+    path: '/pulumirpc.ResourceProvider/GetMapping',
+    requestStream: false,
+    responseStream: false,
+    requestType: pulumi_provider_pb.GetMappingRequest,
+    responseType: pulumi_provider_pb.GetMappingResponse,
+    requestSerialize: serialize_pulumirpc_GetMappingRequest,
+    requestDeserialize: deserialize_pulumirpc_GetMappingRequest,
+    responseSerialize: serialize_pulumirpc_GetMappingResponse,
+    responseDeserialize: deserialize_pulumirpc_GetMappingResponse,
+  },
+  // GetMappings is an optional method that returns what mappings (if any) a provider supports. If a provider does not
+// implement this method the engine falls back to the old behaviour of just calling GetMapping without a name.
+// If this method is implemented than the engine will then call GetMapping only with the names returned from this method.
+getMappings: {
+    path: '/pulumirpc.ResourceProvider/GetMappings',
+    requestStream: false,
+    responseStream: false,
+    requestType: pulumi_provider_pb.GetMappingsRequest,
+    responseType: pulumi_provider_pb.GetMappingsResponse,
+    requestSerialize: serialize_pulumirpc_GetMappingsRequest,
+    requestDeserialize: deserialize_pulumirpc_GetMappingsRequest,
+    responseSerialize: serialize_pulumirpc_GetMappingsResponse,
+    responseDeserialize: deserialize_pulumirpc_GetMappingsResponse,
   },
 };
 

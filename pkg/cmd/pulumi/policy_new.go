@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -28,30 +27,24 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
-	"github.com/pulumi/pulumi/pkg/v3/util/yamlutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 type newPolicyArgs struct {
 	dir               string
 	force             bool
 	generateOnly      bool
-	interactive       bool
 	offline           bool
 	templateNameOrURL string
-	yes               bool
 }
 
 func newPolicyNewCmd() *cobra.Command {
-	args := newPolicyArgs{
-		interactive: cmdutil.Interactive(),
-	}
+	args := newPolicyArgs{}
 
 	cmd := &cobra.Command{
 		Use:        "new [template|url]",
@@ -92,14 +85,10 @@ func newPolicyNewCmd() *cobra.Command {
 }
 
 func runNewPolicyPack(ctx context.Context, args newPolicyArgs) error {
-	if !args.interactive && !args.yes {
-		return errors.New("--yes must be passed in to proceed when running in non-interactive mode")
-	}
-
 	// Prepare options.
 	opts := display.Options{
 		Color:         cmdutil.GetGlobalColorization(),
-		IsInteractive: args.interactive,
+		IsInteractive: cmdutil.Interactive(),
 	}
 
 	// Get the current working directory.
@@ -144,10 +133,15 @@ func runNewPolicyPack(ctx context.Context, args newPolicyArgs) error {
 		return errors.New("no templates")
 	} else if len(templates) == 1 {
 		template = templates[0]
+	} else if !opts.IsInteractive {
+		return fmt.Errorf("a template must be provided when running in non-interactive mode")
 	} else {
 		if template, err = choosePolicyPackTemplate(templates, opts); err != nil {
 			return err
 		}
+	}
+	if template.Errored() {
+		return fmt.Errorf("template '%s' is currently broken: %w", template.Name, template.Error)
 	}
 
 	// Do a dry run, if we're not forcing files to be overwritten.
@@ -170,46 +164,21 @@ func runNewPolicyPack(ctx context.Context, args newPolicyArgs) error {
 
 	fmt.Println("Created Policy Pack!")
 
-	proj, projPath, root, err := readPolicyProject()
+	proj, projPath, root, err := readPolicyProject(cwd)
 	if err != nil {
 		return err
 	}
 
-	if filepath.Ext(projPath) == ".yaml" {
-		filedata, err := os.ReadFile(projPath)
-		if err != nil {
-			return err
+	// Workaround for python, most of our templates don't specify a venv but we want to use one
+	if proj.Runtime.Name() == "python" {
+		// If the template does give virtualenv use it, else default to "venv"
+		if _, has := proj.Runtime.Options()["virtualenv"]; !has {
+			proj.Runtime.SetOption("virtualenv", "venv")
 		}
-		var workspaceDocument yaml.Node
-		err = yaml.Unmarshal(filedata, &workspaceDocument)
-		if err != nil {
-			return err
-		}
-		if proj.Runtime.Name() == "python" {
-			// If the template does give virtualenv use it, else default to "venv"
-			if len(proj.Runtime.Options()) == 0 {
-				proj.Runtime.SetOption("virtualenv", "venv")
-				err = yamlutil.Insert(&workspaceDocument, "runtime", strings.TrimSpace(`
-name: python
-options:
-virtualenv: venv
-`))
-				if err != nil {
-					return err
-				}
-			}
-		}
+	}
 
-		contract.Assert(len(workspaceDocument.Content) == 1)
-		projFile, err := yaml.Marshal(workspaceDocument.Content[0])
-		if err != nil {
-			return err
-		}
-
-		err = os.WriteFile(projPath, projFile, 0600)
-		if err != nil {
-			return err
-		}
+	if err = proj.Save(projPath); err != nil {
+		return fmt.Errorf("saving project: %w", err)
 	}
 
 	// Install dependencies.
@@ -220,7 +189,8 @@ virtualenv: venv
 		// fow now this works.
 		projinfo := &engine.Projinfo{Proj: &workspace.Project{
 			Main:    proj.Main,
-			Runtime: proj.Runtime}, Root: root}
+			Runtime: proj.Runtime,
+		}, Root: root}
 		pwd, _, pluginCtx, err := engine.ProjectInfoContext(
 			projinfo,
 			nil,
@@ -228,6 +198,7 @@ virtualenv: venv
 			cmdutil.Diag(),
 			false,
 			span,
+			nil,
 		)
 		if err != nil {
 			return err
@@ -252,7 +223,8 @@ virtualenv: venv
 }
 
 func installPolicyPackDependencies(ctx *plugin.Context,
-	proj *workspace.PolicyPackProject, directory string) error {
+	proj *workspace.PolicyPackProject, directory string,
+) error {
 	// First make sure the language plugin is present.  We need this to load the required resource plugins.
 	// TODO: we need to think about how best to version this.  For now, it always picks the latest.
 	lang, err := ctx.Host.LanguageRuntime(ctx.Root, ctx.Pwd, proj.Runtime.Name(), proj.Runtime.Options())
@@ -296,8 +268,9 @@ func printPolicyPackNextSteps(proj *workspace.PolicyPackProject, root string, ge
 		fmt.Println()
 	}
 
-	usageCommandPreambles :=
-		[]string{"run the Policy Pack against a Pulumi program, in the directory of the Pulumi program run"}
+	usageCommandPreambles := []string{
+		"run the Policy Pack against a Pulumi program, in the directory of the Pulumi program run",
+	}
 	usageCommands := []string{fmt.Sprintf("pulumi up --policy-pack %s", root)}
 
 	if strings.EqualFold(proj.Runtime.Name(), "nodejs") || strings.EqualFold(proj.Runtime.Name(), "python") {
@@ -305,7 +278,9 @@ func printPolicyPackNextSteps(proj *workspace.PolicyPackProject, root string, ge
 		usageCommands = append(usageCommands, "pulumi policy publish [org-name]")
 	}
 
-	contract.Assert(len(usageCommandPreambles) == len(usageCommands))
+	contract.Assertf(len(usageCommandPreambles) == len(usageCommands),
+		"Number of command preambles (%d) must match number of commands (%d)",
+		len(usageCommandPreambles), len(usageCommands))
 
 	if len(usageCommands) == 1 {
 		usageMsg := fmt.Sprintf("Once you're done editing your Policy Pack, to %s `%s`", usageCommandPreambles[0],
@@ -326,8 +301,8 @@ func printPolicyPackNextSteps(proj *workspace.PolicyPackProject, root string, ge
 
 // choosePolicyPackTemplate will prompt the user to choose amongst the available templates.
 func choosePolicyPackTemplate(templates []workspace.PolicyPackTemplate,
-	opts display.Options) (workspace.PolicyPackTemplate, error) {
-
+	opts display.Options,
+) (workspace.PolicyPackTemplate, error) {
 	const chooseTemplateErr = "no template selected; please use `pulumi policy new` to choose one"
 	if !opts.IsInteractive {
 		return workspace.PolicyPackTemplate{}, errors.New(chooseTemplateErr)
@@ -354,8 +329,8 @@ func choosePolicyPackTemplate(templates []workspace.PolicyPackTemplate,
 // policyTemplatesToOptionArrayAndMap returns an array of option strings and a map of option strings to policy
 // templates. Each option string is made up of the template name and description with some padding in between.
 func policyTemplatesToOptionArrayAndMap(
-	templates []workspace.PolicyPackTemplate) ([]string, map[string]workspace.PolicyPackTemplate) {
-
+	templates []workspace.PolicyPackTemplate,
+) ([]string, map[string]workspace.PolicyPackTemplate) {
 	// Find the longest name length. Used to add padding between the name and description.
 	maxNameLength := 0
 	for _, template := range templates {
@@ -366,15 +341,26 @@ func policyTemplatesToOptionArrayAndMap(
 
 	// Build the array and map.
 	var options []string
+	var brokenOptions []string
 	nameToTemplateMap := make(map[string]workspace.PolicyPackTemplate)
 	for _, template := range templates {
+		// If template is broken, indicate it in the project description.
+		if template.Errored() {
+			template.Description = brokenTemplateDescription
+		}
+
 		// Create the option string that combines the name, padding, and description.
 		option := fmt.Sprintf(fmt.Sprintf("%%%ds    %%s", -maxNameLength), template.Name, template.Description)
 
-		// Add it to the array and map.
-		options = append(options, option)
 		nameToTemplateMap[option] = template
+		if template.Errored() {
+			brokenOptions = append(brokenOptions, option)
+		} else {
+			options = append(options, option)
+		}
 	}
+	// After sorting the options, add the broken templates to the end
 	sort.Strings(options)
+	options = append(options, brokenOptions...)
 	return options, nameToTemplateMap
 }

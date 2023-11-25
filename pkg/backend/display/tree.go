@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: goconst
 package display
 
 import (
@@ -24,11 +23,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pkg/browser"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display/internal/terminal"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
-	"github.com/rivo/uniseg"
 )
 
 type treeRenderer struct {
@@ -38,11 +37,15 @@ type treeRenderer struct {
 
 	term terminal.Terminal
 
+	permalink string
+
 	dirty  bool // True if the display has changed since the last redraw.
 	rewind int  // The number of lines we need to rewind to redraw the entire screen.
 
-	treeTableRows  []string
-	systemMessages []string
+	treeTableRows         []string
+	systemMessages        []string
+	statusMessage         string
+	statusMessageDeadline time.Time
 
 	ticker *time.Ticker
 	keys   chan string
@@ -52,19 +55,21 @@ type treeRenderer struct {
 	maxTreeTableOffset int // The maximum scroll offset.
 }
 
-func newInteractiveRenderer(term terminal.Terminal, opts Options) progressRenderer {
+func newInteractiveRenderer(term terminal.Terminal, permalink string, opts Options) progressRenderer {
 	// Something about the tree renderer--possibly the raw terminal--does not yet play well with Windows, so for now
 	// we fall back to the legacy renderer on that platform.
 	if !term.IsRaw() {
 		return newInteractiveMessageRenderer(term, opts)
 	}
+	term.HideCursor()
 
 	r := &treeRenderer{
-		opts:   opts,
-		term:   term,
-		ticker: time.NewTicker(16 * time.Millisecond),
-		keys:   make(chan string),
-		closed: make(chan bool),
+		opts:      opts,
+		term:      term,
+		permalink: permalink,
+		ticker:    time.NewTicker(16 * time.Millisecond),
+		keys:      make(chan string),
+		closed:    make(chan bool),
 	}
 	if opts.deterministicOutput {
 		r.ticker.Stop()
@@ -75,6 +80,7 @@ func newInteractiveRenderer(term terminal.Terminal, opts Options) progressRender
 }
 
 func (r *treeRenderer) Close() error {
+	r.term.ShowCursor()
 	return r.term.Close()
 }
 
@@ -100,6 +106,13 @@ func (r *treeRenderer) done(display *ProgressDisplay) {
 	r.frame(false, true)
 }
 
+func (r *treeRenderer) showStatusMessage(msg string, duration time.Duration) {
+	r.m.Lock()
+	defer r.m.Unlock()
+
+	r.statusMessage, r.statusMessageDeadline = msg, time.Now().Add(duration)
+}
+
 func (r *treeRenderer) print(text string) {
 	_, err := r.term.Write([]byte(r.opts.Color.Colorize(text)))
 	contract.IgnoreError(err)
@@ -107,6 +120,16 @@ func (r *treeRenderer) print(text string) {
 
 func (r *treeRenderer) println(display *ProgressDisplay, text string) {
 	r.print(text)
+	r.print("\n")
+}
+
+func (r *treeRenderer) over(text string) {
+	r.print(text)
+	r.term.ClearEnd()
+}
+
+func (r *treeRenderer) overln(text string) {
+	r.over(text)
 	r.print("\n")
 }
 
@@ -169,6 +192,7 @@ func (r *treeRenderer) markDirty() {
 // | treetable footer                           |
 // | system messages header                     |
 // | system messages contents...                |
+// | status message                             |
 // +--------------------------------------------+
 func (r *treeRenderer) frame(locked, done bool) {
 	if !locked {
@@ -186,6 +210,7 @@ func (r *treeRenderer) frame(locked, done bool) {
 
 	treeTableRows := r.treeTableRows
 	systemMessages := r.systemMessages
+	statusMessage := r.statusMessage
 
 	var treeTableHeight int
 	var treeTableHeader string
@@ -199,8 +224,16 @@ func (r *treeRenderer) frame(locked, done bool) {
 		systemMessagesHeight += 3 // Account for padding + title
 	}
 
+	statusMessageHeight := 0
+	if !done && r.statusMessage != "" {
+		statusMessageHeight = 1
+	}
+
+	// Enable autoscrolling if the display is scrolled to its maximum offset.
+	autoscroll := r.treeTableOffset == r.maxTreeTableOffset
+
 	// Layout the display. The extra '1' accounts for the fact that we terminate each line with a newline.
-	totalHeight := treeTableHeight + systemMessagesHeight + 1
+	totalHeight := treeTableHeight + systemMessagesHeight + statusMessageHeight + 1
 	r.maxTreeTableOffset = 0
 
 	// If this is not the final frame and the terminal is not large enough to show the entire display:
@@ -221,55 +254,107 @@ func (r *treeRenderer) frame(locked, done bool) {
 			}
 		}
 
-		treeTableHeight = termHeight - systemMessagesHeight - 1
-		r.maxTreeTableOffset = len(treeTableRows) - treeTableHeight - 1
+		// If there are no system messages and we have a status message to display, fold the status message into the
+		// last line of the tree table (where the scroll indicator is displayed).
+		mergeLastLine := systemMessagesHeight == 0 && statusMessageHeight != 0
 
+		treeTableHeight = termHeight - systemMessagesHeight - statusMessageHeight - 1
+		r.maxTreeTableOffset = len(treeTableRows) - treeTableHeight + 1
+		scrollable := r.maxTreeTableOffset != 0
+
+		if autoscroll {
+			r.treeTableOffset = r.maxTreeTableOffset
+		}
+
+		if treeTableHeight <= 0 {
+			// Ensure that the treeTableHeight is at least 1 to avoid going out of bounds.
+			treeTableHeight = 1
+		}
 		treeTableRows = treeTableRows[r.treeTableOffset : r.treeTableOffset+treeTableHeight-1]
 
-		totalHeight = treeTableHeight + systemMessagesHeight + 1
+		totalHeight = treeTableHeight + systemMessagesHeight + statusMessageHeight + 1
 
-		upArrow := "  "
-		if r.treeTableOffset != 0 {
-			upArrow = "⬆ "
+		footer := ""
+		if scrollable {
+			upArrow := "  "
+			if r.treeTableOffset != 0 {
+				upArrow = "⬆ "
+			}
+			downArrow := "  "
+			if r.treeTableOffset != r.maxTreeTableOffset {
+				downArrow = "⬇ "
+			}
+			footer = colors.BrightBlue + fmt.Sprintf("%smore%s", upArrow, downArrow) + colors.Reset
 		}
-		downArrow := "  "
-		if r.treeTableOffset != r.maxTreeTableOffset {
-			downArrow = "⬇ "
+		padding := termWidth - colors.MeasureColorizedString(footer)
+
+		// Combine any last-line content.
+		prefix := ""
+		if mergeLastLine {
+			prefix = r.clampLine(statusMessage, padding-1) + " "
+			padding -= colors.MeasureColorizedString(prefix)
+			statusMessageHeight, statusMessage = 0, ""
 		}
-		footer := fmt.Sprintf("%smore%s", upArrow, downArrow)
-		padding := termWidth - uniseg.GraphemeClusterCount(footer)
-		treeTableFooter = strings.Repeat(" ", padding) + footer
+
+		if padding < 0 {
+			// Padding can potentially go negative on very small terminals.
+			// This will cause a panic. To avoid this, we clamp the padding to 0.
+			// The user won't be able to see anything anyway.
+			padding = 0
+		}
+		treeTableFooter = r.opts.Color.Colorize(prefix + strings.Repeat(" ", padding) + footer)
+
+		if systemMessagesHeight > 0 {
+			treeTableFooter += "\n"
+		}
 	}
 
 	// Re-home the cursor.
-	r.term.ClearLine()
+	r.print("\r")
 	for ; r.rewind > 0; r.rewind-- {
+		// If there is content that we won't overwrite, clear it.
+		if r.rewind > totalHeight-1 {
+			r.term.ClearEnd()
+		}
 		r.term.CursorUp(1)
-		r.term.ClearLine()
 	}
 	r.rewind = totalHeight - 1
 
 	// Render the tree table.
-	r.println(nil, r.clampLine(treeTableHeader, termWidth))
+	r.overln(r.clampLine(treeTableHeader, termWidth))
 	for _, row := range treeTableRows {
-		r.println(nil, r.clampLine(row, termWidth))
+		r.overln(r.clampLine(row, termWidth))
 	}
 	if treeTableFooter != "" {
-		r.print(treeTableFooter)
+		r.over(treeTableFooter)
 	}
 
 	// Render the system messages.
 	if systemMessagesHeight > 0 {
-		r.println(nil, "")
-		r.println(nil, colors.Yellow+"System Messages"+colors.Reset)
+		r.overln("")
+		r.overln(colors.Yellow + "System Messages" + colors.Reset)
 
 		for _, line := range systemMessages {
-			r.println(nil, "  "+line)
+			r.overln("  " + line)
 		}
 	}
 
+	// Render the status message, if any.
+	if statusMessageHeight != 0 {
+		padding := termWidth - colors.MeasureColorizedString(statusMessage)
+
+		r.overln("")
+		r.over(statusMessage + strings.Repeat(" ", padding))
+	}
+
 	if done && totalHeight > 0 {
-		r.println(nil, "")
+		r.overln("")
+	}
+
+	// Handle the status message timer. We do this at the end to ensure that any message is displayed for at least one
+	// frame.
+	if !r.statusMessageDeadline.IsZero() && r.statusMessageDeadline.Before(time.Now()) {
+		r.statusMessage, r.statusMessageDeadline = "", time.Time{}
 	}
 }
 
@@ -292,16 +377,42 @@ func (r *treeRenderer) handleEvents() {
 			r.frame(false, false)
 		case key := <-r.keys:
 			switch key {
-			case "ctrl+c":
+			case terminal.KeyCtrlC:
 				sigint()
-			case "up":
+			case terminal.KeyCtrlO:
+				if r.permalink != "" {
+					if err := browser.OpenURL(r.permalink); err != nil {
+						r.showStatusMessage(colors.Red+"could not open browser"+colors.Reset, 5*time.Second)
+					}
+				}
+			case terminal.KeyUp:
 				if r.treeTableOffset > 0 {
 					r.treeTableOffset--
 				}
 				r.markDirty()
-			case "down":
+			case terminal.KeyDown:
 				if r.treeTableOffset < r.maxTreeTableOffset {
 					r.treeTableOffset++
+				}
+				r.markDirty()
+			case terminal.KeyPageUp:
+				_, termHeight, err := r.term.Size()
+				contract.IgnoreError(err)
+
+				if r.treeTableOffset > termHeight {
+					r.treeTableOffset -= termHeight
+				} else {
+					r.treeTableOffset = 0
+				}
+				r.markDirty()
+			case terminal.KeyPageDown:
+				_, termHeight, err := r.term.Size()
+				contract.IgnoreError(err)
+
+				if r.maxTreeTableOffset-r.treeTableOffset > termHeight {
+					r.treeTableOffset += termHeight
+				} else {
+					r.treeTableOffset = r.maxTreeTableOffset
 				}
 				r.markDirty()
 			}

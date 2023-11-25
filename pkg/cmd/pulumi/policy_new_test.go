@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !smoke
+//go:build !xplatform_acceptance
 
 package main
 
 import (
 	"context"
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -30,16 +28,14 @@ import (
 func TestCreatingPolicyPackWithPromptedName(t *testing.T) {
 	skipIfShortOrNoPulumiAccessToken(t)
 
-	tempdir, _ := ioutil.TempDir("", "test-env")
-	defer os.RemoveAll(tempdir)
+	tempdir := tempProjectDir(t)
 	chdir(t, tempdir)
 
-	var args = newPolicyArgs{
-		interactive:       true,
+	args := newPolicyArgs{
 		templateNameOrURL: "aws-javascript",
 	}
 
-	err := runNewPolicyPack(context.TODO(), args)
+	err := runNewPolicyPack(context.Background(), args)
 	assert.NoError(t, err)
 
 	assert.FileExists(t, filepath.Join(tempdir, "PulumiPolicy.yaml"))
@@ -54,35 +50,29 @@ func TestInvalidPolicyPackTemplateName(t *testing.T) {
 	const nonExistantTemplate = "this-is-not-the-template-youre-looking-for"
 
 	t.Run("RemoteTemplateNotFound", func(t *testing.T) {
-		tempdir, _ := ioutil.TempDir("", "test-env")
-		defer os.RemoveAll(tempdir)
-		assert.DirExists(t, tempdir)
+		tempdir := tempProjectDir(t)
 		chdir(t, tempdir)
 
-		var args = newPolicyArgs{
-			interactive:       false,
-			yes:               true,
+		args := newPolicyArgs{
 			templateNameOrURL: nonExistantTemplate,
 		}
 
-		err := runNewPolicyPack(context.TODO(), args)
+		err := runNewPolicyPack(context.Background(), args)
 		assert.Error(t, err)
 		assertNotFoundError(t, err)
 	})
 
 	t.Run("LocalTemplateNotFound", func(t *testing.T) {
-		tempdir, _ := ioutil.TempDir("", "test-env")
-		defer os.RemoveAll(tempdir)
+		tempdir := tempProjectDir(t)
 		chdir(t, tempdir)
 
-		var args = newPolicyArgs{
+		args := newPolicyArgs{
 			generateOnly:      true,
 			offline:           true,
 			templateNameOrURL: nonExistantTemplate,
-			yes:               true,
 		}
 
-		err := runNewPolicyPack(context.TODO(), args)
+		err := runNewPolicyPack(context.Background(), args)
 		assert.Error(t, err)
 		assertNotFoundError(t, err)
 	})

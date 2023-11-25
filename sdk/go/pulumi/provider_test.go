@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: lll
+//nolint:lll
 package pulumi
 
 import (
@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 )
 
 type BoolEnumInput interface {
@@ -563,7 +565,7 @@ func assertOutputEqual(t *testing.T, value interface{}, known bool, secret bool,
 
 	actualDepsSet := urnSet{}
 	for _, res := range actualDeps {
-		urn, uknown, usecret, err := res.URN().awaitURN(context.TODO())
+		urn, uknown, usecret, err := res.URN().awaitURN(context.Background())
 		assert.NoError(t, err)
 		assert.True(t, uknown)
 		assert.False(t, usecret)
@@ -1735,4 +1737,200 @@ func TestSerdeNilNestedResource(t *testing.T) {
 
 	_, _, _, err = marshalInputs(state)
 	assert.NoError(t, err)
+}
+
+func TestConstruct_resourceOptionsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	// Runs Construct with the given request and a fake constructor,
+	// and returns a snapshot (ResourceOptions) of the resulting options.
+	//
+	// Fails the test if any operation fails.
+	snapshotFromRequest := func(t *testing.T, req *pulumirpc.ConstructRequest) *ResourceOptions {
+		// Keep test cases simple:
+		req.Stack = "mystack"
+		req.Project = "myproject"
+
+		var got *ResourceOptions
+		ctx := context.Background()
+		_, err := construct(ctx, req, nil, func(
+			ctx *Context,
+			typ, name string,
+			inputs map[string]interface{},
+			opts ResourceOption,
+		) (URNInput, Input, error) {
+			urn := resource.NewURN(
+				tokens.QName(ctx.Stack()),
+				tokens.PackageName(ctx.Project()),
+				"", // parent
+				tokens.Type(typ),
+				name,
+			)
+
+			snap, err := NewResourceOptions(opts)
+			require.NoError(t, err, "failed to create snapshot")
+			got = snap
+
+			return URN(urn), nil, nil
+		})
+		require.NoError(t, err, "failed to construct")
+		require.NotNil(t, got, "Construct was never called")
+		return got
+	}
+
+	t.Run("Aliases", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Aliases: []string{"test"},
+		})
+		assert.Len(t, snap.Aliases, 1, "aliases were not set")
+	})
+
+	t.Run("DependsOn", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Dependencies: []string{"test"},
+		})
+		assert.Len(t, snap.DependsOn, 1, "dependencies were not set")
+	})
+
+	t.Run("Protect", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Protect: true,
+		})
+		assert.True(t, snap.Protect, "protect was not set")
+	})
+
+	t.Run("Providers", func(t *testing.T) {
+		t.Parallel()
+
+		urn := resource.NewURN("mystack", "myproject", "", "pulumi:providers:foo", "bar")
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Providers: map[string]string{
+				"baz": string(urn) + "::qux",
+			},
+		})
+		assert.Len(t, snap.Providers, 1, "providers were not set")
+	})
+
+	t.Run("Parent", func(t *testing.T) {
+		t.Parallel()
+
+		urn := resource.NewURN("mystack", "myproject", "", "pulumi:providers:foo", "bar")
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Parent: string(urn),
+		})
+		assert.NotNil(t, snap.Parent, "parent was not set")
+	})
+
+	t.Run("AdditionalSecretOutputs", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			AdditionalSecretOutputs: []string{"foo"},
+		})
+		assert.Equal(t, []string{"foo"}, snap.AdditionalSecretOutputs)
+	})
+
+	t.Run("CustomTimeouts", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			give *pulumirpc.ConstructRequest_CustomTimeouts
+			want *CustomTimeouts
+		}{
+			{
+				name: "Create",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{Create: "1m"},
+				want: &CustomTimeouts{Create: "1m"},
+			},
+			{
+				name: "Update",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{Update: "2m"},
+				want: &CustomTimeouts{Update: "2m"},
+			},
+			{
+				name: "Delete",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{Delete: "3m"},
+				want: &CustomTimeouts{Delete: "3m"},
+			},
+			{
+				name: "all",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{
+					Create: "1m",
+					Update: "2m",
+					Delete: "3m",
+				},
+				want: &CustomTimeouts{
+					Create: "1m",
+					Update: "2m",
+					Delete: "3m",
+				},
+			},
+		}
+
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+					CustomTimeouts: tt.give,
+				})
+
+				assert.Equal(t, tt.want, snap.CustomTimeouts)
+			})
+		}
+	})
+
+	t.Run("DeletedWith", func(t *testing.T) {
+		t.Parallel()
+
+		urn := resource.NewURN("mystack", "myproject", "", "foo:bar:Baz", "qux")
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			DeletedWith: string(urn),
+		})
+		assert.NotNil(t, snap.DeletedWith, "deletedWith was not set")
+	})
+
+	t.Run("DeleteBeforeReplace", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			DeleteBeforeReplace: true,
+		})
+		assert.True(t, snap.DeleteBeforeReplace, "deleteBeforeReplace was not set")
+	})
+
+	t.Run("IgnoreChanges", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			IgnoreChanges: []string{"foo"},
+		})
+		assert.Equal(t, []string{"foo"}, snap.IgnoreChanges)
+	})
+
+	t.Run("ReplaceOnChanges", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			ReplaceOnChanges: []string{"foo"},
+		})
+		assert.Equal(t, []string{"foo"}, snap.ReplaceOnChanges)
+	})
+
+	t.Run("RetainOnDelete", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			RetainOnDelete: true,
+		})
+		assert.True(t, snap.RetainOnDelete, "retainOnDelete was not set")
+	})
 }

@@ -17,6 +17,7 @@ package workspace
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -26,12 +27,16 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
+	"github.com/pgavlin/fx"
+	"github.com/pulumi/esc/ast"
+	"github.com/pulumi/esc/eval"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/santhosh-tekuri/jsonschema/v5"
+	"golang.org/x/exp/maps"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -62,14 +67,18 @@ type Analyzers []tokens.QName
 
 // ProjectTemplate is a Pulumi project template manifest.
 type ProjectTemplate struct {
+	// DisplayName is an optional user friendly name of the template.
+	DisplayName string `json:"displayName,omitempty" yaml:"displayName,omitempty"`
 	// Description is an optional description of the template.
 	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 	// Quickstart contains optional text to be displayed after template creation.
 	Quickstart string `json:"quickstart,omitempty" yaml:"quickstart,omitempty"`
 	// Config is an optional template config.
 	Config map[string]ProjectTemplateConfigValue `json:"config,omitempty" yaml:"config,omitempty"`
-	// Important indicates the template is important and should be listed by default.
+	// Important indicates the template is important.
 	Important bool `json:"important,omitempty" yaml:"important,omitempty"`
+	// Metadata are key/value pairs used to attach additional metadata to a template.
+	Metadata map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
 // ProjectTemplateConfigValue is a config value included in the project template manifest.
@@ -178,6 +187,13 @@ type Project struct {
 
 	// Handle additional keys, albeit in a way that will remove comments and trivia.
 	AdditionalKeys map[string]interface{} `yaml:",inline"`
+
+	// The original byte representation of the file, used to attempt trivia-preserving edits
+	raw []byte
+}
+
+func (proj Project) RawValue() []byte {
+	return proj.raw
 }
 
 func isPrimitiveValue(value interface{}) bool {
@@ -251,7 +267,6 @@ func RewriteShorthandConfigValues(project map[string]interface{}) map[string]int
 	}
 
 	for key, value := range config {
-
 		if isPrimitiveValue(value) || isArray(value) {
 			configTypeDefinition := make(map[string]interface{})
 			if configKeyIsNamespacedByProject(projectName, key) {
@@ -321,7 +336,6 @@ func SimplifyMarshalledProject(raw interface{}) (map[string]interface{}, error) 
 }
 
 func ValidateProject(raw interface{}) error {
-
 	project, err := SimplifyMarshalledProject(raw)
 	if err != nil {
 		return err
@@ -353,7 +367,7 @@ func ValidateProject(raw interface{}) error {
 	appendError = func(err *jsonschema.ValidationError) {
 		if err.InstanceLocation != "" && err.Message != "" {
 			errorf := func(path, message string, args ...interface{}) error {
-				contract.Require(path != "", "path")
+				contract.Requiref(path != "", "path", "path must not be empty")
 				return fmt.Errorf("%s: %s", path, fmt.Sprintf(message, args...))
 			}
 
@@ -380,7 +394,6 @@ func InferFullTypeName(typeName string, itemsType *ProjectConfigItemsType) strin
 // We use this to validate the default config values alongside their type definition but
 // also to validate config values coming from individual stacks.
 func ValidateConfigValue(typeName string, itemsType *ProjectConfigItemsType, value interface{}) bool {
-
 	if typeName == stringTypeName {
 		_, ok := value.(string)
 		return ok
@@ -451,7 +464,7 @@ func (proj *Project) Validate() error {
 	projectName := proj.Name.String()
 	for configKey, configType := range proj.Config {
 		if configType.Default != nil && configType.Value != nil {
-			return errors.Errorf("project config '%v' cannot have both a 'default' and 'value' attribute", configKey)
+			return fmt.Errorf("project config '%v' cannot have both a 'default' and 'value' attribute", configKey)
 		}
 
 		configTypeName := configType.TypeName()
@@ -459,7 +472,7 @@ func (proj *Project) Validate() error {
 		if configKeyIsNamespacedByProject(projectName, configKey) {
 			// namespaced by project
 			if configType.IsExplicitlyTyped() && configType.TypeName() == arrayTypeName && configType.Items == nil {
-				return errors.Errorf("The configuration key '%v' declares an array "+
+				return fmt.Errorf("The configuration key '%v' declares an array "+
 					"but does not specify the underlying type via the 'items' attribute", configKey)
 			}
 
@@ -467,7 +480,7 @@ func (proj *Project) Validate() error {
 			if configType.IsExplicitlyTyped() && configType.Default != nil {
 				if !ValidateConfigValue(configTypeName, configType.Items, configType.Default) {
 					inferredTypeName := InferFullTypeName(configTypeName, configType.Items)
-					return errors.Errorf("The default value specified for configuration key '%v' is not of the expected type '%v'",
+					return fmt.Errorf("The default value specified for configuration key '%v' is not of the expected type '%v'",
 						configKey,
 						inferredTypeName)
 				}
@@ -476,21 +489,21 @@ func (proj *Project) Validate() error {
 		} else {
 			// when not namespaced by project, there shouldn't be a type, only a value
 			if configType.IsExplicitlyTyped() {
-				return errors.Errorf("Configuration key '%v' is not namespaced by the project and should not define a type",
+				return fmt.Errorf("Configuration key '%v' is not namespaced by the project and should not define a type",
 					configKey)
 			}
 
 			// default values are part of a type schema
 			// when not namespaced by project, there is no type schema, only a value
 			if configType.Default != nil {
-				return errors.Errorf("Configuration key '%v' is not namespaced by the project and "+
+				return fmt.Errorf("Configuration key '%v' is not namespaced by the project and "+
 					"should not define a default value. "+
 					"Did you mean to use the 'value' attribute instead of 'default'?", configKey)
 			}
 
 			// when not namespaced by project, there should be a value
 			if configType.Value == nil {
-				return errors.Errorf("Configuration key '%v' is namespaced and must provide an attribute 'value'", configKey)
+				return fmt.Errorf("Configuration key '%v' is namespaced and must provide an attribute 'value'", configKey)
 			}
 		}
 	}
@@ -507,8 +520,8 @@ func (proj *Project) TrustResourceDependencies() bool {
 
 // Save writes a project definition to a file.
 func (proj *Project) Save(path string) error {
-	contract.Require(path != "", "path")
-	contract.Require(proj != nil, "proj")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(proj != nil, "proj", "must not be nil")
 	contract.Requiref(proj.Validate() == nil, "proj", "Validate()")
 	return save(path, proj, false /*mkDirAll*/)
 }
@@ -531,6 +544,13 @@ type PolicyPackProject struct {
 	Website *string `json:"website,omitempty" yaml:"website,omitempty"`
 	// License is the optional license governing this project's usage.
 	License *string `json:"license,omitempty" yaml:"license,omitempty"`
+
+	// The original byte representation of the file, used to attempt trivia-preserving edits
+	raw []byte
+}
+
+func (proj PolicyPackProject) RawValue() []byte {
+	return proj.raw
 }
 
 func (proj *PolicyPackProject) Validate() error {
@@ -543,8 +563,8 @@ func (proj *PolicyPackProject) Validate() error {
 
 // Save writes a project definition to a file.
 func (proj *PolicyPackProject) Save(path string) error {
-	contract.Require(path != "", "path")
-	contract.Require(proj != nil, "proj")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(proj != nil, "proj", "must not be nil")
 	contract.Requiref(proj.Validate() == nil, "proj", "Validate()")
 	return save(path, proj, false /*mkDirAll*/)
 }
@@ -562,6 +582,234 @@ func (proj *PluginProject) Validate() error {
 	return nil
 }
 
+type Environment struct {
+	envs    []string
+	message json.RawMessage
+	node    *yaml.Node
+}
+
+func NewEnvironment(envs []string) *Environment {
+	return &Environment{envs: envs}
+}
+
+func (e *Environment) Definition() []byte {
+	switch {
+	case e == nil:
+		// If there's no environment, return nil.
+		return nil
+	case len(e.envs) != 0:
+		// If the environment was a list of environments, create an anonymous environment and return it.
+		bytes, err := json.Marshal(map[string]any{"imports": e.envs})
+		if err != nil {
+			return nil
+		}
+		return bytes
+	case e.message != nil:
+		// If the environment was encoded as JSON, return the raw JSON.
+		return e.message
+	case e.node != nil:
+		// Re-encode the YAML and return it.
+		bytes, err := yaml.Marshal(e.node)
+		if err != nil {
+			return nil
+		}
+		return bytes
+	default:
+		return nil
+	}
+}
+
+func (e *Environment) Imports() []string {
+	def, diags, err := eval.LoadYAMLBytes("yaml", e.Definition())
+	if err != nil || len(diags) != 0 || def == nil {
+		return nil
+	}
+	names := fx.ToSet(fx.Map(fx.IterSlice(def.Imports.GetElements()), func(imp *ast.ImportDecl) string {
+		return imp.Environment.GetValue()
+	}))
+	if len(def.Values.GetEntries()) != 0 {
+		names.Add("yaml")
+	}
+	return fx.ToSlice(fx.IterSet(names))
+}
+
+func (e *Environment) Append(envs ...string) *Environment {
+	switch {
+	case e == nil:
+		// The stack has no environment block. Create one that imports the named environments.
+		return NewEnvironment(envs)
+	case e.message != nil:
+		// The environment definition is inline JSON. Append the named environments to the import list,
+		// creating the list if necessary.
+		var m map[string]any
+		if err := json.Unmarshal([]byte(e.message), &m); err == nil {
+			imports, _ := m["imports"].([]any)
+			anys := fx.ToSlice(fx.Map(fx.IterSlice(envs), func(e string) any { return e }))
+			m["imports"] = append(imports, anys...)
+			if new, err := json.Marshal(m); err == nil {
+				e.message = json.RawMessage(new)
+			}
+		}
+		return e
+	case e.node != nil:
+		// The environment definition is inline YAML.
+		// - If there is no import list, add one, then append the named envs to the import list
+		// - If there is an import list, append the named envs to the import list
+		root := e.node
+		if root.Kind == yaml.MappingNode {
+			var imports *yaml.Node
+			for i := 0; i < len(root.Content); i += 2 {
+				key := root.Content[i]
+				if key.Kind == yaml.ScalarNode && key.Value == "imports" {
+					imports = root.Content[i+1]
+					break
+				}
+			}
+			if imports == nil {
+				root.Content = append([]*yaml.Node{
+					{
+						Kind:  yaml.ScalarNode,
+						Style: root.Style,
+						Tag:   "!!str",
+						Value: "imports",
+					},
+					{
+						Kind:  yaml.SequenceNode,
+						Style: root.Style,
+					},
+				}, root.Content...)
+				imports = root.Content[1]
+			}
+			if imports.Kind == yaml.SequenceNode {
+				nodes := fx.ToSlice(fx.Map(fx.IterSlice(envs), func(env string) *yaml.Node {
+					return &yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Style: imports.Style,
+						Tag:   "!!str",
+						Value: env,
+					}
+				}))
+				imports.Content = append(imports.Content, nodes...)
+				return e
+			}
+		}
+		return e
+	default:
+		// The environment definition is just a list of environments. Append to the list.
+		e.envs = append(e.envs, envs...)
+		return e
+	}
+}
+
+func (e *Environment) Remove(env string) *Environment {
+	switch {
+	case e == nil:
+		// There is no environment block, so there's nothing to remove.
+		return nil
+	case e.message != nil:
+		// The environment definition is inline JSON. Find the last occurrence of the named environment in the import
+		// list and remove it.
+		var m map[string]any
+		if err := json.Unmarshal([]byte(e.message), &m); err == nil {
+			if imports, ok := m["imports"].([]any); ok {
+				for i := len(imports) - 1; i >= 0; i-- {
+					match := false
+					switch e := imports[i].(type) {
+					case string:
+						match = e == env
+					case map[string]any:
+						match = len(e) == 1 && maps.Keys(e)[0] == env
+					}
+					if match {
+						m["imports"] = append(imports[:i], imports[i+1:]...)
+						if new, err := json.Marshal(m); err == nil {
+							e.message = json.RawMessage(new)
+						}
+						return e
+					}
+				}
+			}
+		}
+		return e
+	case e.node != nil:
+		// The environment definition is inline YAML. Find the last occurrence of the named environment in the import
+		// list and remove it.
+		root := e.node
+		if root.Kind == yaml.MappingNode {
+			for i := 0; i < len(root.Content); i += 2 {
+				key := root.Content[i]
+				if key.Kind == yaml.ScalarNode && key.Value == "imports" {
+					value := root.Content[i+1]
+					if value.Kind == yaml.SequenceNode {
+						for j := len(value.Content) - 1; j >= 0; j-- {
+							n := value.Content[j]
+
+							match := false
+							switch n.Kind {
+							case yaml.ScalarNode:
+								match = n.Value == env
+							case yaml.MappingNode:
+								match = len(n.Content) == 2 && n.Content[0].Value == env
+							}
+							if match {
+								value.Content = append(value.Content[:j], value.Content[j+1:]...)
+								if len(value.Content) == 0 {
+									root.Content = append(root.Content[:i], root.Content[i+2:]...)
+								}
+								return e
+							}
+						}
+					}
+				}
+			}
+		}
+		return e
+	default:
+		// The environment definition is just a list of environments. Find the last occurrence of the named environment
+		// in the list and remove it.
+		for i := len(e.envs) - 1; i >= 0; i-- {
+			n := e.envs[i]
+			if n == env {
+				e.envs = append(e.envs[:i], e.envs[i+1:]...)
+				if len(e.envs) == 0 {
+					return nil
+				}
+				return e
+			}
+		}
+		return e
+	}
+}
+
+func (e Environment) MarshalJSON() ([]byte, error) {
+	if e.message == nil {
+		return json.Marshal(e.envs)
+	}
+	return json.Marshal(e.message)
+}
+
+func (e *Environment) UnmarshalJSON(b []byte) error {
+	if err := json.Unmarshal(b, &e.envs); err == nil {
+		return nil
+	}
+	return json.Unmarshal(b, &e.message)
+}
+
+func (e Environment) MarshalYAML() (any, error) {
+	if e.node == nil {
+		return e.envs, nil
+	}
+	return e.node, nil
+}
+
+func (e *Environment) UnmarshalYAML(n *yaml.Node) error {
+	if err := n.Decode(&e.envs); err == nil {
+		return nil
+	}
+	e.node = n
+	return nil
+}
+
 // ProjectStack holds stack specific information about a project.
 type ProjectStack struct {
 	// SecretsProvider is this stack's secrets provider.
@@ -574,12 +822,25 @@ type ProjectStack struct {
 	EncryptionSalt string `json:"encryptionsalt,omitempty" yaml:"encryptionsalt,omitempty"`
 	// Config is an optional config bag.
 	Config config.Map `json:"config,omitempty" yaml:"config,omitempty"`
+	// Environment is an optional environment definition or list of environments.
+	Environment *Environment `json:"environment,omitempty" yaml:"environment,omitempty"`
+
+	// The original byte representation of the file, used to attempt trivia-preserving edits
+	raw []byte
+}
+
+func (ps ProjectStack) EnvironmentBytes() []byte {
+	return ps.Environment.Definition()
+}
+
+func (ps ProjectStack) RawValue() []byte {
+	return ps.raw
 }
 
 // Save writes a project definition to a file.
 func (ps *ProjectStack) Save(path string) error {
-	contract.Require(path != "", "path")
-	contract.Require(ps != nil, "ps")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(ps != nil, "ps", "must not be nil")
 	return save(path, ps, true /*mkDirAll*/)
 }
 
@@ -674,15 +935,15 @@ func marshallerForPath(path string) (encoding.Marshaler, error) {
 	ext := filepath.Ext(path)
 	m, has := encoding.Marshalers[ext]
 	if !has {
-		return nil, errors.Errorf("no marshaler found for file format '%v'", ext)
+		return nil, fmt.Errorf("no marshaler found for file format '%v'", ext)
 	}
 
 	return m, nil
 }
 
 func save(path string, value interface{}, mkDirAll bool) error {
-	contract.Require(path != "", "path")
-	contract.Require(value != nil, "value")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(value != nil, "value", "must not be nil")
 
 	m, err := marshallerForPath(path)
 	if err != nil {
@@ -695,11 +956,11 @@ func save(path string, value interface{}, mkDirAll bool) error {
 	}
 
 	if mkDirAll {
-		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
 	}
 
-	//nolint: gosec
-	return os.WriteFile(path, b, 0644)
+	//nolint:gosec
+	return os.WriteFile(path, b, 0o644)
 }

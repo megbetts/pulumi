@@ -33,6 +33,7 @@ from ._workspace import Workspace, PulumiFn, Deployment
 from ..runtime.settings import _GRPC_CHANNEL_OPTIONS
 from ..runtime.proto import language_pb2_grpc
 from ._representable import _Representable
+from ._tag import TagMap
 
 _DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -227,7 +228,7 @@ class Stack:
     ) -> UpResult:
         """
         Creates or updates the resources in a stack by executing the program in the Workspace.
-        https://www.pulumi.com/docs/reference/cli/pulumi_up/
+        https://www.pulumi.com/docs/cli/commands/pulumi_up/
 
         :param parallel: Parallel is the number of resource operations to run in parallel at once.
                          (1 for no parallelism). Defaults to unbounded (2147483647).
@@ -345,7 +346,7 @@ class Stack:
     ) -> PreviewResult:
         """
         Performs a dry-run update to a stack, returning pending changes.
-        https://www.pulumi.com/docs/reference/cli/pulumi_preview/
+        https://www.pulumi.com/docs/cli/commands/pulumi_preview/
 
         :param parallel: Parallel is the number of resource operations to run in parallel at once.
                          (1 for no parallelism). Defaults to unbounded (2147483647).
@@ -579,14 +580,15 @@ class Stack:
             stdout=destroy_result.stdout, stderr=destroy_result.stderr, summary=summary
         )
 
-    def get_config(self, key: str) -> ConfigValue:
+    def get_config(self, key: str, *, path: bool = False) -> ConfigValue:
         """
         Returns the config value associated with the specified key.
 
         :param key: The key for the config item to get.
+        :param path: The key contains a path to a property in a map or list to get.
         :returns: ConfigValue
         """
-        return self.workspace.get_config(self.name, key)
+        return self.workspace.get_config(self.name, key, path=path)
 
     def get_all_config(self) -> ConfigMap:
         """
@@ -596,42 +598,82 @@ class Stack:
         """
         return self.workspace.get_all_config(self.name)
 
-    def set_config(self, key: str, value: ConfigValue) -> None:
+    def set_config(self, key: str, value: ConfigValue, *, path: bool = False) -> None:
         """
         Sets a config key-value pair on the Stack in the associated Workspace.
 
         :param key: The config key to add.
         :param value: The config value to add.
+        :param path: The key contains a path to a property in a map or list to set.
         """
-        self.workspace.set_config(self.name, key, value)
+        self.workspace.set_config(self.name, key, value, path=path)
 
-    def set_all_config(self, config: ConfigMap) -> None:
+    def set_all_config(self, config: ConfigMap, *, path: bool = False) -> None:
         """
         Sets all specified config values on the stack in the associated Workspace.
 
         :param config: A mapping of key to ConfigValue to set to config.
+        :param path: The keys contain a path to a property in a map or list to set.
         """
-        self.workspace.set_all_config(self.name, config)
+        self.workspace.set_all_config(self.name, config, path=path)
 
-    def remove_config(self, key: str) -> None:
+    def remove_config(self, key: str, *, path: bool = False) -> None:
         """
         Removes the specified config key from the Stack in the associated Workspace.
 
         :param key: The key to remove from config.
+        :param path: The key contains a path to a property in a map or list to remove.
         """
-        self.workspace.remove_config(self.name, key)
+        self.workspace.remove_config(self.name, key, path=path)
 
-    def remove_all_config(self, keys: List[str]) -> None:
+    def remove_all_config(self, keys: List[str], *, path: bool = False) -> None:
         """
         Removes the specified config keys from the Stack in the associated Workspace.
 
         :param keys: The keys to remove from config.
+        :param path: The keys contain a path to a property in a map or list to remove.
         """
-        self.workspace.remove_all_config(self.name, keys)
+        self.workspace.remove_all_config(self.name, keys, path=path)
 
     def refresh_config(self) -> None:
         """Gets and sets the config map used with the last update."""
         self.workspace.refresh_config(self.name)
+
+    def get_tag(self, key: str) -> str:
+        """
+        Returns the tag value associated with specified key.
+
+        :param key: The key to use for the tag lookup.
+        :returns: str
+        """
+        return self.workspace.get_tag(self.name, key)
+
+    def set_tag(self, key: str, value: str) -> None:
+        """
+        Sets a tag key-value pair on the Stack in the associated Workspace.
+
+        :param key: The tag key to set.
+        :param value: The tag value to set.
+        """
+        self.workspace.set_tag(self.name, key, value)
+
+    def remove_tag(self, key: str) -> None:
+        """
+        Removes the specified key-value pair on the provided stack name.
+
+        :param stack_name: The name of the stack.
+        :param key: The tag key to remove.
+        """
+        self.workspace.remove_tag(self.name, key)
+
+    def list_tags(self) -> TagMap:
+        """
+        Returns the tag map for the specified tag name, scoped to the Workspace.
+
+        :param stack_name: The name of the stack.
+        :returns: TagMap
+        """
+        return self.workspace.list_tags(self.name)
 
     def outputs(self) -> OutputMap:
         """
@@ -773,21 +815,21 @@ class Stack:
 def _parse_extra_args(**kwargs) -> List[str]:
     extra_args: List[str] = []
 
-    message = kwargs.get("message")
-    expect_no_changes = kwargs.get("expect_no_changes")
-    diff = kwargs.get("diff")
-    replace = kwargs.get("replace")
-    target = kwargs.get("target")
-    policy_packs = kwargs.get("policy_packs")
-    policy_pack_configs = kwargs.get("policy_pack_configs")
-    target_dependents = kwargs.get("target_dependents")
-    parallel = kwargs.get("parallel")
-    color = kwargs.get("color")
-    log_flow = kwargs.get("log_flow")
-    log_verbosity = kwargs.get("log_verbosity")
-    log_to_std_err = kwargs.get("log_to_std_err")
-    tracing = kwargs.get("tracing")
-    debug = kwargs.get("debug")
+    message: Optional[str] = kwargs.get("message")
+    expect_no_changes: Optional[bool] = kwargs.get("expect_no_changes")
+    diff: Optional[bool] = kwargs.get("diff")
+    replace: Optional[List[str]] = kwargs.get("replace")
+    target: Optional[List[str]] = kwargs.get("target")
+    policy_packs: Optional[List[str]] = kwargs.get("policy_packs")
+    policy_pack_configs: Optional[List[str]] = kwargs.get("policy_pack_configs")
+    target_dependents: Optional[bool] = kwargs.get("target_dependents")
+    parallel: Optional[int] = kwargs.get("parallel")
+    color: Optional[str] = kwargs.get("color")
+    log_flow: Optional[bool] = kwargs.get("log_flow")
+    log_verbosity: Optional[int] = kwargs.get("log_verbosity")
+    log_to_std_err: Optional[bool] = kwargs.get("log_to_std_err")
+    tracing: Optional[str] = kwargs.get("tracing")
+    debug: Optional[bool] = kwargs.get("debug")
 
     if message:
         extra_args.extend(["--message", message])
@@ -816,7 +858,7 @@ def _parse_extra_args(**kwargs) -> List[str]:
     if log_flow:
         extra_args.extend(["--logflow"])
     if log_verbosity:
-        extra_args.extend(["--verbose", log_verbosity])
+        extra_args.extend(["--verbose", str(log_verbosity)])
     if log_to_std_err:
         extra_args.extend(["--logtostderr"])
     if tracing:

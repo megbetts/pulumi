@@ -32,11 +32,14 @@ download_release() {
 }
 
 # shellcheck disable=SC2043
-for i in "github.com/pulumi/pulumi-java java" "github.com/pulumi/pulumi-yaml yaml"; do
+for i in "github.com/pulumi/pulumi-java java" "github.com/pulumi/pulumi-yaml yaml" "github.com/pulumi/pulumi-dotnet dotnet v3.59.0"; do
   set -- $i # treat strings in loop as args
   REPO="$1"
   PULUMI_LANG="$2"
-  TAG=$(get_version "${REPO}")
+  TAG="$3" # only dotnet sets this because we don't currently have a go dependency on dotnet (and quite possibly never will)
+  if [ -z "$TAG" ]; then
+    TAG=$(get_version "${REPO}")
+  fi
 
   LANG_DIST="$(pwd)/bin"
   mkdir -p "${LANG_DIST}"
@@ -73,16 +76,9 @@ for i in "github.com/pulumi/pulumi-java java" "github.com/pulumi/pulumi-yaml yam
         OUTDIR="${LANG_DIST}/$DIST_OS-$RENAMED_ARCH"
 
         mkdir -p "${OUTDIR}"
-        case "${PULUMI_LANG}-${DIST_OS}" in
-          java-windows)
-            download_release "${PULUMI_LANG}" "${TAG}" "${ARCHIVE}.zip"
-            unzip -o "${ARCHIVE}.zip" "pulumi-language-${PULUMI_LANG}${DIST_EXT}" -d "${OUTDIR}"
-            ;;
-          *)
-            download_release "${PULUMI_LANG}" "${TAG}" "${ARCHIVE}.tar.gz"
-            tar -xzvf "${ARCHIVE}.tar.gz" -C "${OUTDIR}" "pulumi-language-${PULUMI_LANG}${DIST_EXT}"
-            ;;
-        esac
+
+        download_release "${PULUMI_LANG}" "${TAG}" "${ARCHIVE}.tar.gz"
+        tar -xzvf "${ARCHIVE}.tar.gz" -C "${OUTDIR}" "pulumi-language-${PULUMI_LANG}${DIST_EXT}"
       done
     done
   )

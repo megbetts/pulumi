@@ -33,7 +33,6 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
@@ -56,10 +55,8 @@ type Options struct {
 	Parallel                  int        // the degree of parallelism for resource operations (<=1 for serial).
 	Refresh                   bool       // whether or not to refresh before executing the deployment.
 	RefreshOnly               bool       // whether or not to exit after refreshing.
-	RefreshTargets            UrnTargets // The specific resources to refresh during a refresh op.
-	ReplaceTargets            UrnTargets // Specific resources to replace.
-	DestroyTargets            UrnTargets // Specific resources to destroy.
-	UpdateTargets             UrnTargets // Specific resources to update.
+	Targets                   UrnTargets // If specified, only operate on specified resources.
+	ReplaceTargets            UrnTargets // If specified, mark the specified resources for replacement.
 	TargetDependents          bool       // true if we're allowing things to proceed, even with unspecified targets
 	TrustDependencies         bool       // whether or not to trust the resource dependency graph.
 	UseLegacyDiff             bool       // whether or not to use legacy diffing behavior.
@@ -114,6 +111,19 @@ func NewUrnTargets(urnOrGlobs []string) UrnTargets {
 // Create a new set of targets from fully resolved URNs.
 func NewUrnTargetsFromUrns(urns []resource.URN) UrnTargets {
 	return UrnTargets{urns, nil}
+}
+
+// Return a copy of the UrnTargets
+func (t UrnTargets) Clone() UrnTargets {
+	newLiterals := append(make([]resource.URN, 0, len(t.literals)), t.literals...)
+	newGlobs := make(map[string]*regexp.Regexp, len(t.globs))
+	for k, v := range t.globs {
+		newGlobs[k] = v
+	}
+	return UrnTargets{
+		literals: newLiterals,
+		globs:    newGlobs,
+	}
 }
 
 // Return if the target set constrains the set of acceptable URNs.
@@ -188,6 +198,7 @@ type StepExecutorEvents interface {
 // PolicyEvents is an interface that can be used to hook policy events.
 type PolicyEvents interface {
 	OnPolicyViolation(resource.URN, plugin.AnalyzeDiagnostic)
+	OnPolicyRemediation(resource.URN, plugin.Remediation, resource.PropertyMap, resource.PropertyMap)
 }
 
 // Events is an interface that can be used to hook interesting engine events.
@@ -328,6 +339,7 @@ func addDefaultProviders(target *Target, source Source, prev *Snapshot) error {
 			if pkgInfo, ok := defaultProviderInfo[pkg]; ok {
 				providers.SetProviderVersion(inputs, pkgInfo.Version)
 				providers.SetProviderURL(inputs, pkgInfo.PluginDownloadURL)
+				providers.SetProviderChecksums(inputs, pkgInfo.Checksums)
 			}
 
 			uuid, err := uuid.NewV4()
@@ -337,7 +349,8 @@ func addDefaultProviders(target *Target, source Source, prev *Snapshot) error {
 
 			urn, id := defaultProviderURN(target, source, pkg), resource.ID(uuid.String())
 			ref, err = providers.NewReference(urn, id)
-			contract.Assert(err == nil)
+			contract.Assertf(err == nil,
+				"could not create provider reference with URN %v and ID %v", urn, id)
 
 			provider := &resource.State{
 				Type:    urn.Type(),
@@ -422,11 +435,11 @@ func buildResourceMap(prev *Snapshot, preview bool) ([]*resource.State, map[reso
 // Note that a deployment uses internal concurrency and parallelism in various ways, so it must be closed if for some
 // reason it isn't carried out to its final conclusion. This will result in cancellation and reclamation of resources.
 func NewDeployment(ctx *plugin.Context, target *Target, prev *Snapshot, plan *Plan, source Source,
-	localPolicyPackPaths []string, preview bool, backendClient BackendClient) (*Deployment, error) {
-
-	contract.Assert(ctx != nil)
-	contract.Assert(target != nil)
-	contract.Assert(source != nil)
+	localPolicyPackPaths []string, preview bool, backendClient BackendClient,
+) (*Deployment, error) {
+	contract.Requiref(ctx != nil, "ctx", "must not be nil")
+	contract.Requiref(target != nil, "target", "must not be nil")
+	contract.Requiref(source != nil, "source", "must not be nil")
 
 	if err := migrateProviders(target, prev, source); err != nil {
 		return nil, err
@@ -456,10 +469,7 @@ func NewDeployment(ctx *plugin.Context, target *Target, prev *Snapshot, plan *Pl
 	// Create a new provider registry. Although we really only need to pass in any providers that were present in the
 	// old resource list, the registry itself will filter out other sorts of resources when processing the prior state,
 	// so we just pass all of the old resources.
-	reg, err := providers.NewRegistry(ctx.Host, oldResources, preview, builtins)
-	if err != nil {
-		return nil, err
-	}
+	reg := providers.NewRegistry(ctx.Host, preview, builtins)
 
 	return &Deployment{
 		ctx:                  ctx,
@@ -485,8 +495,42 @@ func (d *Deployment) Prev() *Snapshot                        { return d.prev }
 func (d *Deployment) Olds() map[resource.URN]*resource.State { return d.olds }
 func (d *Deployment) Source() Source                         { return d.source }
 
-func (d *Deployment) SameProvider(ref providers.Reference) {
-	d.providers.Same(ref)
+func (d *Deployment) SameProvider(res *resource.State) error {
+	return d.providers.Same(res)
+}
+
+// EnsureProvider ensures that the provider for the given resource is available in the registry. It assumes
+// the provider is available in the previous snapshot.
+func (d *Deployment) EnsureProvider(provider string) error {
+	if provider == "" {
+		return nil
+	}
+
+	providerRef, err := providers.ParseReference(provider)
+	if err != nil {
+		return fmt.Errorf("invalid provider reference %v: %w", provider, err)
+	}
+	_, has := d.GetProvider(providerRef)
+	if !has {
+		// We need to create the provider in the registry, find its old state and just "Same" it.
+		var providerResource *resource.State
+		for _, r := range d.prev.Resources {
+			if r.URN == providerRef.URN() && r.ID == providerRef.ID() {
+				providerResource = r
+				break
+			}
+		}
+		if providerResource == nil {
+			return fmt.Errorf("could not find provider %v", providerRef)
+		}
+
+		err := d.SameProvider(providerResource)
+		if err != nil {
+			return fmt.Errorf("could not create provider %v: %w", providerRef, err)
+		}
+	}
+
+	return nil
 }
 
 func (d *Deployment) GetProvider(ref providers.Reference) (plugin.Provider, bool) {
@@ -495,7 +539,7 @@ func (d *Deployment) GetProvider(ref providers.Reference) (plugin.Provider, bool
 
 // generateURN generates a resource's URN from its parent, type, and name under the scope of the deployment's stack and
 // project.
-func (d *Deployment) generateURN(parent resource.URN, ty tokens.Type, name tokens.QName) resource.URN {
+func (d *Deployment) generateURN(parent resource.URN, ty tokens.Type, name string) resource.URN {
 	// Use the resource goal state name to produce a globally unique URN.
 	parentType := tokens.Type("")
 	if parent != "" && parent.Type() != resource.RootStackType {
@@ -513,7 +557,7 @@ func defaultProviderURN(target *Target, source Source, pkg tokens.Package) resou
 
 // generateEventURN generates a URN for the resource associated with the given event.
 func (d *Deployment) generateEventURN(event SourceEvent) resource.URN {
-	contract.Require(event != nil, "event != nil")
+	contract.Requiref(event != nil, "event", "must not be nil")
 
 	switch e := event.(type) {
 	case RegisterResourceEvent:
@@ -529,7 +573,7 @@ func (d *Deployment) generateEventURN(event SourceEvent) resource.URN {
 }
 
 // Execute executes a deployment to completion, using the given cancellation context and running a preview or update.
-func (d *Deployment) Execute(ctx context.Context, opts Options, preview bool) (*Plan, result.Result) {
+func (d *Deployment) Execute(ctx context.Context, opts Options, preview bool) (*Plan, error) {
 	deploymentExec := &deploymentExecutor{deployment: d}
 	return deploymentExec.Execute(ctx, opts, preview)
 }

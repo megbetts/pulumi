@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
@@ -195,7 +196,7 @@ func (x hclExpression) Variables() []hcl.Traversal {
 		}
 		return n, nil
 	})
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 	return variables
 }
 
@@ -344,6 +345,9 @@ type BinaryOpExpression struct {
 
 // SyntaxNode returns the syntax node associated with the binary operation.
 func (x *BinaryOpExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -385,7 +389,8 @@ func (x *BinaryOpExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 
 	// Compute the signature for the operator and typecheck the arguments.
 	signature := getOperationSignature(x.Operation)
-	contract.Assert(len(signature.Parameters) == 2)
+	contract.Assertf(len(signature.Parameters) == 2,
+		"expected binary operator signature to have two parameters, got %v", len(signature.Parameters))
 
 	x.leftType = signature.Parameters[0].Type
 	x.rightType = signature.Parameters[1].Type
@@ -468,6 +473,9 @@ type ConditionalExpression struct {
 
 // SyntaxNode returns the syntax node associated with the conditional expression.
 func (x *ConditionalExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -718,11 +726,19 @@ type ForExpression struct {
 	// True if the value expression is being grouped.
 	Group bool
 
+	// Whether the collection type should be strictly type-checked
+	// When true, unsupported collection types will result in an error
+	// otherwise a warning will be emitted
+	StrictCollectionTypechecking bool
+
 	exprType Type
 }
 
 // SyntaxNode returns the syntax node associated with the for expression.
 func (x *ForExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -750,10 +766,7 @@ func (x *ForExpression) typecheck(typecheckCollection, typecheckOperands bool) h
 	}
 
 	if typecheckCollection {
-		// Poke through any eventual and optional types that may wrap the collection type.
-		collectionType := unwrapIterableSourceType(x.Collection.Type())
-
-		keyType, valueType, kvDiags := GetCollectionTypes(collectionType, rng)
+		keyType, valueType, kvDiags := GetCollectionTypes(x.Collection.Type(), rng, x.StrictCollectionTypechecking)
 		diagnostics = append(diagnostics, kvDiags...)
 
 		if x.KeyVariable != nil {
@@ -1002,6 +1015,9 @@ type FunctionCallExpression struct {
 
 // SyntaxNode returns the syntax node associated with the function call expression.
 func (x *FunctionCallExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -1136,6 +1152,10 @@ type IndexExpression struct {
 	Collection Expression
 	// The index key.
 	Key Expression
+	// Whether the collection type should be strictly type-checked
+	// When true, unsupported collection types will result in an error
+	// otherwise a warning will be emitted
+	StrictCollectionTypechecking bool
 
 	keyType  Type
 	exprType Type
@@ -1143,6 +1163,9 @@ type IndexExpression struct {
 
 // SyntaxNode returns the syntax node associated with the index expression.
 func (x *IndexExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -1177,8 +1200,7 @@ func (x *IndexExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 		rng = x.Syntax.Collection.Range()
 	}
 
-	collectionType := unwrapIterableSourceType(x.Collection.Type())
-	keyType, valueType, kvDiags := GetCollectionTypes(collectionType, rng)
+	keyType, valueType, kvDiags := GetCollectionTypes(x.Collection.Type(), rng, x.StrictCollectionTypechecking)
 	diagnostics = append(diagnostics, kvDiags...)
 	x.keyType = keyType
 
@@ -1281,14 +1303,39 @@ func literalText(value cty.Value, rawBytes []byte, escaped, quoted bool) string 
 		if !escaped {
 			return value.AsString()
 		}
-		s := strconv.Quote(value.AsString())
-		if !quoted {
-			return s[1 : len(s)-1]
+		s := escapeString(value.AsString())
+		if quoted {
+			return fmt.Sprintf(`"%s"`, s)
 		}
 		return s
 	default:
 		panic(fmt.Errorf("unexpected literal type %v", value.Type().FriendlyName()))
 	}
+}
+
+func escapeString(s string) string {
+	// escape special characters
+	s = strconv.Quote(s)
+	s = s[1 : len(s)-1] // Remove surrounding double quote (`"`)
+
+	// Escape `${`
+	runes := []rune(s)
+	out := slice.Prealloc[rune](len(runes))
+	for i, r := range runes {
+		next := func() rune {
+			if i >= len(runes)-1 {
+				return 0
+			}
+			return runes[i+1]
+		}
+		if r == '$' && next() == '{' {
+			out = append(out, '$')
+		} else if r == '%' && next() == '{' {
+			out = append(out, '%')
+		}
+		out = append(out, r)
+	}
+	return string(out)
 }
 
 // LiteralValueExpression represents a semantically-analyzed literal value expression.
@@ -1306,6 +1353,9 @@ type LiteralValueExpression struct {
 
 // SyntaxNode returns the syntax node associated with the literal value expression.
 func (x *LiteralValueExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -1443,6 +1493,9 @@ type ObjectConsExpression struct {
 
 // SyntaxNode returns the syntax node associated with the object construction expression.
 func (x *ObjectConsExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -1463,7 +1516,7 @@ func (x *ObjectConsExpression) WithType(updateType func(Type) *ObjectConsExpress
 func (x *ObjectConsExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 	var diagnostics hcl.Diagnostics
 
-	var keys []Expression
+	keys := slice.Prealloc[Expression](len(x.Items))
 	for _, item := range x.Items {
 		if typecheckOperands {
 			keyDiags := item.Key.Typecheck(true)
@@ -1721,6 +1774,9 @@ type RelativeTraversalExpression struct {
 
 // SyntaxNode returns the syntax node associated with the relative traversal expression.
 func (x *RelativeTraversalExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -1847,6 +1903,9 @@ type ScopeTraversalExpression struct {
 
 // SyntaxNode returns the syntax node associated with the scope traversal expression.
 func (x *ScopeTraversalExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -1989,6 +2048,9 @@ type SplatExpression struct {
 
 // SyntaxNode returns the syntax node associated with the splat expression.
 func (x *SplatExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -2092,8 +2154,8 @@ func (x *SplatExpression) GetTrailingTrivia() syntax.TriviaList {
 	if parens := x.Tokens.GetParentheses(); parens.Any() {
 		return parens.GetTrailingTrivia()
 	}
-	if close := x.Tokens.GetClose(); close != nil {
-		return close.TrailingTrivia
+	if closeTok := x.Tokens.GetClose(); closeTok != nil {
+		return closeTok.TrailingTrivia
 	}
 	return x.Tokens.GetStar().TrailingTrivia
 }
@@ -2144,6 +2206,9 @@ type TemplateExpression struct {
 
 // SyntaxNode returns the syntax node associated with the template expression.
 func (x *TemplateExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -2249,6 +2314,9 @@ type TemplateJoinExpression struct {
 
 // SyntaxNode returns the syntax node associated with the template join expression.
 func (x *TemplateJoinExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -2330,6 +2398,9 @@ type TupleConsExpression struct {
 
 // SyntaxNode returns the syntax node associated with the tuple construction expression.
 func (x *TupleConsExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -2464,6 +2535,9 @@ type UnaryOpExpression struct {
 
 // SyntaxNode returns the syntax node associated with the unary operation.
 func (x *UnaryOpExpression) SyntaxNode() hclsyntax.Node {
+	if x.Syntax == nil {
+		return syntax.None
+	}
 	return x.Syntax
 }
 
@@ -2492,7 +2566,8 @@ func (x *UnaryOpExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 
 	// Compute the signature for the operator and typecheck the arguments.
 	signature := getOperationSignature(x.Operation)
-	contract.Assert(len(signature.Parameters) == 1)
+	contract.Assertf(len(signature.Parameters) == 1,
+		"expected unary operator signature to have 1 parameter, got %d", len(signature.Parameters))
 
 	x.operandType = signature.Parameters[0].Type
 

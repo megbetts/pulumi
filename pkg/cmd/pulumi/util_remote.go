@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/httpstate"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
 // This is a variable instead of a constant so it can be set in certain builds of the CLI that do not
@@ -65,6 +66,7 @@ func validateUnsupportedRemoteFlags(
 	policyPackConfigPaths []string,
 	refresh string,
 	showConfig bool,
+	showPolicyRemediations bool,
 	showReplacementSteps bool,
 	showSames bool,
 	showReads bool,
@@ -77,7 +79,6 @@ func validateUnsupportedRemoteFlags(
 	planFilePath string,
 	stackConfigFile string,
 ) error {
-
 	if expectNop {
 		return errors.New("--expect-no-changes is not supported with --remote")
 	}
@@ -105,6 +106,9 @@ func validateUnsupportedRemoteFlags(
 	}
 	if showConfig {
 		return errors.New("--show-config is not supported with --remote")
+	}
+	if showPolicyRemediations {
+		return errors.New("--show-policy-remediations is not supported with --remote")
 	}
 	if showReplacementSteps {
 		return errors.New("--show-replacement-steps is not supported with --remote")
@@ -152,6 +156,7 @@ type RemoteArgs struct {
 	envVars                  []string
 	secretEnvVars            []string
 	preRunCommands           []string
+	skipInstallDependencies  bool
 	gitBranch                string
 	gitCommit                string
 	gitRepoDir               string
@@ -182,6 +187,9 @@ func (r *RemoteArgs) applyFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringArrayVar(
 		&r.preRunCommands, "remote-pre-run-command", []string{},
 		"[EXPERIMENTAL] Commands to run before the remote operation")
+	cmd.PersistentFlags().BoolVar(
+		&r.skipInstallDependencies, "remote-skip-install-dependencies", false,
+		"[EXPERIMENTAL] Whether to skip the default dependency installation step")
 	cmd.PersistentFlags().StringVar(
 		&r.gitBranch, "remote-git-branch", "",
 		"[EXPERIMENTAL] Git branch to deploy; this is mutually exclusive with --remote-git-branch; "+
@@ -213,8 +221,8 @@ func (r *RemoteArgs) applyFlags(cmd *cobra.Command) {
 
 // runDeployment kicks off a remote deployment.
 func runDeployment(ctx context.Context, opts display.Options, operation apitype.PulumiOperation, stack, url string,
-	args RemoteArgs) result.Result {
-
+	args RemoteArgs,
+) result.Result {
 	// Validate args.
 	if url == "" {
 		return result.FromError(errors.New("the url arg must be specified"))
@@ -254,7 +262,13 @@ func runDeployment(ctx context.Context, opts display.Options, operation apitype.
 		sshPrivateKey = string(key)
 	}
 
-	b, err := currentBackend(ctx, opts)
+	// Try to read the current project
+	project, _, err := readProject()
+	if err != nil && !errors.Is(err, workspace.ErrProjectNotFound) {
+		return result.FromError(err)
+	}
+
+	b, err := currentBackend(ctx, project, opts)
 	if err != nil {
 		return result.FromError(err)
 	}
@@ -262,8 +276,8 @@ func runDeployment(ctx context.Context, opts display.Options, operation apitype.
 	// Ensure the cloud backend is being used.
 	cb, isCloud := b.(httpstate.Backend)
 	if !isCloud {
-		return result.FromError(errors.New("the Pulumi service backend must be used for remote operations; " +
-			"use `pulumi login` without arguments to log into the Pulumi service backend"))
+		return result.FromError(errors.New("the Pulumi Cloud backend must be used for remote operations; " +
+			"use `pulumi login` without arguments to log into the Pulumi Cloud backend"))
 	}
 
 	stackRef, err := b.ParseStackReference(stack)
@@ -298,11 +312,19 @@ func runDeployment(ctx context.Context, opts display.Options, operation apitype.
 		}
 	}
 
+	var operationOptions *apitype.OperationContextOptions
+	if args.skipInstallDependencies {
+		operationOptions = &apitype.OperationContextOptions{
+			SkipInstallDependencies: args.skipInstallDependencies,
+		}
+	}
+
 	req := apitype.CreateDeploymentRequest{
 		Source: &apitype.SourceContext{
 			Git: &apitype.SourceContextGit{
 				RepoURL: url,
 				Branch:  args.gitBranch,
+				Commit:  args.gitCommit,
 				RepoDir: args.gitRepoDir,
 				GitAuth: gitAuth,
 			},
@@ -311,6 +333,7 @@ func runDeployment(ctx context.Context, opts display.Options, operation apitype.
 			Operation:            operation,
 			PreRunCommands:       args.preRunCommands,
 			EnvironmentVariables: env,
+			Options:              operationOptions,
 		},
 	}
 	err = cb.RunDeployment(ctx, stackRef, req, opts)

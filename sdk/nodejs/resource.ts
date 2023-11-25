@@ -13,23 +13,36 @@
 // limitations under the License.
 
 import { ResourceError } from "./errors";
+import * as log from "./log";
 import { Input, Inputs, interpolate, Output, output } from "./output";
-import { getResource, readResource, registerResource, registerResourceOutputs } from "./runtime/resource";
+import {
+    getResource,
+    pkgFromType,
+    readResource,
+    registerResource,
+    registerResourceOutputs,
+    SourcePosition,
+} from "./runtime/resource";
+import { unknownValue } from "./runtime/rpc";
 import { getProject, getStack } from "./runtime/settings";
 import { getStackResource } from "./runtime/state";
-import * as stacklib from "./runtime/stack";
-import { unknownValue } from "./runtime/rpc";
 import * as utils from "./utils";
-import * as log from "./log";
+import * as url from "url";
 
-export type ID = string;  // a provider-assigned ID.
+export type ID = string; // a provider-assigned ID.
 export type URN = string; // an automatically generated logical URN, used to stably identify resources.
 
 /**
  * createUrn computes a URN from the combination of a resource name, resource type, optional parent,
  * optional project and optional stack.
  */
-export function createUrn(name: Input<string>, type: Input<string>, parent?: Resource | Input<URN>, project?: string, stack?: string): Output<string> {
+export function createUrn(
+    name: Input<string>,
+    type: Input<string>,
+    parent?: Resource | Input<URN>,
+    project?: string,
+    stack?: string,
+): Output<string> {
     let parentPrefix: Output<string>;
     if (parent) {
         let parentUrn: Output<string>;
@@ -38,7 +51,7 @@ export function createUrn(name: Input<string>, type: Input<string>, parent?: Res
         } else {
             parentUrn = output(parent);
         }
-        parentPrefix = parentUrn.apply(parentUrnString =>  {
+        parentPrefix = parentUrn.apply((parentUrnString) => {
             const prefix = parentUrnString.substring(0, parentUrnString.lastIndexOf("::")) + "$";
             if (prefix.endsWith("::pulumi:pulumi:Stack$")) {
                 // Don't prefix the stack type as a parent type
@@ -55,7 +68,12 @@ export function createUrn(name: Input<string>, type: Input<string>, parent?: Res
 // inheritedChildAlias computes the alias that should be applied to a child based on an alias applied to it's parent.
 // This may involve changing the name of the resource in cases where the resource has a named derived from the name of
 // the parent, and the parent name changed.
-function inheritedChildAlias(childName: string, parentName: string, parentAlias: Input<string>, childType: string): Output<string> {
+function inheritedChildAlias(
+    childName: string,
+    parentName: string,
+    parentAlias: Input<string>,
+    childType: string,
+): Output<string> {
     // If the child name has the parent name as a prefix, then we make the assumption that it was
     // constructed from the convention of using `{name}-details` as the name of the child resource.  To
     // ensure this is aliased correctly, we must then also replace the parent aliases name in the prefix of
@@ -70,7 +88,7 @@ function inheritedChildAlias(childName: string, parentName: string, parentAlias:
     // * childAlias: "urn:pulumi:stackname::projectname::aws:s3/bucket:Bucket::app-function"
     let aliasName = output(childName);
     if (childName.startsWith(parentName)) {
-        aliasName = output(parentAlias).apply(parentAliasUrn => {
+        aliasName = output(parentAlias).apply((parentAliasUrn) => {
             const parentAliasName = parentAliasUrn.substring(parentAliasUrn.lastIndexOf("::") + 2);
             return parentAliasName + childName.substring(parentName.length);
         });
@@ -84,27 +102,35 @@ function urnTypeAndName(urn: URN) {
     const typeParts = parts[2].split("$");
     return {
         name: parts[3],
-        type: typeParts[typeParts.length-1],
+        type: typeParts[typeParts.length - 1],
     };
 }
 
 // Make a copy of the aliases array, and add to it any implicit aliases inherited from its parent.
 // If there are N child aliases, and M parent aliases, there will be (M+1)*(N+1)-1 total aliases,
 // or, as calculated in the logic below, N+(M*(1+N)).
-export function allAliases(childAliases: Input<URN | Alias>[], childName: string, childType: string, parent: Resource, parentName: string): Output<URN>[] {
+export function allAliases(
+    childAliases: Input<URN | Alias>[],
+    childName: string,
+    childType: string,
+    parent: Resource,
+    parentName: string,
+): Output<URN>[] {
     const aliases: Output<URN>[] = [];
     for (const childAlias of childAliases) {
         aliases.push(collapseAliasToUrn(childAlias, childName, childType, parent));
     }
-    for (const parentAlias of (parent.__aliases || [])) {
+    for (const parentAlias of parent.__aliases || []) {
         // For each parent alias, add an alias that uses that base child name and the parent alias
         aliases.push(inheritedChildAlias(childName, parentName, parentAlias, childType));
         // Also add an alias for each child alias and the parent alias
         for (const childAlias of childAliases) {
-            const inheritedAlias = collapseAliasToUrn(childAlias, childName, childType, parent).apply(childAliasURN => {
-                const {name: aliasedChildName, type: aliasedChildType} = urnTypeAndName(childAliasURN);
-                return inheritedChildAlias(aliasedChildName, parentName, parentAlias, aliasedChildType);
-            });
+            const inheritedAlias = collapseAliasToUrn(childAlias, childName, childType, parent).apply(
+                (childAliasURN) => {
+                    const { name: aliasedChildName, type: aliasedChildType } = urnTypeAndName(childAliasURN);
+                    return inheritedChildAlias(aliasedChildName, parentName, parentAlias, aliasedChildType);
+                },
+            );
             aliases.push(inheritedAlias);
         }
     }
@@ -115,6 +141,12 @@ export function allAliases(childAliases: Input<URN | Alias>[], childName: string
  * Resource represents a class whose CRUD operations are implemented by a provider plugin.
  */
 export abstract class Resource {
+    /**
+     * A regexp for use with sourcePosition.
+     */
+    private static sourcePositionRegExp =
+        /Error:\s*\n\s*at new Resource \(.*\)\n\s*at new \S*Resource \(.*\)\n(\s*at new \S* \(.*\)\n)?[^(]*\((?<file>.*):(?<line>[0-9]+):(?<col>[0-9]+)\)\n/;
+
     /**
      * A private field to help with RTTI that works in SxS scenarios.
      * @internal
@@ -215,7 +247,7 @@ export abstract class Resource {
      * @internal
      */
     // eslint-disable-next-line @typescript-eslint/naming-convention,no-underscore-dangle,id-blacklist,id-match
-    private readonly __name?: string;
+    readonly __name?: string;
 
     /**
      * The set of providers to use for child resources. Keyed by package name (e.g. "aws").
@@ -225,7 +257,9 @@ export abstract class Resource {
     private readonly __providers: Record<string, ProviderResource>;
 
     /**
-     * The specified provider or provider determined from the parent for custom resources.
+     * The specified provider or provider determined from the parent for custom or remote resources.
+     * It is passed along in the `Call` gRPC request for resource method calls (when set) so that the
+     * call goes to the same provider as the resource.
      * @internal
      */
     // Note: This is deliberately not named `__provider` as that conflicts with the property
@@ -247,17 +281,70 @@ export abstract class Resource {
     // eslint-disable-next-line @typescript-eslint/naming-convention,no-underscore-dangle,id-blacklist,id-match
     readonly __pluginDownloadURL?: string;
 
+    /**
+     * Private field containing the type ID for this object. Useful for implementing `isInstance` on
+     * classes that inherit from `Resource`.
+     * @internal
+     */
+    // eslint-disable-next-line @typescript-eslint/naming-convention,no-underscore-dangle,id-blacklist,id-match
+    public readonly __pulumiType: string;
+
     public static isInstance(obj: any): obj is Resource {
         return utils.isInstance<Resource>(obj, "__pulumiResource");
     }
 
-    // getProvider fetches the provider for the given module member, if any.
-    public getProvider(moduleMember: string): ProviderResource | undefined {
-        const memComponents = moduleMember.split(":");
-        if (memComponents.length !== 3) {
+    // sourcePosition returns the source position of the user code that instantiated this resource.
+    //
+    // This is somewhat brittle in that it expects a call stack of the form:
+    // - Resource class constructor
+    // - abstract Resource subclass constructor
+    // - concrete Resource subclass constructor
+    // - user code
+    //
+    // This stack reflects the expected class hierarchy of "cloud resource / component resource < customresource/componentresource < resource".
+    //
+    // For example, consider the AWS S3 Bucket resource. When user code instantiates a Bucket, the stack will look like
+    // this:
+    //
+    //     new Resource (/path/to/resource.ts:123:45)
+    //     new CustomResource (/path/to/resource.ts:678:90)
+    //     new Bucket (/path/to/bucket.ts:987:65)
+    //     <user code> (/path/to/index.ts:4:3)
+    //
+    // Because Node can only give us the stack trace as text, we parse out the source position using a regex that
+    // matches traces of this form (see stackTraceRegExp above).
+    private static sourcePosition(): SourcePosition | undefined {
+        const stackObj: any = {};
+        Error.captureStackTrace(stackObj, Resource.sourcePosition);
+
+        // Parse out the source position of the user code. If any part of the match is missing, return undefined.
+        const { file, line, col } = Resource.sourcePositionRegExp.exec(stackObj.stack)?.groups || {};
+        if (!file || !line || !col) {
             return undefined;
         }
-        const pkg = memComponents[0];
+
+        // Parse the line and column numbers. If either fails to parse, return undefined.
+        //
+        // Note: this really shouldn't happen given the regex; this is just a bit of defensive coding.
+        const lineNum = parseInt(line, 10);
+        const colNum = parseInt(col, 10);
+        if (Number.isNaN(lineNum) || Number.isNaN(colNum)) {
+            return undefined;
+        }
+
+        return {
+            uri: url.pathToFileURL(file).toString(),
+            line: lineNum,
+            column: colNum,
+        };
+    }
+
+    // getProvider fetches the provider for the given module member, if any.
+    public getProvider(moduleMember: string): ProviderResource | undefined {
+        const pkg = pkgFromType(moduleMember);
+        if (pkg === undefined) {
+            return undefined;
+        }
 
         return this.__providers[pkg];
     }
@@ -276,8 +363,16 @@ export abstract class Resource {
      * @param remote True if this is a remote component resource.
      * @param dependency True if this is a synthetic resource used internally for dependency tracking.
      */
-    constructor(t: string, name: string, custom: boolean, props: Inputs = {}, opts: ResourceOptions = {},
-                remote: boolean = false, dependency: boolean = false) {
+    constructor(
+        t: string,
+        name: string,
+        custom: boolean,
+        props: Inputs = {},
+        opts: ResourceOptions = {},
+        remote: boolean = false,
+        dependency: boolean = false,
+    ) {
+        this.__pulumiType = t;
 
         if (dependency) {
             this.__protect = false;
@@ -299,7 +394,7 @@ export abstract class Resource {
         // Before anything else - if there are transformations registered, invoke them in order to transform the properties and
         // options assigned to this resource.
         const parent = opts.parent || getStackResource();
-        this.__transformations = [ ...(opts.transformations || []), ...(parent?.__transformations || []) ];
+        this.__transformations = [...(opts.transformations || []), ...(parent?.__transformations || [])];
         for (const transformation of this.__transformations) {
             const tres = transformation({ resource: this, type: t, name, props, opts });
             if (tres) {
@@ -333,9 +428,6 @@ export abstract class Resource {
                 opts.protect = parent.__protect;
             }
 
-            // Update aliases to include the full set of aliases implied by the child and parent aliases.
-            opts.aliases = allAliases(opts.aliases || [], name, t, parent, parent.__name!);
-
             this.__providers = parent.__providers;
         }
 
@@ -349,28 +441,38 @@ export abstract class Resource {
             ...convertToProvidersMap(opts.provider ? [opts.provider] : {}),
         };
 
+        const pkg = pkgFromType(t);
+
         // provider is the first option that does not return none
         // 1. opts.provider
         // 2. a matching provider in opts.providers
         // 3. a matching provider inherited from opts.parent
-        if (custom && opts.provider === undefined) {
-            let pkg = undefined;
-            const memComponents = t.split(":");
-            if (memComponents.length === 3) {
-                pkg = memComponents[0];
-            }
+        if ((custom || remote) && opts.provider === undefined) {
             const parentProvider = parent?.getProvider(t);
 
             if (pkg && pkg in this.__providers) {
                 opts.provider = this.__providers[pkg];
-            }
-            else if (parentProvider) {
+            } else if (parentProvider) {
                 opts.provider = parentProvider;
             }
         }
 
+        // Custom and remote resources have a backing provider. If this is a custom or
+        // remote resource and a provider has been specified that has the same package
+        // as the resource's package, save it in `__prov`.
+        // If the provider's package isn't the same as the resource's package, don't
+        // save it in `__prov` because the user specified `provider: someProvider` as
+        // shorthand for `providers: [someProvider]`, which is a provider intended for
+        // the component's children and not for this resource itself.
+        // `__prov` is passed along in `Call` gRPC requests for resource method calls
+        // (when set) so that the call goes to the same provider as the resource.
+        if ((custom || remote) && opts.provider) {
+            if (pkg && pkg === opts.provider.getPackage()) {
+                this.__prov = opts.provider;
+            }
+        }
+
         this.__protect = !!opts.protect;
-        this.__prov = custom ? opts.provider : undefined;
         this.__version = opts.version;
         this.__pluginDownloadURL = opts.pluginDownloadURL;
 
@@ -383,23 +485,37 @@ export abstract class Resource {
             }
         }
 
+        const sourcePosition = Resource.sourcePosition();
+
         if (opts.urn) {
             // This is a resource that already exists. Read its state from the engine.
             getResource(this, parent, props, custom, opts.urn);
-        }
-        else if (opts.id) {
+        } else if (opts.id) {
             // If this is a custom resource that already exists, read its state from the provider.
             if (!custom) {
                 throw new ResourceError(
-                    "Cannot read an existing resource unless it has a custom provider", opts.parent);
+                    "Cannot read an existing resource unless it has a custom provider",
+                    opts.parent,
+                );
             }
-            readResource(this, parent, t, name, props, opts);
+            readResource(this, parent, t, name, props, opts, sourcePosition);
         } else {
             // Kick off the resource registration.  If we are actually performing a deployment, this
             // resource's properties will be resolved asynchronously after the operation completes, so
             // that dependent computations resolve normally.  If we are just planning, on the other
             // hand, values will never resolve.
-            registerResource(this, parent, t, name, custom, remote, urn => new DependencyResource(urn), props, opts);
+            registerResource(
+                this,
+                parent,
+                t,
+                name,
+                custom,
+                remote,
+                (urn) => new DependencyResource(urn),
+                props,
+                opts,
+                sourcePosition,
+            );
         }
     }
 }
@@ -499,9 +615,9 @@ function collapseAliasToUrn(
     alias: Input<Alias | string>,
     defaultName: string,
     defaultType: string,
-    defaultParent: Resource | undefined): Output<URN> {
-
-    return output(alias).apply(a => {
+    defaultParent: Resource | undefined,
+): Output<URN> {
+    return output(alias).apply((a) => {
         if (typeof a === "string") {
             return output(a);
         }
@@ -743,14 +859,6 @@ export abstract class CustomResource extends Resource {
     public readonly __pulumiCustomResource: boolean;
 
     /**
-     * Private field containing the type ID for this object. Useful for implementing `isInstance` on
-     * classes that inherit from `CustomResource`.
-     * @internal
-     */
-    // eslint-disable-next-line @typescript-eslint/naming-convention,no-underscore-dangle,id-blacklist,id-match
-    public readonly __pulumiType: string;
-
-    /**
      * id is the provider-assigned unique ID for this managed resource.  It is set during
      * deployments and may be missing (undefined) during planning phases.
      */
@@ -780,12 +888,14 @@ export abstract class CustomResource extends Resource {
      */
     constructor(t: string, name: string, props?: Inputs, opts: CustomResourceOptions = {}, dependency = false) {
         if ((<ComponentResourceOptions>opts).providers) {
-            throw new ResourceError("Do not supply 'providers' option to a CustomResource. Did you mean 'provider' instead?", opts.parent);
+            throw new ResourceError(
+                "Do not supply 'providers' option to a CustomResource. Did you mean 'provider' instead?",
+                opts.parent,
+            );
         }
 
         super(t, name, true, props, opts, false, dependency);
         this.__pulumiCustomResource = true;
-        this.__pulumiType = t;
     }
 }
 
@@ -810,7 +920,7 @@ export abstract class ProviderResource extends CustomResource {
 
         if (!provider.__registrationId) {
             const providerURN = await provider.urn.promise();
-            const providerID = await provider.id.promise() || unknownValue;
+            const providerID = (await provider.id.promise()) || unknownValue;
             provider.__registrationId = `${providerURN}::${providerID}`;
         }
 
@@ -883,7 +993,13 @@ export class ComponentResource<TData = any> extends Resource {
      * @param opts A bag of options that control this resource's behavior.
      * @param remote True if this is a remote component resource.
      */
-    constructor(type: string, name: string, args: Inputs = {}, opts: ComponentResourceOptions = {}, remote: boolean = false) {
+    constructor(
+        type: string,
+        name: string,
+        args: Inputs = {},
+        opts: ComponentResourceOptions = {},
+        remote: boolean = false,
+    ) {
         // Explicitly ignore the props passed in.  We allow them for back compat reasons.  However,
         // we explicitly do not want to pass them along to the engine.  The ComponentResource acts
         // only as a container for other resources.  Another way to think about this is that a normal
@@ -965,8 +1081,14 @@ export const testingOptions = {
  *  4. For the purposes of merging `dependsOn`, `provider` and `providers` are always treated as
  *     collections, even if only a single value was provided.
  */
-export function mergeOptions(opts1: CustomResourceOptions | undefined, opts2: CustomResourceOptions | undefined): CustomResourceOptions;
-export function mergeOptions(opts1: ComponentResourceOptions | undefined, opts2: ComponentResourceOptions | undefined): ComponentResourceOptions;
+export function mergeOptions(
+    opts1: CustomResourceOptions | undefined,
+    opts2: CustomResourceOptions | undefined,
+): CustomResourceOptions;
+export function mergeOptions(
+    opts1: ComponentResourceOptions | undefined,
+    opts2: ComponentResourceOptions | undefined,
+): ComponentResourceOptions;
 export function mergeOptions(opts1: ResourceOptions | undefined, opts2: ResourceOptions | undefined): ResourceOptions;
 export function mergeOptions(opts1: ResourceOptions | undefined, opts2: ResourceOptions | undefined): ResourceOptions {
     const dest = <any>{ ...opts1 };
@@ -1026,9 +1148,8 @@ function normalizeProviders(opts: ComponentResourceOptions) {
     const providers = <ProviderResource[]>opts.providers;
     if (providers) {
         if (providers.length === 0) {
-            delete opts.providers;
-        }
-        else {
+            opts.providers = undefined;
+        } else {
             opts.providers = {};
             for (const res of providers) {
                 opts.providers[res.getPackage()] = res;
@@ -1041,11 +1162,11 @@ function normalizeProviders(opts: ComponentResourceOptions) {
 export function merge(dest: any, source: any, alwaysCreateArray: boolean): any {
     // unwind any top level promise/outputs.
     if (isPromiseOrOutput(dest)) {
-        return output(dest).apply(d => merge(d, source, alwaysCreateArray));
+        return output(dest).apply((d) => merge(d, source, alwaysCreateArray));
     }
 
     if (isPromiseOrOutput(source)) {
-        return output(source).apply(s => merge(dest, s, alwaysCreateArray));
+        return output(source).apply((s) => merge(dest, s, alwaysCreateArray));
     }
 
     // If either are an array, make a new array and merge the values into it.
@@ -1063,8 +1184,7 @@ export function merge(dest: any, source: any, alwaysCreateArray: boolean): any {
 function addToArray(resultArray: any[], value: any) {
     if (Array.isArray(value)) {
         resultArray.push(...value);
-    }
-    else if (value !== undefined && value !== null) {
+    } else if (value !== undefined && value !== null) {
         resultArray.push(value);
     }
 }
@@ -1077,8 +1197,13 @@ export class DependencyResource extends CustomResource {
     constructor(urn: URN) {
         super("", "", {}, {}, true);
 
-        (<any>this).urn = new Output(<any>this, Promise.resolve(urn), Promise.resolve(true), Promise.resolve(false),
-            Promise.resolve([]));
+        (<any>this).urn = new Output(
+            <any>this,
+            Promise.resolve(urn),
+            Promise.resolve(true),
+            Promise.resolve(false),
+            Promise.resolve([]),
+        );
     }
 }
 
@@ -1098,8 +1223,20 @@ export class DependencyProviderResource extends ProviderResource {
 
         super(pkg, "", {}, {}, true);
 
-        (<any>this).urn = new Output(<any>this, Promise.resolve(urn), Promise.resolve(true), Promise.resolve(false), Promise.resolve([]));
-        (<any>this).id = new Output(<any>this, Promise.resolve(id), Promise.resolve(true), Promise.resolve(false), Promise.resolve([]));
+        (<any>this).urn = new Output(
+            <any>this,
+            Promise.resolve(urn),
+            Promise.resolve(true),
+            Promise.resolve(false),
+            Promise.resolve([]),
+        );
+        (<any>this).id = new Output(
+            <any>this,
+            Promise.resolve(id),
+            Promise.resolve(true),
+            Promise.resolve(false),
+            Promise.resolve([]),
+        );
     }
 }
 
@@ -1113,6 +1250,6 @@ export function parseResourceReference(ref: string): [string, string] {
         throw new Error(`expected '::' in provider reference ${ref}`);
     }
     const urn = ref.slice(0, lastSep);
-    const id = ref.slice(lastSep+2);
+    const id = ref.slice(lastSep + 2);
     return [urn, id];
 }

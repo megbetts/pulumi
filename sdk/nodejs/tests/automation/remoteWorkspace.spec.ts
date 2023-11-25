@@ -18,6 +18,7 @@ import {
     fullyQualifiedStackName,
     isFullyQualifiedStackName,
     LocalWorkspace,
+    LocalWorkspaceOptions,
     RemoteGitAuthArgs,
     RemoteGitProgramArgs,
     RemoteStack,
@@ -29,6 +30,197 @@ import { getTestOrg, getTestSuffix } from "./util";
 const testRepo = "https://github.com/pulumi/test-repo.git";
 
 describe("RemoteWorkspace", () => {
+    describe("remote cmd args", () => {
+        const tests: {
+            name: string;
+            opts: LocalWorkspaceOptions;
+            expected: string[];
+        }[] = [
+            {
+                name: "empty",
+                opts: {},
+                expected: [],
+            },
+            {
+                name: "just remote",
+                opts: {
+                    remote: true,
+                },
+                expected: ["--remote"],
+            },
+            {
+                name: "url",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                    },
+                },
+                expected: ["--remote", "foo"],
+            },
+            {
+                name: "path",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        projectPath: "mypath",
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-git-repo-dir", "mypath"],
+            },
+            {
+                name: "branch",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        branch: "mybranch",
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-git-branch", "mybranch"],
+            },
+            {
+                name: "commit",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        commitHash: "mycommit",
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-git-commit", "mycommit"],
+            },
+            {
+                name: "auth access token",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        auth: {
+                            personalAccessToken: "mytoken",
+                        },
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-git-auth-access-token", "mytoken"],
+            },
+            {
+                name: "auth ssh key",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        auth: {
+                            sshPrivateKey: "mykey",
+                        },
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-git-auth-ssh-private-key", "mykey"],
+            },
+            {
+                name: "auth ssh key path",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        auth: {
+                            sshPrivateKeyPath: "mykeypath",
+                        },
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-git-auth-ssh-private-key-path", "mykeypath"],
+            },
+            {
+                name: "auth ssh password",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                        auth: {
+                            username: "myuser",
+                            password: "mypass",
+                        },
+                    },
+                },
+                expected: [
+                    "--remote",
+                    "foo",
+                    "--remote-git-auth-password",
+                    "mypass",
+                    "--remote-git-auth-username",
+                    "myuser",
+                ],
+            },
+            {
+                name: "env",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                    },
+                    remoteEnvVars: {
+                        foo: "bar",
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-env", "foo=bar"],
+            },
+            {
+                name: "env secret",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                    },
+                    remoteEnvVars: {
+                        foo: { secret: "bar" },
+                    },
+                },
+                expected: ["--remote", "foo", "--remote-env-secret", "foo=bar"],
+            },
+            {
+                name: "pre-run command",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                    },
+                    remotePreRunCommands: ["whoami"],
+                },
+                expected: ["--remote", "foo", "--remote-pre-run-command", "whoami"],
+            },
+            {
+                name: "skip install dependencies",
+                opts: {
+                    remote: true,
+                    remoteGitProgramArgs: {
+                        stackName: "stack",
+                        url: "foo",
+                    },
+                    remoteSkipInstallDependencies: true,
+                },
+                expected: ["--remote", "foo", "--remote-skip-install-dependencies"],
+            },
+        ];
+        tests.forEach((test) => {
+            it(`${test.name}`, async () => {
+                const ws = await LocalWorkspace.create(test.opts);
+                const actual = ws.remoteArgs();
+                assert.deepStrictEqual(actual, test.expected);
+            });
+        });
+    });
+
     describe("selectStack", () => {
         describe("throws appropriate errors", () => testErrors(RemoteWorkspace.selectStack));
     });
@@ -160,31 +352,38 @@ function testErrors(fn: (args: RemoteGitProgramArgs, opts?: RemoteWorkspaceOptio
         },
     ];
 
-    tests.forEach(test => {
+    tests.forEach((test) => {
         it(`${test.name}`, async () => {
             const { stackName, url, branch, commitHash, auth } = test;
-            await assert.rejects(async () => {
-                await fn({ stackName, url, branch, commitHash, auth });
-            }, {
-                message: test.error,
-            });
+            await assert.rejects(
+                async () => {
+                    await fn({ stackName, url, branch, commitHash, auth });
+                },
+                {
+                    message: test.error,
+                },
+            );
         });
     });
 }
 
 async function testLifecycle(fn: (args: RemoteGitProgramArgs, opts?: RemoteWorkspaceOptions) => Promise<RemoteStack>) {
     const stackName = fullyQualifiedStackName(getTestOrg(), "go_remote_proj", `int_test${getTestSuffix()}`);
-    const stack = await fn({
-        stackName,
-        url: testRepo,
-        branch: "refs/heads/master",
-        projectPath: "goproj",
-    },{
-        preRunCommands: [
-            `pulumi config set bar abc --stack ${stackName}`,
-            `pulumi config set --secret buzz secret --stack ${stackName}`,
-        ],
-    });
+    const stack = await fn(
+        {
+            stackName,
+            url: testRepo,
+            branch: "refs/heads/master",
+            projectPath: "goproj",
+        },
+        {
+            preRunCommands: [
+                `pulumi config set bar abc --stack ${stackName}`,
+                `pulumi config set --secret buzz secret --stack ${stackName}`,
+            ],
+            skipInstallDependencies: true,
+        },
+    );
 
     // pulumi up
     const upRes = await stack.up();
@@ -269,7 +468,7 @@ describe("isFullyQualifiedStackName", () => {
         },
     ];
 
-    tests.forEach(test => {
+    tests.forEach((test) => {
         it(`${test.name}`, () => {
             const actual = isFullyQualifiedStackName(test.input!);
             assert.strictEqual(actual, test.expected);

@@ -20,7 +20,6 @@ import (
 	"runtime"
 	"sync"
 	"testing"
-
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -32,7 +31,7 @@ func TestTokenSource(t *testing.T) {
 	}
 	t.Parallel()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	dur := 20 * time.Millisecond
 	backend := &testTokenBackend{tokens: map[string]time.Time{}}
 
@@ -42,7 +41,7 @@ func TestTokenSource(t *testing.T) {
 	defer ts.Close()
 
 	for i := 0; i < 32; i++ {
-		tok, err := ts.GetToken()
+		tok, err := ts.GetToken(ctx)
 		assert.NoError(t, err)
 		assert.NoError(t, backend.VerifyToken(tok))
 		t.Logf("STEP: %d, TOKEN: %s", i, tok)
@@ -68,7 +67,7 @@ func TestTokenSourceWithQuicklyExpiringInitialToken(t *testing.T) {
 	}
 	t.Parallel()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	dur := 20 * time.Millisecond
 	backend := &testTokenBackend{tokens: map[string]time.Time{}}
 
@@ -78,7 +77,7 @@ func TestTokenSourceWithQuicklyExpiringInitialToken(t *testing.T) {
 	defer ts.Close()
 
 	for i := 0; i < 8; i++ {
-		tok, err := ts.GetToken()
+		tok, err := ts.GetToken(ctx)
 		assert.NoError(t, err)
 		assert.NoError(t, backend.VerifyToken(tok))
 		t.Logf("STEP: %d, TOKEN: %s", i, tok)
@@ -101,7 +100,8 @@ func (ts *testTokenBackend) NewToken(duration time.Duration) (string, time.Time)
 func (ts *testTokenBackend) Refresh(
 	ctx context.Context,
 	duration time.Duration,
-	currentToken string) (string, time.Time, error) {
+	currentToken string,
+) (string, time.Time, error) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if err := ts.verifyTokenInner(currentToken); err != nil {

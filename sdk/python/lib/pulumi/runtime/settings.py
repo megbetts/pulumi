@@ -18,14 +18,16 @@ Runtime settings and configuration.
 from __future__ import annotations
 
 import asyncio
-from contextvars import ContextVar
 import os
-from typing import Optional, Union, Any, TYPE_CHECKING
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import grpc
-from ..runtime.proto import engine_pb2_grpc, resource_pb2, resource_pb2_grpc
-from ..errors import RunError
+
 from .._utils import contextproperty
+from ..errors import RunError
+from ..runtime.proto import engine_pb2_grpc, resource_pb2, resource_pb2_grpc
+from .rpc_manager import RPCManager
 
 if TYPE_CHECKING:
     from ..resource import Resource
@@ -55,6 +57,8 @@ class Settings:
         legacy_apply_enabled: Optional[bool] = None,
         organization: Optional[str] = None,
     ):
+        self.rpc_manager = RPCManager()
+
         # Save the metadata information.
         self.project = project
         self.stack = stack
@@ -88,6 +92,11 @@ class Settings:
                 self.engine = engine
         else:
             self.engine = None
+
+    @contextproperty
+    def rpc_manager(self) -> RPCManager:  # type: ignore
+        # The contextproperty decorator will fill the body of this method in, but mypy doesn't know that.
+        ...
 
     @contextproperty
     def monitor(self) -> Optional[resource_pb2_grpc.ResourceMonitorStub]:
@@ -195,6 +204,13 @@ def _set_stack(v: Optional[str]):
     SETTINGS.stack = v
 
 
+def _get_rpc_manager() -> RPCManager:
+    """
+    Returns the current rpc manager.
+    """
+    return SETTINGS.rpc_manager
+
+
 def get_monitor() -> Optional[Union[resource_pb2_grpc.ResourceMonitorStub, Any]]:
     """
     Returns the current resource monitoring service client for RPC communications.
@@ -287,6 +303,10 @@ async def monitor_supports_output_values() -> bool:
 
 async def monitor_supports_deleted_with() -> bool:
     return await monitor_supports_feature("deletedWith")
+
+
+async def monitor_supports_alias_specs() -> bool:
+    return await monitor_supports_feature("aliasSpecs")
 
 
 def reset_options(

@@ -16,7 +16,7 @@ func (nameInfo) Format(name string) string {
 	return name
 }
 
-// nolint: lll
+//nolint:lll
 func TestApplyRewriter(t *testing.T) {
 	t.Parallel()
 
@@ -153,8 +153,9 @@ func TestApplyRewriter(t *testing.T) {
 		Name:         "resourcesOutput",
 		VariableType: model.NewOutputType(model.NewListType(resourceType)),
 	})
-	scope.DefineFunction("element", pulumiBuiltins["element"])
-	scope.DefineFunction("toJSON", pulumiBuiltins["toJSON"])
+	functions := pulumiBuiltins(bindOptions{})
+	scope.DefineFunction("element", functions["element"])
+	scope.DefineFunction("toJSON", functions["toJSON"])
 	scope.DefineFunction("getPromise", model.NewFunction(model.StaticFunctionSignature{
 		Parameters: []model.Parameter{{
 			Name: "p",

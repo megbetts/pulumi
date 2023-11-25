@@ -25,7 +25,9 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/operations"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
@@ -37,7 +39,7 @@ import (
 const timeFormat = "2006-01-02T15:04:05.000Z07:00"
 
 func newLogsCmd() *cobra.Command {
-	var stack string
+	var stackName string
 	var follow bool
 	var since string
 	var resource string
@@ -64,17 +66,12 @@ func newLogsCmd() *cobra.Command {
 				return err
 			}
 
-			s, err := requireStack(ctx, stack, false, opts, false /*setCurrent*/)
+			s, err := requireStack(ctx, stackName, stackLoadOnly, opts)
 			if err != nil {
 				return err
 			}
 
-			sm, err := getStackSecretsManager(s)
-			if err != nil {
-				return fmt.Errorf("getting secrets manager: %w", err)
-			}
-
-			cfg, err := getStackConfiguration(ctx, s, proj, sm)
+			cfg, sm, err := getStackConfiguration(ctx, s, proj, nil)
 			if err != nil {
 				return fmt.Errorf("getting stack configuration: %w", err)
 			}
@@ -83,9 +80,19 @@ func newLogsCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("getting stack decrypter: %w", err)
 			}
+			encrypter, err := sm.Encrypter()
+			if err != nil {
+				return fmt.Errorf("getting stack encrypter: %w", err)
+			}
 
 			stackName := s.Ref().Name().String()
-			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+				stackName,
+				proj,
+				cfg.Environment,
+				cfg.Config,
+				encrypter,
+				decrypter)
 			if configErr != nil {
 				return fmt.Errorf("validating stack config: %w", configErr)
 			}
@@ -96,7 +103,7 @@ func newLogsCmd() *cobra.Command {
 			}
 			var resourceFilter *operations.ResourceFilter
 			if resource != "" {
-				var rf = operations.ResourceFilter(resource)
+				rf := operations.ResourceFilter(resource)
 				resourceFilter = &rf
 			}
 
@@ -116,7 +123,7 @@ func newLogsCmd() *cobra.Command {
 			// rendered now even though they are technically out of order.
 			shown := map[operations.LogEntry]bool{}
 			for {
-				logs, err := s.GetLogs(ctx, cfg, operations.LogQuery{
+				logs, err := s.GetLogs(ctx, stack.DefaultSecretsProvider, cfg, operations.LogQuery{
 					StartTime:      startTime,
 					ResourceFilter: resourceFilter,
 				})
@@ -126,7 +133,7 @@ func newLogsCmd() *cobra.Command {
 
 				// When we are emitting a fixed number of log entries, and outputing JSON, wrap them in an array.
 				if !follow && jsonOut {
-					entries := make([]logEntryJSON, 0, len(logs))
+					entries := slice.Prealloc[logEntryJSON](len(logs))
 
 					for _, logEntry := range logs {
 						if _, shownAlready := shown[logEntry]; !shownAlready {
@@ -181,7 +188,7 @@ func newLogsCmd() *cobra.Command {
 	}
 
 	logsCmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	logsCmd.PersistentFlags().StringVar(
 		&stackConfigFile, "config-file", "",

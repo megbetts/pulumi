@@ -22,12 +22,10 @@ type Random struct {
 }
 
 func NewRandom(ctx *pulumi.Context,
-	name string, args *RandomArgs, opts ...pulumi.ResourceOption) (*Random, error) {
+	name string, args *RandomArgs, opts ...pulumi.ResourceOption,
+) (*Random, error) {
 	if args == nil || args.Length == nil {
 		return nil, errors.New("missing required argument 'Length'")
-	}
-	if args == nil {
-		args = &RandomArgs{}
 	}
 	var resource Random
 	err := ctx.RegisterResource("testprovider:index:Random", name, args, &resource, opts...)

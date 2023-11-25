@@ -15,12 +15,13 @@
 package engine
 
 import (
+	"context"
+
+	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
 
@@ -28,22 +29,22 @@ func Refresh(
 	u UpdateInfo,
 	ctx *Context,
 	opts UpdateOptions,
-	dryRun bool) (*deploy.Plan, display.ResourceChanges, result.Result) {
+	dryRun bool,
+) (*deploy.Plan, display.ResourceChanges, error) {
+	contract.Requiref(u != nil, "u", "cannot be nil")
+	contract.Requiref(ctx != nil, "ctx", "cannot be nil")
 
-	contract.Require(u != nil, "u")
-	contract.Require(ctx != nil, "ctx")
-
-	defer func() { ctx.Events <- cancelEvent() }()
+	defer func() { ctx.Events <- NewCancelEvent() }()
 
 	info, err := newDeploymentContext(u, "refresh", ctx.ParentSpan)
 	if err != nil {
-		return nil, nil, result.FromError(err)
+		return nil, nil, err
 	}
 	defer info.Close()
 
 	emitter, err := makeEventEmitter(ctx.Events, u)
 	if err != nil {
-		return nil, nil, result.FromError(err)
+		return nil, nil, err
 	}
 	defer emitter.Close()
 
@@ -53,7 +54,11 @@ func Refresh(
 	logging.V(7).Infof("*** Starting Refresh(preview=%v) ***", dryRun)
 	defer logging.V(7).Infof("*** Refresh(preview=%v) complete ***", dryRun)
 
-	return update(ctx, info, deploymentOptions{
+	if err := checkTargets(opts.Targets, u.GetTarget().Snapshot); err != nil {
+		return nil, nil, err
+	}
+
+	return update(ctx, info, &deploymentOptions{
 		UpdateOptions: opts,
 		SourceFunc:    newRefreshSource,
 		Events:        emitter,
@@ -63,9 +68,10 @@ func Refresh(
 	}, dryRun)
 }
 
-func newRefreshSource(client deploy.BackendClient, opts deploymentOptions, proj *workspace.Project, pwd, main string,
-	target *deploy.Target, plugctx *plugin.Context, dryRun bool) (deploy.Source, error) {
-
+func newRefreshSource(
+	ctx context.Context, client deploy.BackendClient, opts *deploymentOptions, proj *workspace.Project, pwd, main,
+	projectRoot string, target *deploy.Target, plugctx *plugin.Context, dryRun bool,
+) (deploy.Source, error) {
 	// Like Update, we need to gather the set of plugins necessary to refresh everything in the snapshot.
 	// Unlike Update, we don't actually run the user's program so we only need the set of plugins described
 	// in the snapshot.
@@ -75,7 +81,7 @@ func newRefreshSource(client deploy.BackendClient, opts deploymentOptions, proj 
 	}
 
 	// Like Update, if we're missing plugins, attempt to download the missing plugins.
-	if err := ensurePluginsAreInstalled(plugctx.Request(), plugins.Deduplicate(),
+	if err := ensurePluginsAreInstalled(ctx, plugctx.Diag, plugins.Deduplicate(),
 		plugctx.Host.GetProjectPlugins()); err != nil {
 		logging.V(7).Infof("newRefreshSource(): failed to install missing plugins: %v", err)
 	}

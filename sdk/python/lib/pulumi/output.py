@@ -13,28 +13,31 @@
 # limitations under the License.
 import asyncio
 import contextlib
+import json
 from functools import reduce
 from inspect import isawaitable
 from typing import (
-    TypeVar,
-    Generic,
-    Set,
-    Callable,
+    TYPE_CHECKING,
+    Any,
     Awaitable,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
     Union,
     cast,
-    Mapping,
-    Any,
-    List,
-    Dict,
-    Optional,
-    TYPE_CHECKING,
     overload,
 )
 
-from . import _types
-from . import runtime
+from . import _types, runtime
 from .runtime import rpc
+from .runtime.sync_await import _sync_await
 
 if TYPE_CHECKING:
     from .resource import Resource
@@ -289,22 +292,45 @@ class Output(Generic[T_co]):
         typ = type(val)
         if _types.is_input_type(typ):
             # We know that any input type can safely be decomposed into it's `__dict__`, and then reconstructed
-            # via `type(**d)` from the (unwrapped) properties.
-            o_typ: Output[typ] = Output.all(**val.__dict__).apply(  # type:ignore
+            # via `type(**d)` from the (unwrapped) properties (bar empty input types, see next comment).
+            o_typ = Output.all(**val.__dict__).apply(
+                # if __dict__ was empty `all` will return an empty list object rather than a dict object,
+                # there isn't really a good way to express this in mypy so the type checker doesn't pickup on
+                # this. If we get an empty list we can't splat it as that results in a type error, so check
+                # that we have some values before splatting. If it's empty just call the `typ` constructor
+                # directly with no arguments.
                 lambda d: typ(**d)
+                if d
+                else typ()
             )
             return cast(Output[T_co], o_typ)
 
-        # Is a (non-empty) dict or list? Recurse into the values within them.
+        # Is a (non-empty) dict, list, or tuple? Recurse into the values within them.
         if val and isinstance(val, dict):
-            o_dict: Output[dict] = Output.all(**val)
+            # The keys themselves might be outputs, so we can't just pass `**val` to all.
+
+            # keys() and values() will be in the same order: https://docs.python.org/3/library/stdtypes.html#dictionary-view-objects
+            keys = list(val.keys())
+            values = list(val.values())
+
+            def liftValues(keys: List[Any]):
+                d = {keys[i]: values[i] for i in range(len(keys))}
+                return Output.all(**d)
+
+            o_dict: Output[dict] = Output.all(*keys).apply(liftValues)
             return cast(Output[T_co], o_dict)
 
         if val and isinstance(val, list):
             o_list: Output[list] = Output.all(*val)
             return cast(Output[T_co], o_list)
 
-        # If it's not an output, list, or dict, it must be known and not secret
+        if val and isinstance(val, tuple):
+            # We can splat a tuple into all, but we'll always get back a list...
+            o_list = Output.all(*val)
+            # ...so we need to convert back to a tuple.
+            return cast(Output[T_co], o_list.apply(tuple))
+
+        # If it's not an output, tuple, list, or dict, it must be known and not secret
         is_known_fut: asyncio.Future[bool] = asyncio.Future()
         is_secret_fut: asyncio.Future[bool] = asyncio.Future()
         is_known_fut.set_result(True)
@@ -536,13 +562,172 @@ class Output(Generic[T_co]):
             )
         return Output.from_input(format_string).apply(lambda str: str.format())
 
+    @staticmethod
+    def json_dumps(
+        obj: Input[Any],
+        *,
+        skipkeys: bool = False,
+        ensure_ascii: bool = True,
+        check_circular: bool = True,
+        allow_nan: bool = True,
+        cls: Optional[Type[json.JSONEncoder]] = None,
+        indent: Optional[Union[int, str]] = None,
+        separators: Optional[Tuple[str, str]] = None,
+        default: Optional[Callable[[Any], Any]] = None,
+        sort_keys: bool = False,
+        **kw: Any,
+    ) -> "Output[str]":
+        """
+        Uses json.dumps to serialize the given Input[object] value into a JSON string.
+
+        The arguments have the same meaning as in `json.dumps` except obj is an Input.
+        """
+
+        if cls is None:
+            cls = json.JSONEncoder
+
+        output = Output.from_input(obj)
+        result_resources: asyncio.Future[Set["Resource"]] = asyncio.Future()
+        result_is_known: asyncio.Future[bool] = asyncio.Future()
+        result_is_secret: asyncio.Future[bool] = asyncio.Future()
+
+        async def run() -> str:
+            resources: Set["Resource"] = set()
+            try:
+                seen_unknown = False
+                seen_secret = False
+                seen_resources = set()
+
+                class OutputEncoder(cls):  # type: ignore
+                    def default(self, o):
+                        if isinstance(o, Output):
+                            nonlocal seen_unknown
+                            nonlocal seen_secret
+                            nonlocal seen_resources
+
+                            # We need to synchronously wait for o to complete
+                            async def wait_output() -> Tuple[object, bool, bool, set]:
+                                return (
+                                    await o._future,
+                                    await o._is_known,
+                                    await o._is_secret,
+                                    await o._resources,
+                                )
+
+                            (result, known, secret, resources) = _sync_await(
+                                asyncio.ensure_future(wait_output())
+                            )
+                            # Update the secret flag and set of seen resources
+                            seen_secret = seen_secret or secret
+                            seen_resources.update(resources)
+                            if known:
+                                return result
+                            # The value wasn't known set the local seenUnknown variable and just return None
+                            # so the serialization doesn't raise an exception at this point
+                            seen_unknown = True
+                            return None
+
+                        return super().default(o)
+
+                # Await the output's details.
+                resources = await output._resources
+                is_known = await output._is_known
+                is_secret = await output._is_secret
+                value = await output._future
+
+                if not is_known:
+                    result_resources.set_result(resources)
+                    result_is_known.set_result(is_known)
+                    result_is_secret.set_result(is_secret)
+                    return cast(str, None)
+
+                # Try and dump using our special OutputEncoder to handle nested outputs
+                result = json.dumps(
+                    value,
+                    skipkeys=skipkeys,
+                    ensure_ascii=ensure_ascii,
+                    check_circular=check_circular,
+                    allow_nan=allow_nan,
+                    cls=OutputEncoder,
+                    indent=indent,
+                    separators=separators,
+                    default=default,
+                    sort_keys=sort_keys,
+                    **kw,
+                )
+
+                # Update the final resources and secret flag based on what we saw while dumping
+                is_secret = is_secret or seen_secret
+                resources = set(resources)
+                resources.update(seen_resources)
+
+                # If we saw an unknown during dumping then throw away the result and return not known
+                if seen_unknown:
+                    result_resources.set_result(resources)
+                    result_is_known.set_result(False)
+                    result_is_secret.set_result(is_secret)
+                    return cast(str, None)
+
+                result_resources.set_result(resources)
+                result_is_known.set_result(True)
+                result_is_secret.set_result(is_secret)
+                return result
+
+            finally:
+                with contextlib.suppress(asyncio.InvalidStateError):
+                    result_resources.set_result(resources)
+
+                with contextlib.suppress(asyncio.InvalidStateError):
+                    result_is_known.set_result(False)
+
+                with contextlib.suppress(asyncio.InvalidStateError):
+                    result_is_secret.set_result(False)
+
+        run_fut = asyncio.ensure_future(run())
+        return Output(result_resources, run_fut, result_is_known, result_is_secret)
+
+    @staticmethod
+    def json_loads(
+        s: Input[Union[str, bytes, bytearray]],
+        *,
+        cls: Optional[Type[json.JSONDecoder]] = None,
+        object_hook: Optional[Callable[[Dict[Any, Any]], Any]] = None,
+        parse_float: Optional[Callable[[str], Any]] = None,
+        parse_int: Optional[Callable[[str], Any]] = None,
+        parse_constant: Optional[Callable[[str], Any]] = None,
+        object_pairs_hook: Optional[Callable[[List[Tuple[Any, Any]]], Any]] = None,
+        **kwds: Any,
+    ) -> "Output[Any]":
+        """
+        Uses json.loads to deserialize the given JSON Input[str] value into a value.
+
+        The arguments have the same meaning as in `json.loads` except s is an Input.
+        """
+
+        def loads(s: Union[str, bytes, bytearray]) -> Any:
+            return json.loads(
+                s,
+                cls=cls,
+                object_hook=object_hook,
+                parse_float=parse_float,
+                parse_int=parse_int,
+                parse_constant=parse_constant,
+                object_pairs_hook=object_pairs_hook,
+                **kwds,
+            )
+
+        # You'd think this could all be on one line but mypy seems to think `s` is a `Sequence[object]` if you
+        # do.
+        os: Output[Union[str, bytes, bytearray]] = Output.from_input(s)
+        return os.apply(loads)
+
     def __str__(self) -> str:
         return """Calling __str__ on an Output[T] is not supported.
 
 To get the value of an Output[T] as an Output[str] consider:
 1. o.apply(lambda v: f"prefix{v}suffix")
 
-See https://pulumi.io/help/outputs for more details.
+See https://www.pulumi.com/docs/concepts/inputs-outputs for more details.
 This function may throw in a future version of Pulumi."""
 
 

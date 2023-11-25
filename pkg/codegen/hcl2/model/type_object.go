@@ -18,13 +18,17 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
+
+	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model/pretty"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 // ObjectType represents schematized maps from strings to particular types.
@@ -35,7 +39,7 @@ type ObjectType struct {
 	Annotations []interface{}
 
 	propertyUnion Type
-	s             string
+	s             atomic.Value // Value<string>
 }
 
 // NewObjectType creates a new object type with the given properties and annotations.
@@ -46,6 +50,31 @@ func NewObjectType(properties map[string]Type, annotations ...interface{}) *Obje
 // SyntaxNode returns the syntax node for the type. This is always syntax.None.
 func (*ObjectType) SyntaxNode() hclsyntax.Node {
 	return syntax.None
+}
+
+func (t *ObjectType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
+	if existingFormatter, ok := seenFormatters[t]; ok {
+		return existingFormatter
+	}
+
+	m := make(map[string]pretty.Formatter, len(t.Properties))
+	seenFormatters[t] = &pretty.Object{Properties: m}
+	for k, v := range t.Properties {
+		if seenFormatter, ok := seenFormatters[v]; ok {
+			m[k] = seenFormatter
+		} else {
+			formatter := v.pretty(seenFormatters)
+			seenFormatters[v] = formatter
+			m[k] = formatter
+		}
+	}
+
+	return seenFormatters[t]
+}
+
+func (t *ObjectType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 // Traverse attempts to traverse the optional type with the given traverser. The result type of
@@ -60,7 +89,7 @@ func (t *ObjectType) Traverse(traverser hcl.Traverser) (Traversable, hcl.Diagnos
 
 	if key == cty.DynamicVal {
 		if t.propertyUnion == nil {
-			types := make([]Type, 0, len(t.Properties))
+			types := slice.Prealloc[Type](len(t.Properties))
 			for _, t := range t.Properties {
 				types = append(types, t)
 			}
@@ -70,7 +99,7 @@ func (t *ObjectType) Traverse(traverser hcl.Traverser) (Traversable, hcl.Diagnos
 	}
 
 	keyString, err := convert.Convert(key, cty.String)
-	contract.Assert(err == nil)
+	contract.Assertf(err == nil, "error converting key (%#v) to string", key)
 
 	propertiesLower := make(map[string]string)
 	for p := range t.Properties {
@@ -93,7 +122,7 @@ func (t *ObjectType) Traverse(traverser hcl.Traverser) (Traversable, hcl.Diagnos
 				},
 			}
 		}
-		props := make([]string, 0, len(t.Properties))
+		props := slice.Prealloc[string](len(t.Properties))
 		for k := range t.Properties {
 			props = append(props, k)
 		}
@@ -263,8 +292,8 @@ func (t *ObjectType) String() string {
 }
 
 func (t *ObjectType) string(seen map[Type]struct{}) string {
-	if t.s != "" {
-		return t.s
+	if s := t.s.Load(); s != nil {
+		return s.(string)
 	}
 
 	if seen != nil {
@@ -276,7 +305,7 @@ func (t *ObjectType) string(seen map[Type]struct{}) string {
 	}
 	seen[t] = struct{}{}
 
-	var properties []string
+	properties := slice.Prealloc[string](len(t.Properties))
 	for k, v := range t.Properties {
 		properties = append(properties, fmt.Sprintf("%s = %s", k, v.string(seen)))
 	}
@@ -287,8 +316,9 @@ func (t *ObjectType) string(seen map[Type]struct{}) string {
 		annotations = fmt.Sprintf(", annotated(%p)", t)
 	}
 
-	t.s = fmt.Sprintf("object({%s}%v)", strings.Join(properties, ", "), annotations)
-	return t.s
+	s := fmt.Sprintf("object({%s}%v)", strings.Join(properties, ", "), annotations)
+	t.s.Store(s)
+	return s
 }
 
 func (t *ObjectType) unify(other Type) (Type, ConversionKind) {

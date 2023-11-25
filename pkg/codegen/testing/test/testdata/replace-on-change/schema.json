@@ -133,15 +133,11 @@
     }
   },
   "language": {
-    "csharp": {
-      "projectReferences": [
-        "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-      ]
-    },
     "go": {
       "generateResourceContainerTypes": true,
       "disableInputTypeRegistrations": true,
-      "generateExtraInputTypes": true
+      "generateExtraInputTypes": true,
+      "importBasePath": "replace-on-change/example"
     },
     "nodejs": {
       "dependencies": {

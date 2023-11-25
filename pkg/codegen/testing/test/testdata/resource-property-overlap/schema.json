@@ -11,14 +11,10 @@
     }
   },
   "language": {
-    "csharp": {
-      "projectReferences": [
-        "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-      ]
-    },
     "go": {
       "generateResourceContainerTypes": true,
-      "generateExtraInputTypes": true
+      "generateExtraInputTypes": true,
+      "importBasePath": "resource-property-overlap/example"
     },
     "nodejs": {
       "dependencies": {

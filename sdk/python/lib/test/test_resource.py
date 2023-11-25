@@ -14,6 +14,7 @@
 
 from typing import Optional, TypeVar, Awaitable, List, Any
 import asyncio
+import os
 import pytest
 import unittest
 
@@ -21,6 +22,7 @@ from pulumi.resource import DependencyProviderResource
 from pulumi.runtime import settings, mocks
 from pulumi.runtime.proto import resource_pb2
 from pulumi import ResourceOptions
+from pulumi.runtime.rpc import ERROR_ON_DEPENDENCY_CYCLES_VAR
 import pulumi
 
 
@@ -33,6 +35,12 @@ class DependencyProviderResourceTests(unittest.TestCase):
         res = DependencyProviderResource("urn:pulumi:stack::project::pulumi:providers:aws::default_4_13_0")
         self.assertEqual("aws", res.package)
 
+@pytest.fixture(autouse=True)
+def clean_up_env_vars():
+    try:
+        del os.environ[ERROR_ON_DEPENDENCY_CYCLES_VAR]
+    except KeyError:
+        pass
 
 @pulumi.runtime.test
 def test_depends_on_accepts_outputs(dep_tracker):
@@ -129,6 +137,46 @@ def test_depends_on_typing_variations(dep_tracker) -> None:
     ])
 
 
+@pulumi.runtime.test
+def test_component_resource_propagates_provider() -> None:
+    mocks.set_mocks(MinimalMocks())
+
+    provider = pulumi.ProviderResource('test', 'prov', {})
+    component = pulumi.ComponentResource(
+        "custom:foo:Component",
+        "comp",
+        opts=pulumi.ResourceOptions(provider=provider),
+    )
+    custom = pulumi.CustomResource(
+        "test:index:Resource",
+        "res",
+        opts=pulumi.ResourceOptions(parent=component),
+    )
+
+    assert provider == custom._provider, \
+        "Failed to propagate provider to child resource"
+
+
+@pulumi.runtime.test
+def test_component_resource_propagates_providers_list() -> None:
+    mocks.set_mocks(MinimalMocks())
+
+    provider = pulumi.ProviderResource('test', 'prov', {})
+    component = pulumi.ComponentResource(
+        "custom:foo:Component",
+        "comp",
+        opts=pulumi.ResourceOptions(providers=[provider]),
+    )
+    custom = pulumi.CustomResource(
+        "test:index:Resource",
+        "res",
+        opts=pulumi.ResourceOptions(parent=component),
+    )
+
+    assert provider == custom._provider, \
+        "Failed to propagate provider to child resource"
+
+
 def output_depending_on_resource(r: pulumi.Resource, isKnown: bool) -> pulumi.Output[None]:
     """Returns an output that depends on the given resource."""
     o = pulumi.Output.from_input(None)
@@ -201,5 +249,70 @@ class MergeResourceOptions(unittest.TestCase):
         assert opts1.protect is None
         opts2 = ResourceOptions.merge(opts1, ResourceOptions(protect=True))
         assert opts2.protect is True
-        opts3 = opts2.merge(ResourceOptions())
+        opts3 = ResourceOptions.merge(opts2, ResourceOptions())
         assert opts3.protect is True
+
+# Regression test for https://github.com/pulumi/pulumi/issues/12032
+@pulumi.runtime.test
+def test_parent_and_depends_on_are_the_same_12032():
+    os.environ[ERROR_ON_DEPENDENCY_CYCLES_VAR] = "false"
+    mocks.set_mocks(MinimalMocks())
+
+    parent = pulumi.ComponentResource("pkg:index:first", "first")
+    child = pulumi.ComponentResource(
+        "pkg:index:second",
+        "second",
+        opts=pulumi.ResourceOptions(parent=parent, depends_on=[parent]),
+    )
+
+    # This would freeze before the fix.
+    pulumi.CustomResource(
+        "foo:bar:baz",
+        "myresource",
+        opts=pulumi.ResourceOptions(parent=child),
+    )
+
+# Regression test for https://github.com/pulumi/pulumi/issues/12736
+@pulumi.runtime.test
+def test_complex_parent_child_dependencies():
+    os.environ[ERROR_ON_DEPENDENCY_CYCLES_VAR] = "false"
+    mocks.set_mocks(MinimalMocks())
+
+    class A(pulumi.ComponentResource):
+        def __init__(self, name: str, opts=None):
+            super().__init__("my:modules:A", name, {}, opts)
+            self.b = B("a-b", opts=ResourceOptions(parent=self))
+            self.c = C("a-c", opts=ResourceOptions(parent=self.b, depends_on=[self.b]))
+
+    class B(pulumi.ComponentResource):
+        def __init__(self, name: str, opts=None):
+            super().__init__("my:modules:B", name, {}, opts)
+            pulumi.CustomResource("my:module:Child", "b-child", opts=ResourceOptions(parent=self))
+
+    class C(pulumi.ComponentResource):
+        def __init__(self, name: str, opts=None):
+            super().__init__("my:modules:C", name, {}, opts)
+            pulumi.CustomResource("my:module:Child", "c-child", opts=ResourceOptions(parent=self))
+
+    class D(pulumi.ComponentResource):
+        def __init__(self, name: str, opts=None):
+            super().__init__("my:modules:D", name, {}, opts)
+            pulumi.CustomResource("my:module:Child", "d-child", opts=ResourceOptions(parent=self))
+
+    a = A("a")
+
+    D("d", opts=ResourceOptions(
+        parent=a.b,
+        depends_on=[a.b]
+    ))
+
+
+# Regression test for https://github.com/pulumi/pulumi/issues/13997
+@pulumi.runtime.test
+def test_bad_component_super_call():
+    class C(pulumi.ComponentResource):
+        def __init__(self, name: str, arg: int, opts=None):
+            super().__init__("my:module:C", name, arg, opts)
+
+    with pytest.raises(TypeError):
+        C("test", 4, None)

@@ -29,6 +29,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
@@ -43,7 +44,7 @@ func newRefreshCmd() *cobra.Command {
 	var message string
 	var execKind string
 	var execAgent string
-	var stack string
+	var stackName string
 
 	// Flags for remote operations.
 	remoteArgs := RemoteArgs{}
@@ -72,7 +73,7 @@ func newRefreshCmd() *cobra.Command {
 		use, cmdArgs = "refresh [url]", cmdutil.MaximumNArgs(1)
 	}
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   use,
 		Short: "Refresh the resources in a stack",
 		Long: "Refresh the resources in a stack.\n" +
@@ -80,7 +81,7 @@ func newRefreshCmd() *cobra.Command {
 			"This command compares the current stack's resource state with the state known to exist in\n" +
 			"the actual cloud provider. Any such changes are adopted into the current stack. Note that if\n" +
 			"the program text isn't updated accordingly, subsequent updates may still appear to be out of\n" +
-			"synch with respect to the cloud provider's source of truth.\n" +
+			"sync with respect to the cloud provider's source of truth.\n" +
 			"\n" +
 			"The program to run is loaded from the project in the current directory. Use the `-C` or\n" +
 			"`--cwd` flag to use a different directory.",
@@ -105,7 +106,7 @@ func newRefreshCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			var displayType = display.DisplayProgress
+			displayType := display.DisplayProgress
 			if diffDisplay {
 				displayType = display.DisplayDiff
 			}
@@ -137,14 +138,14 @@ func newRefreshCmd() *cobra.Command {
 				}
 
 				err = validateUnsupportedRemoteFlags(expectNop, nil, false, "", jsonDisplay, nil,
-					nil, "", showConfig, showReplacementSteps, showSames, false,
+					nil, "", showConfig, false, showReplacementSteps, showSames, false,
 					suppressOutputs, "default", targets, nil, nil,
 					false, "", stackConfigFile)
 				if err != nil {
 					return result.FromError(err)
 				}
 
-				return runDeployment(ctx, opts.Display, apitype.Refresh, stack, args[0], remoteArgs)
+				return runDeployment(ctx, opts.Display, apitype.Refresh, stackName, args[0], remoteArgs)
 			}
 
 			filestateBackend, err := isFilestateBackend(opts.Display)
@@ -158,7 +159,7 @@ func newRefreshCmd() *cobra.Command {
 				opts.Display.SuppressPermalink = true
 			}
 
-			s, err := requireStack(ctx, stack, true, opts.Display, false /*setCurrent*/)
+			s, err := requireStack(ctx, stackName, stackOfferNew, opts.Display)
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -168,17 +169,12 @@ func newRefreshCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			m, err := getUpdateMetadata(message, root, execKind, execAgent, false)
+			m, err := getUpdateMetadata(message, root, execKind, execAgent, false, cmd.Flags())
 			if err != nil {
 				return result.FromError(fmt.Errorf("gathering environment metadata: %w", err))
 			}
 
-			sm, err := getStackSecretsManager(s)
-			if err != nil {
-				return result.FromError(fmt.Errorf("getting secrets manager: %w", err))
-			}
-
-			cfg, err := getStackConfiguration(ctx, s, proj, sm)
+			cfg, sm, err := getStackConfiguration(ctx, s, proj, nil)
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack configuration: %w", err))
 			}
@@ -187,9 +183,19 @@ func newRefreshCmd() *cobra.Command {
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack decrypter: %w", err))
 			}
+			encrypter, err := sm.Encrypter()
+			if err != nil {
+				return result.FromError(fmt.Errorf("getting stack encrypter: %w", err))
+			}
 
 			stackName := s.Ref().Name().String()
-			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+				stackName,
+				proj,
+				cfg.Environment,
+				cfg.Config,
+				encrypter,
+				decrypter)
 			if configErr != nil {
 				return result.FromError(fmt.Errorf("validating stack config: %w", configErr))
 			}
@@ -205,8 +211,8 @@ func newRefreshCmd() *cobra.Command {
 				if stderr == nil {
 					stderr = os.Stderr
 				}
-				if unused, result := pendingCreatesToImports(ctx, s, yes, opts.Display, *importPendingCreates); result != nil {
-					return result
+				if unused, err := pendingCreatesToImports(ctx, s, yes, opts.Display, *importPendingCreates); err != nil {
+					return result.FromError(err)
 				} else if len(unused) > 1 {
 					fmt.Fprintf(stderr, "%s\n- \"%s\"\n", opts.Display.Color.Colorize(colors.Highlight(
 						"warning: the following urns did not correspond to a pending create",
@@ -219,16 +225,16 @@ func newRefreshCmd() *cobra.Command {
 				}
 			}
 
-			snap, err := s.Snapshot(ctx)
+			snap, err := s.Snapshot(ctx, stack.DefaultSecretsProvider)
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting snapshot: %w", err))
 			}
 
 			// We then allow the user to interactively handle remaining pending creates.
 			if interactive && hasPendingCreates(snap) && !skipPendingCreates {
-				if result := filterMapPendingCreates(ctx, s, opts.Display,
-					yes, interactiveFixPendingCreate); result != nil {
-					return result
+				if err := filterMapPendingCreates(ctx, s, opts.Display,
+					yes, interactiveFixPendingCreate); err != nil {
+					return result.FromError(err)
 				}
 			}
 
@@ -238,16 +244,14 @@ func newRefreshCmd() *cobra.Command {
 				removePendingCreates := func(op resource.Operation) (*resource.Operation, error) {
 					return nil, nil
 				}
-				result := filterMapPendingCreates(ctx, s, opts.Display, yes, removePendingCreates)
-				if result != nil {
-					return result
+				err := filterMapPendingCreates(ctx, s, opts.Display, yes, removePendingCreates)
+				if err != nil {
+					return result.FromError(err)
 				}
 			}
 
 			targetUrns := []string{}
-			for _, t := range *targets {
-				targetUrns = append(targetUrns, t)
-			}
+			targetUrns = append(targetUrns, *targets...)
 
 			opts.Engine = engine.UpdateOptions{
 				Parallel:                  parallel,
@@ -256,7 +260,7 @@ func newRefreshCmd() *cobra.Command {
 				DisableProviderPreview:    disableProviderPreview(),
 				DisableResourceReferences: disableResourceReferences(),
 				DisableOutputValues:       disableOutputValues(),
-				RefreshTargets:            deploy.NewUrnTargets(targetUrns),
+				Targets:                   deploy.NewUrnTargets(targetUrns),
 				Experimental:              hasExperimentalCommands(),
 			}
 
@@ -267,7 +271,8 @@ func newRefreshCmd() *cobra.Command {
 				Opts:               opts,
 				StackConfiguration: cfg,
 				SecretsManager:     sm,
-				Scopes:             cancellationScopes,
+				SecretsProvider:    stack.DefaultSecretsProvider,
+				Scopes:             backend.CancellationScopes,
 			})
 
 			switch {
@@ -290,7 +295,7 @@ func newRefreshCmd() *cobra.Command {
 		&expectNop, "expect-no-changes", false,
 		"Return an error if any changes occur during this update")
 	cmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
 		&stackConfigFile, "config-file", "",
@@ -371,7 +376,7 @@ type editPendingOp = func(op resource.Operation) (*resource.Operation, error)
 // is deleted. Otherwise is is replaced by the returned op.
 func filterMapPendingCreates(
 	ctx context.Context, s backend.Stack, opts display.Options, yes bool, f editPendingOp,
-) result.Result {
+) error {
 	return totalStateEdit(ctx, s, yes, opts, func(opts display.Options, snap *deploy.Snapshot) error {
 		var pending []resource.Operation
 		for _, op := range snap.PendingOperations {
@@ -399,16 +404,17 @@ func filterMapPendingCreates(
 // it is returned. The list of URNs that were not mapped to a pending create is also
 // returned.
 func pendingCreatesToImports(ctx context.Context, s backend.Stack, yes bool, opts display.Options,
-	importToCreates []string) ([]string, result.Result) {
+	importToCreates []string,
+) ([]string, error) {
 	// A map from URN to ID
 	if len(importToCreates)%2 != 0 {
-		return nil, result.Errorf("each URN must be followed by an ID: found an odd number of entries")
+		return nil, errors.New("each URN must be followed by an ID: found an odd number of entries")
 	}
 	alteredOps := make(map[string]string, len(importToCreates)/2)
 	for i := 0; i < len(importToCreates); i += 2 {
 		alteredOps[importToCreates[i]] = importToCreates[i+1]
 	}
-	result := filterMapPendingCreates(ctx, s, opts, yes, func(op resource.Operation) (*resource.Operation, error) {
+	err := filterMapPendingCreates(ctx, s, opts, yes, func(op resource.Operation) (*resource.Operation, error) {
 		if id, ok := alteredOps[string(op.Resource.URN)]; ok {
 			op.Resource.ID = resource.ID(id)
 			op.Type = resource.OperationTypeImporting
@@ -421,7 +427,7 @@ func pendingCreatesToImports(ctx context.Context, s backend.Stack, yes bool, opt
 	for k := range alteredOps {
 		unusedKeys = append(unusedKeys, k)
 	}
-	return unusedKeys, result
+	return unusedKeys, err
 }
 
 func hasPendingCreates(snap *deploy.Snapshot) bool {
@@ -440,9 +446,9 @@ func interactiveFixPendingCreate(op resource.Operation) (*resource.Operation, er
 	for {
 		option := ""
 		options := []string{
-			"import (the CREATE succeeded; provide a resource ID and complete the CREATE operation)",
 			"clear (the CREATE failed; remove the pending CREATE)",
 			"skip (do nothing)",
+			"import (the CREATE succeeded; provide a resource ID and complete the CREATE operation)",
 		}
 		if err := survey.AskOne(&survey.Select{
 			Message: fmt.Sprintf("Options for pending CREATE of %s", op.Resource.URN),
@@ -454,6 +460,10 @@ func interactiveFixPendingCreate(op resource.Operation) (*resource.Operation, er
 		var err error
 		switch option {
 		case options[0]:
+			return nil, nil
+		case options[1]:
+			return &op, nil
+		case options[2]:
 			var id string
 			err = survey.AskOne(&survey.Input{
 				Message: "ID: ",
@@ -463,10 +473,6 @@ func interactiveFixPendingCreate(op resource.Operation) (*resource.Operation, er
 				op.Type = resource.OperationTypeImporting
 				return &op, nil
 			}
-		case options[1]:
-			return nil, nil
-		case options[2]:
-			return &op, nil
 		default:
 			return nil, fmt.Errorf("unknown option: %q", option)
 		}

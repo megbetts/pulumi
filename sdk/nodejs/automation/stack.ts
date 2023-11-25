@@ -14,7 +14,7 @@
 
 import * as fs from "fs";
 import * as os from "os";
-import * as path from "path";
+import * as pathlib from "path";
 import * as readline from "readline";
 import * as upath from "upath";
 
@@ -29,6 +29,7 @@ import { EngineEvent, SummaryEvent } from "./events";
 import { LanguageServer, maxRPCMessageSize } from "./server";
 import { Deployment, PulumiFn, Workspace } from "./workspace";
 import { LocalWorkspace } from "./localWorkspace";
+import { TagMap } from "./tag";
 
 const langrpc = require("../proto/language_grpc_pb.js");
 
@@ -98,29 +99,28 @@ export class Stack {
         this.workspace = workspace;
 
         switch (mode) {
-        case "create":
-            this.ready = workspace.createStack(name);
-            return this;
-        case "select":
-            this.ready = workspace.selectStack(name);
-            return this;
-        case "createOrSelect":
-            this.ready = workspace.selectStack(name).catch((err) => {
-                if (err instanceof StackNotFoundError) {
-                    return workspace.createStack(name);
-                }
-                throw err;
-            });
-            return this;
-        default:
-            throw new Error(`unexpected Stack creation mode: ${mode}`);
+            case "create":
+                this.ready = workspace.createStack(name);
+                return this;
+            case "select":
+                this.ready = workspace.selectStack(name);
+                return this;
+            case "createOrSelect":
+                this.ready = workspace.selectStack(name).catch((err) => {
+                    if (err instanceof StackNotFoundError) {
+                        return workspace.createStack(name);
+                    }
+                    throw err;
+                });
+                return this;
+            default:
+                throw new Error(`unexpected Stack creation mode: ${mode}`);
         }
     }
     private async readLines(logPath: string, callback: (event: EngineEvent) => void): Promise<ReadlineResult> {
-        const eventLogTail = new TailFile(logPath, { startPos: 0, pollFileIntervalMs: 200 })
-            .on("tail_error", (err) => {
-                throw err;
-            });
+        const eventLogTail = new TailFile(logPath, { startPos: 0, pollFileIntervalMs: 200 }).on("tail_error", (err) => {
+            throw err;
+        });
         await eventLogTail.start();
         const lineSplitter = readline.createInterface({ input: eventLogTail });
         lineSplitter.on("line", (line) => {
@@ -144,7 +144,7 @@ Event: ${line}\n${e.toString()}`);
     }
     /**
      * Creates or updates the resources in a stack by executing the program in the Workspace.
-     * https://www.pulumi.com/docs/reference/cli/pulumi_up/
+     * https://www.pulumi.com/docs/cli/commands/pulumi_up/
      *
      * @param opts Options to customize the behavior of the update.
      */
@@ -164,6 +164,9 @@ Event: ${line}\n${e.toString()}`);
             }
             if (opts.expectNoChanges) {
                 args.push("--expect-no-changes");
+            }
+            if (opts.refresh) {
+                args.push("--refresh");
             }
             if (opts.diff) {
                 args.push("--diff");
@@ -203,7 +206,9 @@ Event: ${line}\n${e.toString()}`);
             applyGlobalOpts(opts, args);
         }
 
-        let onExit = (hasError: boolean) => { return; };
+        let onExit = (hasError: boolean) => {
+            return;
+        };
         let didError = false;
 
         if (program) {
@@ -271,7 +276,7 @@ Event: ${line}\n${e.toString()}`);
     }
     /**
      * Performs a dry-run update to a stack, returning pending changes.
-     * https://www.pulumi.com/docs/reference/cli/pulumi_preview/
+     * https://www.pulumi.com/docs/cli/commands/pulumi_preview/
      *
      * @param opts Options to customize the behavior of the preview.
      */
@@ -291,6 +296,9 @@ Event: ${line}\n${e.toString()}`);
             }
             if (opts.expectNoChanges) {
                 args.push("--expect-no-changes");
+            }
+            if (opts.refresh) {
+                args.push("--refresh");
             }
             if (opts.diff) {
                 args.push("--diff");
@@ -330,7 +338,9 @@ Event: ${line}\n${e.toString()}`);
             applyGlobalOpts(opts, args);
         }
 
-        let onExit = (hasError: boolean) => { return; };
+        let onExit = (hasError: boolean) => {
+            return;
+        };
         let didError = false;
 
         if (program) {
@@ -385,7 +395,9 @@ Event: ${line}\n${e.toString()}`);
         }
 
         if (!summaryEvent) {
-            log.warn("Failed to parse summary event, but preview succeeded. PreviewResult `changeSummary` will be empty.");
+            log.warn(
+                "Failed to parse summary event, but preview succeeded. PreviewResult `changeSummary` will be empty.",
+            );
         }
 
         return {
@@ -477,6 +489,9 @@ Event: ${line}\n${e.toString()}`);
             if (opts.targetDependents) {
                 args.push("--target-dependents");
             }
+            if (opts.excludeProtected) {
+                args.push("--exclude-protected");
+            }
             if (opts.parallel) {
                 args.push("--parallel", opts.parallel.toString());
             }
@@ -519,9 +534,10 @@ Event: ${line}\n${e.toString()}`);
      * Returns the config value associated with the specified key.
      *
      * @param key The key to use for the config lookup
+     * @param path The key contains a path to a property in a map or list to get
      */
-    async getConfig(key: string): Promise<ConfigValue> {
-        return this.workspace.getConfig(this.name, key);
+    async getConfig(key: string, path?: boolean): Promise<ConfigValue> {
+        return this.workspace.getConfig(this.name, key, path);
     }
     /**
      * Returns the full config map associated with the stack in the Workspace.
@@ -534,39 +550,74 @@ Event: ${line}\n${e.toString()}`);
      *
      * @param key The key to set.
      * @param value The config value to set.
+     * @param path The key contains a path to a property in a map or list to set.
      */
-    async setConfig(key: string, value: ConfigValue): Promise<void> {
-        return this.workspace.setConfig(this.name, key, value);
+    async setConfig(key: string, value: ConfigValue, path?: boolean): Promise<void> {
+        return this.workspace.setConfig(this.name, key, value, path);
     }
     /**
      * Sets all specified config values on the stack in the associated Workspace.
      *
      * @param config The map of config key-value pairs to set.
+     * @param path The keys contain a path to a property in a map or list to set.
      */
-    async setAllConfig(config: ConfigMap): Promise<void> {
-        return this.workspace.setAllConfig(this.name, config);
+    async setAllConfig(config: ConfigMap, path?: boolean): Promise<void> {
+        return this.workspace.setAllConfig(this.name, config, path);
     }
     /**
      * Removes the specified config key from the Stack in the associated Workspace.
      *
      * @param key The config key to remove.
+     * @param path The key contains a path to a property in a map or list to remove.
      */
-    async removeConfig(key: string): Promise<void> {
-        return this.workspace.removeConfig(this.name, key);
+    async removeConfig(key: string, path?: boolean): Promise<void> {
+        return this.workspace.removeConfig(this.name, key, path);
     }
     /**
      * Removes the specified config keys from the Stack in the associated Workspace.
      *
      * @param keys The config keys to remove.
+     * @param path The keys contain a path to a property in a map or list to remove.
      */
-    async removeAllConfig(keys: string[]): Promise<void> {
-        return this.workspace.removeAllConfig(this.name, keys);
+    async removeAllConfig(keys: string[], path?: boolean): Promise<void> {
+        return this.workspace.removeAllConfig(this.name, keys, path);
     }
     /**
      * Gets and sets the config map used with the last update.
      */
     async refreshConfig(): Promise<ConfigMap> {
         return this.workspace.refreshConfig(this.name);
+    }
+    /**
+     * Returns the tag value associated with specified key.
+     *
+     * @param key The key to use for the tag lookup.
+     */
+    async getTag(key: string): Promise<string> {
+        return this.workspace.getTag(this.name, key);
+    }
+    /**
+     * Sets a tag key-value pair on the Stack in the associated Workspace.
+     *
+     * @param key The tag key to set.
+     * @param value The tag value to set.
+     */
+    async setTag(key: string, value: string): Promise<void> {
+        await this.workspace.setTag(this.name, key, value);
+    }
+    /**
+     * Removes the specified tag key-value pair from the Stack in the associated Workspace.
+     *
+     * @param key The tag key to remove.
+     */
+    async removeTag(key: string): Promise<void> {
+        await this.workspace.removeTag(this.name, key);
+    }
+    /**
+     * Returns the full tag map associated with the stack in the Workspace.
+     */
+    async listTags(): Promise<TagMap> {
+        return this.workspace.listTags(this.name);
     }
     /**
      * Gets the current set of Stack outputs from the last Stack.up().
@@ -635,7 +686,7 @@ Event: ${line}\n${e.toString()}`);
 
     private async runPulumiCmd(args: string[], onOutput?: (out: string) => void): Promise<CommandResult> {
         let envs: { [key: string]: string } = {
-            "PULUMI_DEBUG_COMMANDS": "true",
+            PULUMI_DEBUG_COMMANDS: "true",
         };
         if (this.isRemote) {
             envs["PULUMI_EXPERIMENTAL"] = "true";
@@ -736,21 +787,22 @@ export type UpdateResult = "not-started" | "in-progress" | "succeeded" | "failed
 /**
  * The granular CRUD operation performed on a particular resource during an update.
  */
-export type OpType = "same"
-| "create"
-| "update"
-| "delete"
-| "replace"
-| "create-replacement"
-| "delete-replaced"
-| "read"
-| "read-replacement"
-| "refresh"
-| "discard"
-| "discard-replaced"
-| "remove-pending-replace"
-| "import"
-| "import-replacement";
+export type OpType =
+    | "same"
+    | "create"
+    | "update"
+    | "delete"
+    | "replace"
+    | "create-replacement"
+    | "delete-replaced"
+    | "read"
+    | "read-replacement"
+    | "refresh"
+    | "discard"
+    | "discard-replaced"
+    | "remove-pending-replace"
+    | "import"
+    | "import-replacement";
 
 /**
  * A map of operation types and their corresponding counts.
@@ -823,6 +875,10 @@ export interface UpOptions extends GlobalOpts {
     parallel?: number;
     message?: string;
     expectNoChanges?: boolean;
+    /**
+     * Refresh the state of the stack's resources before this update.
+     */
+    refresh?: boolean;
     diff?: boolean;
     replace?: string[];
     policyPacks?: string[];
@@ -850,6 +906,10 @@ export interface PreviewOptions extends GlobalOpts {
     parallel?: number;
     message?: string;
     expectNoChanges?: boolean;
+    /**
+     * Refresh the state of the stack's resources against the cloud provider before running preview.
+     */
+    refresh?: boolean;
     diff?: boolean;
     replace?: string[];
     policyPacks?: string[];
@@ -897,6 +957,10 @@ export interface DestroyOptions extends GlobalOpts {
     color?: "always" | "never" | "raw" | "auto";
     // Include secrets in the DestroySummary
     showSecrets?: boolean;
+    /**
+     * Do not destroy protected resources.
+     */
+    excludeProtected?: boolean;
 }
 
 const execKind = {
@@ -923,12 +987,16 @@ const cleanUp = async (logFile?: string, rl?: ReadlineResult) => {
     }
     if (logFile) {
         // remove the logfile
-        if(fs.rm) {
+        if (fs.rm) {
             // remove with Node JS 15.X+
-            fs.rm(path.dirname(logFile), { recursive: true }, () => { return; });
+            fs.rm(pathlib.dirname(logFile), { recursive: true }, () => {
+                return;
+            });
         } else {
             // remove with Node JS 14.X
-            fs.rmdir(path.dirname(logFile), { recursive: true }, () => { return; });
+            fs.rmdir(pathlib.dirname(logFile), { recursive: true }, () => {
+                return;
+            });
         }
     }
 };

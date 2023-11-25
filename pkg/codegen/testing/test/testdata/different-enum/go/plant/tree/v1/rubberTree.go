@@ -8,7 +8,8 @@ import (
 	"reflect"
 
 	"different-enum/plant"
-	"github.com/pkg/errors"
+	"different-enum/plant/internal"
+	"errors"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
@@ -32,18 +33,19 @@ func NewRubberTree(ctx *pulumi.Context,
 	if args.Container != nil {
 		args.Container = args.Container.ToContainerPtrOutput().ApplyT(func(v *plant.Container) *plant.Container { return v.Defaults() }).(plant.ContainerPtrOutput)
 	}
-	if isZero(args.Diameter) {
+	if args.Diameter == nil {
 		args.Diameter = Diameter(6.0)
 	}
-	if isZero(args.Farm) {
+	if args.Farm == nil {
 		args.Farm = pulumi.StringPtr("(unknown)")
 	}
-	if isZero(args.Size) {
+	if args.Size == nil {
 		args.Size = TreeSize("medium")
 	}
-	if isZero(args.Type) {
+	if args.Type == nil {
 		args.Type = RubberTreeVariety("Burgundy")
 	}
+	opts = internal.PkgResourceDefaultOpts(opts)
 	var resource RubberTree
 	err := ctx.RegisterResource("plant:tree/v1:RubberTree", name, args, &resource, opts...)
 	if err != nil {

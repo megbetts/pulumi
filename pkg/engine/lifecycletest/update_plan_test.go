@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: goconst
 package lifecycletest
 
 import (
@@ -24,10 +23,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	. "github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/display"
+	. "github.com/pulumi/pulumi/pkg/v3/engine" //nolint:revive
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
@@ -40,29 +39,29 @@ func TestPlannedUpdate(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
-				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
 				},
 			}, nil
 		}),
 	}
 
 	var ins resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
 		assert.NoError(t, err)
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -81,8 +80,8 @@ func TestPlannedUpdate(t *testing.T) {
 		},
 		"zed": computed,
 	})
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Attempt to run an update using the plan.
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -95,8 +94,8 @@ func TestPlannedUpdate(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resA violates plan: "+
 			"properties changed: +-baz[{map[a:{42} b:output<string>{}]}], +-foo[{bar}]<{%reset%}>\n"))
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 1) {
@@ -121,8 +120,8 @@ func TestPlannedUpdate(t *testing.T) {
 		"zed": "grr",
 	})
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 2) {
@@ -151,7 +150,8 @@ func TestUnplannedCreate(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
 			}, nil
@@ -162,7 +162,7 @@ func TestUnplannedCreate(t *testing.T) {
 		"foo": "bar",
 	})
 	createResource := false
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		if createResource {
 			_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 				Inputs: ins,
@@ -171,25 +171,28 @@ func TestUnplannedCreate(t *testing.T) {
 		}
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create a plan to do nothing
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Now set the flag for the language runtime to create a resource, and run update with the plan
 	createResource = true
 	p.Options.Plan = plan.Clone()
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>create is not allowed by the plan: no steps were expected for this resource<{%reset%}>\n"))
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+	assert.NoError(t, err)
 
 	// Check nothing was was created
 	assert.NotNil(t, snap)
@@ -205,14 +208,16 @@ func TestUnplannedDelete(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 				DeleteF: func(
 					urn resource.URN,
 					id resource.ID,
-					olds resource.PropertyMap,
-					timeout float64) (resource.Status, error) {
+					oldInputs, oldOutputs resource.PropertyMap,
+					timeout float64,
+				) (resource.Status, error) {
 					return resource.StatusOK, nil
 				},
 			}, nil
@@ -223,7 +228,7 @@ func TestUnplannedDelete(t *testing.T) {
 		"foo": "bar",
 	})
 	createAllResources := true
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -238,21 +243,24 @@ func TestUnplannedDelete(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial snapshot that resA and resB exist
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Create a plan that resA and resB won't change
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Now set the flag for the language runtime to not create resB and run an update with
 	// the no-op plan, this should block the delete
@@ -260,9 +268,9 @@ func TestUnplannedDelete(t *testing.T) {
 	p.Options.Plan = plan.Clone()
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>delete is not allowed by the plan: this resource is constrained to same<{%reset%}>\n"))
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check both resources and the provider are still listed in the snapshot
 	if !assert.Len(t, snap.Resources, 3) {
@@ -277,14 +285,16 @@ func TestExpectedDelete(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 				DeleteF: func(
 					urn resource.URN,
 					id resource.ID,
-					olds resource.PropertyMap,
-					timeout float64) (resource.Status, error) {
+					oldInputs, oldOutputs resource.PropertyMap,
+					timeout float64,
+				) (resource.Status, error) {
 					return resource.StatusOK, nil
 				},
 			}, nil
@@ -295,7 +305,7 @@ func TestExpectedDelete(t *testing.T) {
 		"foo": "bar",
 	})
 	createAllResources := true
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -310,24 +320,27 @@ func TestExpectedDelete(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial snapshot that resA and resB exist
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Create a plan that resA is same and resB is deleted
 	createAllResources = false
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now run but set the runtime to return resA and resB, given we expected resB to be deleted
 	// this should be an error
@@ -336,9 +349,9 @@ func TestExpectedDelete(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resB violates plan: "+
 			"resource unexpectedly not deleted<{%reset%}>\n"))
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check both resources and the provider are still listed in the snapshot
 	if !assert.Len(t, snap.Resources, 3) {
@@ -353,7 +366,8 @@ func TestExpectedCreate(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 			}, nil
@@ -364,7 +378,7 @@ func TestExpectedCreate(t *testing.T) {
 		"foo": "bar",
 	})
 	createAllResources := false
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -379,24 +393,27 @@ func TestExpectedCreate(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial snapshot that resA exists
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Create a plan that resA is same and resB is created
 	createAllResources = true
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now run but set the runtime to return resA, given we expected resB to be created
 	// this should be an error
@@ -405,9 +422,9 @@ func TestExpectedCreate(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>expected resource operations for "+
 			"urn:pulumi:test::test::pkgA:m:typA::resB but none were seen<{%reset%}>\n"))
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check resA and the provider are still listed in the snapshot
 	if !assert.Len(t, snap.Resources, 2) {
@@ -422,7 +439,8 @@ func TestPropertySetChange(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 			}, nil
@@ -433,7 +451,7 @@ func TestPropertySetChange(t *testing.T) {
 		"foo":  "bar",
 		"frob": "baz",
 	})
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -441,18 +459,21 @@ func TestPropertySetChange(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial plan to create resA
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now change the runtime to not return property "frob", this should error
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -462,9 +483,9 @@ func TestPropertySetChange(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resA violates plan: "+
 			"properties changed: +-frob[{baz}]<{%reset%}>\n"))
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 }
 
 func TestExpectedUnneededCreate(t *testing.T) {
@@ -474,7 +495,8 @@ func TestExpectedUnneededCreate(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 			}, nil
@@ -484,7 +506,7 @@ func TestExpectedUnneededCreate(t *testing.T) {
 	ins := resource.NewPropertyMapFromMap(map[string]interface{}{
 		"foo": "bar",
 	})
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -492,29 +514,32 @@ func TestExpectedUnneededCreate(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create a plan that resA needs creating
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Create an a snapshot that resA exists
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now run again with the plan set but the snapshot that resA already exists
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check resA and the provider are still listed in the snapshot
 	if !assert.Len(t, snap.Resources, 2) {
@@ -529,14 +554,16 @@ func TestExpectedUnneededDelete(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 				DeleteF: func(
 					urn resource.URN,
 					id resource.ID,
-					olds resource.PropertyMap,
-					timeout float64) (resource.Status, error) {
+					oldInputs, oldOutputs resource.PropertyMap,
+					timeout float64,
+				) (resource.Status, error) {
 					return resource.StatusOK, nil
 				},
 			}, nil
@@ -547,7 +574,7 @@ func TestExpectedUnneededDelete(t *testing.T) {
 		"foo": "bar",
 	})
 	createResource := true
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		if createResource {
 			_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 				Inputs: ins,
@@ -557,33 +584,36 @@ func TestExpectedUnneededDelete(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial snapshot that resA exists
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Create a plan that resA is deleted
 	createResource = false
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Now run to delete resA
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now run again with the plan set but the snapshot that resA is already deleted
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check the resources are still gone
 	if !assert.Len(t, snap.Resources, 0) {
@@ -602,12 +632,9 @@ func TestResoucesWithSames(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
-				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
 				},
 			}, nil
 		}),
@@ -616,7 +643,7 @@ func TestResoucesWithSames(t *testing.T) {
 	var ins resource.PropertyMap
 	createA := false
 	createB := false
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		if createA {
 			_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 				Inputs: ins,
@@ -634,10 +661,13 @@ func TestResoucesWithSames(t *testing.T) {
 		}
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -650,14 +680,14 @@ func TestResoucesWithSames(t *testing.T) {
 		"foo": "bar",
 		"zed": computed,
 	})
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Run an update that creates B
 	createA = false
 	createB = true
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 2) {
@@ -677,8 +707,8 @@ func TestResoucesWithSames(t *testing.T) {
 		"zed": 24,
 	})
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 3) {
@@ -706,29 +736,29 @@ func TestPlannedPreviews(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
-				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
 				},
 			}, nil
 		}),
 	}
 
 	var ins resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
 		assert.NoError(t, err)
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -747,8 +777,8 @@ func TestPlannedPreviews(t *testing.T) {
 		},
 		"zed": computed,
 	})
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Attempt to run a new preview using the plan, given we've changed the property set this should fail
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -761,8 +791,8 @@ func TestPlannedPreviews(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resA violates plan: properties changed: "+
 			"+-baz[{map[a:{42} b:output<string>{}]}], +-foo[{bar}]<{%reset%}>\n"))
-	_, res = TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, validate)
-	assert.Nil(t, res)
+	_, err = TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, validate)
+	assert.NoError(t, err)
 
 	// Attempt to run an preview using the plan, such that the property set is now valid
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -778,8 +808,8 @@ func TestPlannedPreviews(t *testing.T) {
 		"zed": "grr",
 	})
 	p.Options.Plan = plan.Clone()
-	_, res = TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	_, err = TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 }
 
 func TestPlannedUpdateChangedStack(t *testing.T) {
@@ -791,29 +821,29 @@ func TestPlannedUpdateChangedStack(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
-				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
 				},
 			}, nil
 		}),
 	}
 
 	var ins resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
 		assert.NoError(t, err)
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -823,24 +853,24 @@ func TestPlannedUpdateChangedStack(t *testing.T) {
 		"foo": "bar",
 		"zed": 24,
 	})
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Generate a plan that we want to change foo
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
 		"foo": "baz",
 		"zed": 24,
 	})
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Change zed in the stack
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
 		"foo": "bar",
 		"zed": 26,
 	})
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Attempt to run an update using the plan but where we haven't updated our program for the change of zed
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -851,8 +881,8 @@ func TestPlannedUpdateChangedStack(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resA violates plan: "+
 			"properties changed: =~zed[{24}]<{%reset%}>\n"))
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
+	assert.NoError(t, err)
 
 	// Check the resource's state we shouldn't of changed anything because the update failed
 	if !assert.Len(t, snap.Resources, 2) {
@@ -873,7 +903,8 @@ func TestPlannedOutputChanges(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 			}, nil
@@ -884,7 +915,7 @@ func TestPlannedOutputChanges(t *testing.T) {
 		"foo":  "bar",
 		"frob": "baz",
 	})
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		urn, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{})
 		assert.NoError(t, err)
 
@@ -893,18 +924,21 @@ func TestPlannedOutputChanges(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial plan to create resA and the outputs
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now change the runtime to not return property "frob", this should error
 	outs = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -913,9 +947,9 @@ func TestPlannedOutputChanges(t *testing.T) {
 	p.Options.Plan = plan.Clone()
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource violates plan: properties changed: +-frob[{baz}]<{%reset%}>\n"))
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 }
 
 func TestPlannedInputOutputDifferences(t *testing.T) {
@@ -938,11 +972,14 @@ func TestPlannedInputOutputDifferences(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), createOutputs, resource.StatusOK, nil
 				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
+				UpdateF: func(urn resource.URN, id resource.ID,
+					oldInputs, oldOutputs, newInputs resource.PropertyMap,
+					timeout float64, ignoreChanges []string, preview bool,
+				) (resource.PropertyMap, resource.Status, error) {
 					return updateOutputs, resource.StatusOK, nil
 				},
 			}, nil
@@ -953,31 +990,35 @@ func TestPlannedInputOutputDifferences(t *testing.T) {
 		"foo":  "bar",
 		"frob": "baz",
 	})
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
-			Inputs: inputs})
+			Inputs: inputs,
+		})
 		assert.NoError(t, err)
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial plan to create resA
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check we can create resA even though its outputs are different to the planned inputs
 	p.Options.Plan = plan.Clone()
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Make a plan to change resA
 	inputs = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -985,9 +1026,9 @@ func TestPlannedInputOutputDifferences(t *testing.T) {
 		"frob": "newBazzer",
 	})
 	p.Options.Plan = nil
-	plan, res = TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	plan, err = TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Test the plan fails if we don't pass newBazzer
 	inputs = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -998,9 +1039,9 @@ func TestPlannedInputOutputDifferences(t *testing.T) {
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resA violates plan: "+
 			"properties changed: ~~frob[{newBazzer}!={differentBazzer}]<{%reset%}>\n"))
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, validate)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Check the plan succeeds if we do pass newBazzer
 	inputs = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -1008,9 +1049,9 @@ func TestPlannedInputOutputDifferences(t *testing.T) {
 		"frob": "newBazzer",
 	})
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 }
 
 func TestAliasWithPlans(t *testing.T) {
@@ -1022,7 +1063,8 @@ func TestAliasWithPlans(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
 			}, nil
@@ -1035,7 +1077,7 @@ func TestAliasWithPlans(t *testing.T) {
 		"foo":  "bar",
 		"frob": "baz",
 	})
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", resourceName, true, deploytest.ResourceOptions{
 			Inputs:    ins,
 			AliasURNs: aliases,
@@ -1044,32 +1086,35 @@ func TestAliasWithPlans(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Create an initial ResA
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Update the name and alias and make a plan for resA
 	resourceName = "newResA"
 	aliases = make([]resource.URN, 1)
 	aliases[0] = resource.URN("urn:pulumi:test::test::pkgA:m:typA::resA")
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Now try and run with the plan
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 }
 
 func TestComputedCanBeDropped(t *testing.T) {
@@ -1082,19 +1127,16 @@ func TestComputedCanBeDropped(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
-				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
 				},
 			}, nil
 		}),
 	}
 
 	var resourceInputs resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		urn, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{})
 		assert.NoError(t, err)
 
@@ -1109,10 +1151,13 @@ func TestComputedCanBeDropped(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -1156,14 +1201,14 @@ func TestComputedCanBeDropped(t *testing.T) {
 
 	// Generate a plan.
 	resourceInputs = computedPropertySet
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Attempt to run an update using the plan with all computed values removed
 	resourceInputs = partialPropertySet
 	p.Options.Plan = plan.Clone()
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 3) {
@@ -1176,8 +1221,8 @@ func TestComputedCanBeDropped(t *testing.T) {
 	// Now run an update to set the values of the computed properties...
 	resourceInputs = fullPropertySet
 	p.Options.Plan = nil
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 3) {
@@ -1189,14 +1234,14 @@ func TestComputedCanBeDropped(t *testing.T) {
 
 	// ...and then build a new plan where they're computed updates (vs above where its computed creates)
 	resourceInputs = computedPropertySet
-	plan, res = TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err = TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Now run the an update with the plan and check the update is allowed to remove these properties
 	resourceInputs = partialPropertySet
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 3) {
@@ -1214,16 +1259,13 @@ func TestPlannedUpdateWithNondeterministicCheck(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
-				},
 				CheckF: func(urn resource.URN,
-					olds, news resource.PropertyMap, _ []byte) (resource.PropertyMap, []plugin.CheckFailure, error) {
-
+					olds, news resource.PropertyMap, _ []byte,
+				) (resource.PropertyMap, []plugin.CheckFailure, error) {
 					// If we have name use it, else use olds name, else make one up
 					if _, has := news["name"]; has {
 						return news, nil, nil
@@ -1234,8 +1276,8 @@ func TestPlannedUpdateWithNondeterministicCheck(t *testing.T) {
 						return result, nil, nil
 					}
 
-					name, err := resource.NewUniqueHex(urn.Name().String(), 8, 512)
-					assert.Nil(t, err)
+					name, err := resource.NewUniqueHex(urn.Name(), 8, 512)
+					assert.NoError(t, err)
 
 					result := news.Copy()
 					result["name"] = resource.NewStringProperty(name)
@@ -1246,7 +1288,7 @@ func TestPlannedUpdateWithNondeterministicCheck(t *testing.T) {
 	}
 
 	var ins resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, outs, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -1261,10 +1303,13 @@ func TestPlannedUpdateWithNondeterministicCheck(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -1275,8 +1320,8 @@ func TestPlannedUpdateWithNondeterministicCheck(t *testing.T) {
 		"foo": "bar",
 		"zed": computed,
 	})
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 
 	// Attempt to run an update using the plan.
 	// This should fail because of the non-determinism
@@ -1289,8 +1334,8 @@ func TestPlannedUpdateWithNondeterministicCheck(t *testing.T) {
 	validate := ExpectDiagMessage(t,
 		"<{%reset%}>resource urn:pulumi:test::test::pkgA:m:typA::resA violates plan: "+
 			"properties changed: \\+\\+name\\[{res[\\d\\w]{9}}!={res[\\d\\w]{9}}\\]<{%reset%}>\\n")
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+	assert.NoError(t, err)
 
 	// Check the resource's state.
 	if !assert.Len(t, snap.Resources, 1) {
@@ -1307,15 +1352,13 @@ func TestPlannedUpdateWithCheckFailure(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
 				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
-				},
 				CheckF: func(urn resource.URN, olds, news resource.PropertyMap,
-					randomSeed []byte) (resource.PropertyMap, []plugin.CheckFailure, error) {
+					randomSeed []byte,
+				) (resource.PropertyMap, []plugin.CheckFailure, error) {
 					if news["foo"].StringValue() == "bad" {
 						return nil, []plugin.CheckFailure{
 							{Property: resource.PropertyKey("foo"), Reason: "Bad foo"},
@@ -1328,17 +1371,20 @@ func TestPlannedUpdateWithCheckFailure(t *testing.T) {
 	}
 
 	var ins resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
 		assert.NoError(t, err)
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
@@ -1349,18 +1395,18 @@ func TestPlannedUpdateWithCheckFailure(t *testing.T) {
 	})
 	validate := ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>pkgA:m:typA resource 'resA': property foo value {bad} has a problem: Bad foo<{%reset%}>\n"))
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, validate)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, validate)
 	assert.Nil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Generate a plan with good inputs
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
 		"foo": "good",
 	})
-	plan, res = TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err = TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
 	assert.Contains(t, plan.ResourcePlans, resource.URN("urn:pulumi:test::test::pkgA:m:typA::resA"))
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Try and run against the plan with inputs that will fail Check
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -1369,8 +1415,8 @@ func TestPlannedUpdateWithCheckFailure(t *testing.T) {
 	p.Options.Plan = plan.Clone()
 	validate = ExpectDiagMessage(t, regexp.QuoteMeta(
 		"<{%reset%}>pkgA:m:typA resource 'resA': property foo value {bad} has a problem: Bad foo<{%reset%}>\n"))
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, validate)
+	assert.NoError(t, err)
 	assert.NotNil(t, snap)
 
 	// Check the resource's state.
@@ -1390,23 +1436,26 @@ func TestPluginsAreDownloaded(t *testing.T) {
 
 	semver10 := semver.MustParse("1.0.0")
 
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{})
 		assert.NoError(t, err)
 		return nil
 	}, workspace.PluginSpec{Name: "pkgA"}, workspace.PluginSpec{Name: "pkgB", Version: &semver10})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
 	assert.Contains(t, plan.ResourcePlans, resource.URN("urn:pulumi:test::test::pkgA:m:typA::resA"))
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 }
 
 func TestProviderDeterministicPreview(t *testing.T) {
@@ -1420,14 +1469,15 @@ func TestProviderDeterministicPreview(t *testing.T) {
 				CheckF: func(
 					urn resource.URN,
 					olds, news resource.PropertyMap,
-					randomSeed []byte) (resource.PropertyMap, []plugin.CheckFailure, error) {
+					randomSeed []byte,
+				) (resource.PropertyMap, []plugin.CheckFailure, error) {
 					// make a deterministic autoname
 					if _, has := news["name"]; !has {
 						if name, has := olds["name"]; has {
 							news["name"] = name
 						} else {
-							name, err := resource.NewUniqueName(randomSeed, urn.Name().String(), -1, -1, nil)
-							assert.Nil(t, err)
+							name, err := resource.NewUniqueName(randomSeed, urn.Name(), -1, -1, nil)
+							assert.NoError(t, err)
 							generatedName = resource.NewStringProperty(name)
 							news["name"] = generatedName
 						}
@@ -1438,9 +1488,10 @@ func TestProviderDeterministicPreview(t *testing.T) {
 				DiffF: func(
 					urn resource.URN,
 					id resource.ID,
-					olds, news resource.PropertyMap,
-					ignoreChanges []string) (plugin.DiffResult, error) {
-					if !olds["foo"].DeepEquals(news["foo"]) {
+					oldInputs, oldOutputs, newInputs resource.PropertyMap,
+					ignoreChanges []string,
+				) (plugin.DiffResult, error) {
+					if !oldOutputs["foo"].DeepEquals(newInputs["foo"]) {
 						// If foo changes do a replace, we use this to check we get a new name
 						return plugin.DiffResult{
 							Changes:     plugin.DiffSome,
@@ -1450,12 +1501,9 @@ func TestProviderDeterministicPreview(t *testing.T) {
 					return plugin.DiffResult{}, nil
 				},
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return "created-id", news, resource.StatusOK, nil
-				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
 				},
 			}, nil
 		}, deploytest.WithoutGrpc),
@@ -1465,32 +1513,35 @@ func TestProviderDeterministicPreview(t *testing.T) {
 		"foo": "bar",
 	})
 
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
 		assert.NoError(t, err)
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true, Experimental: true},
+		Options: TestUpdateOptions{
+			HostF:         hostF,
+			UpdateOptions: UpdateOptions{GeneratePlan: true, Experimental: true},
+		},
 	}
 
 	project := p.GetProject()
 
 	// Run a preview, this should want to create resA with a given name
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
-	assert.Nil(t, res)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), p.Options, p.BackendClient, nil)
+	assert.NoError(t, err)
 	assert.True(t, generatedName.IsString())
 	assert.NotEqual(t, "", generatedName.StringValue())
 	expectedName := generatedName
 
 	// Run an update, we should get the same name as we saw in preview
 	p.Options.Plan = plan
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Len(t, snap.Resources, 2)
 	assert.Equal(t, expectedName, snap.Resources[1].Inputs["name"])
@@ -1501,8 +1552,8 @@ func TestProviderDeterministicPreview(t *testing.T) {
 		"foo": "baz",
 	})
 	p.Options.Plan = nil
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
-	assert.Nil(t, res)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 	assert.NotNil(t, snap)
 	assert.Len(t, snap.Resources, 2)
 	assert.NotEqual(t, expectedName, snap.Resources[1].Inputs["name"])
@@ -1518,19 +1569,18 @@ func TestPlannedUpdateWithDependentDelete(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			return &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap, timeout float64,
-					preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					return resource.ID("created-id-" + urn.Name()), news, resource.StatusOK, nil
 				},
-				UpdateF: func(urn resource.URN, id resource.ID, olds, news resource.PropertyMap, timeout float64,
-					ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-					return news, resource.StatusOK, nil
-				},
 				CheckF: func(urn resource.URN,
-					olds, news resource.PropertyMap, _ []byte) (resource.PropertyMap, []plugin.CheckFailure, error) {
+					olds, news resource.PropertyMap, _ []byte,
+				) (resource.PropertyMap, []plugin.CheckFailure, error) {
 					return news, nil, nil
 				},
 				DiffF: func(urn resource.URN,
-					id resource.ID, olds, news resource.PropertyMap, ignoreChanges []string) (plugin.DiffResult, error) {
+					id resource.ID, oldInputs, oldOutputs, newInputs resource.PropertyMap, ignoreChanges []string,
+				) (plugin.DiffResult, error) {
 					if strings.Contains(string(urn), "resA") || strings.Contains(string(urn), "resB") {
 						assert.NotNil(t, diffResult, "Diff was called but diffResult wasn't set")
 						return *diffResult, nil
@@ -1542,7 +1592,7 @@ func TestPlannedUpdateWithDependentDelete(t *testing.T) {
 	}
 
 	var ins resource.PropertyMap
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		resA, _, outs, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
 			Inputs: ins,
 		})
@@ -1556,10 +1606,10 @@ func TestPlannedUpdateWithDependentDelete(t *testing.T) {
 
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, GeneratePlan: true},
+		Options: TestUpdateOptions{HostF: hostF, UpdateOptions: UpdateOptions{GeneratePlan: true}},
 	}
 
 	project := p.GetProject()
@@ -1569,9 +1619,9 @@ func TestPlannedUpdateWithDependentDelete(t *testing.T) {
 		"foo": "bar",
 		"zed": "baz",
 	})
-	snap, res := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
+	snap, err := TestOp(Update).Run(project, p.GetTarget(t, nil), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	// Update the input and mark it as a replace, check that both A and B are marked as replacements
 	ins = resource.NewPropertyMapFromMap(map[string]interface{}{
@@ -1590,16 +1640,155 @@ func TestPlannedUpdateWithDependentDelete(t *testing.T) {
 		},
 		DeleteBeforeReplace: true,
 	}
-	plan, res := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, snap), p.Options, p.BackendClient, nil)
 	assert.NotNil(t, plan)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
 
 	assert.Equal(t, 3, len(plan.ResourcePlans["urn:pulumi:test::test::pkgA:m:typA::resA"].Ops))
 	assert.Equal(t, 3, len(plan.ResourcePlans["urn:pulumi:test::test::pkgA:m:typB::resB"].Ops))
 
 	// Now try and run with the plan
 	p.Options.Plan = plan.Clone()
-	snap, res = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
+	snap, err = TestOp(Update).Run(project, p.GetTarget(t, snap), p.Options, false, p.BackendClient, nil)
 	assert.NotNil(t, snap)
-	assert.Nil(t, res)
+	assert.NoError(t, err)
+}
+
+// TestResourcesTargeted checks that a plan created with targets specified captures only those targets and
+// default providers. It checks that trying to construct a new resource that was not targeted in the plan
+// fails and that the update with the same --targets specified is compatible with the plan (roundtripped).
+func TestResoucesTargeted(t *testing.T) {
+	t.Parallel()
+
+	loaders := []*deploytest.ProviderLoader{
+		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
+			return &deploytest.Provider{}, nil
+		}),
+	}
+
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+		_, _, _, err := monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
+			Inputs: resource.PropertyMap{
+				"foo": resource.NewStringProperty("bar"),
+			},
+		})
+		assert.NoError(t, err)
+
+		_, _, _, err = monitor.RegisterResource("pkgA:m:typA", "resB", true, deploytest.ResourceOptions{
+			Inputs: resource.PropertyMap{
+				"foo": resource.NewStringProperty("bar"),
+			},
+		})
+		assert.NoError(t, err)
+
+		return nil
+	})
+
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+
+	p := &TestPlan{}
+
+	project := p.GetProject()
+
+	// Create the update plan with only targeted resources.
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), TestUpdateOptions{
+		HostF: hostF,
+		UpdateOptions: UpdateOptions{
+			Experimental: true,
+			GeneratePlan: true,
+			Targets: deploy.NewUrnTargets([]string{
+				"urn:pulumi:test::test::pkgA:m:typA::resB",
+			}),
+		},
+	}, p.BackendClient, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, plan)
+
+	// Check that running an update with everything targeted fails due to our plan being constrained
+	// to the resource.
+	_, err = TestOp(Update).Run(project, p.GetTarget(t, nil), TestUpdateOptions{
+		HostF: hostF,
+		UpdateOptions: UpdateOptions{
+			// Clone the plan as the plan will be mutated by the engine and useless in future runs.
+			Plan:         plan.Clone(),
+			Experimental: true,
+		},
+	}, false, p.BackendClient, nil)
+	assert.Error(t, err)
+
+	// Check that running an update with the same Targets as the Plan succeeds.
+	_, err = TestOp(Update).Run(project, p.GetTarget(t, nil), TestUpdateOptions{
+		HostF: hostF,
+		UpdateOptions: UpdateOptions{
+			// Clone the plan as the plan will be mutated by the engine and useless in future runs.
+			Plan:         plan.Clone(),
+			Experimental: true,
+			Targets: deploy.NewUrnTargets([]string{
+				"urn:pulumi:test::test::pkgA:m:typA::resB",
+			}),
+		},
+	}, false, p.BackendClient, nil)
+	assert.NoError(t, err)
+}
+
+// This test checks that registering resource outputs does not fail for the root stack resource when it
+// is not specified by the update targets.
+func TestStackOutputsWithTargetedPlan(t *testing.T) {
+	t.Parallel()
+
+	p := &TestPlan{}
+
+	loaders := []*deploytest.ProviderLoader{
+		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
+			return &deploytest.Provider{}, nil
+		}),
+	}
+
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+		stackURN, _, _, err := monitor.RegisterResource("pulumi:pulumi:Stack", "test-test", false)
+		assert.NoError(t, err)
+
+		_, _, _, err = monitor.RegisterResource("pkgA:m:typA", "resA", true)
+
+		assert.NoError(t, err)
+
+		err = monitor.RegisterResourceOutputs(stackURN, resource.PropertyMap{
+			"foo": resource.NewStringProperty("bar"),
+		})
+
+		assert.NoError(t, err)
+
+		return nil
+	})
+
+	p.Options.HostF = deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+
+	project := p.GetProject()
+
+	// Create the update plan without targeting the root stack.
+	plan, err := TestOp(Update).Plan(project, p.GetTarget(t, nil), TestUpdateOptions{
+		HostF: p.Options.HostF,
+		UpdateOptions: UpdateOptions{
+			Experimental: true,
+			GeneratePlan: true,
+			Targets: deploy.NewUrnTargetsFromUrns([]resource.URN{
+				resource.URN("urn:pulumi:test::test::pkgA:m:typA::resA"),
+			}),
+		},
+	}, p.BackendClient, nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, plan)
+
+	// Check that update succeeds despite the root stack not being targeted.
+	_, err = TestOp(Update).Run(project, p.GetTarget(t, nil), TestUpdateOptions{
+		HostF: p.Options.HostF,
+		UpdateOptions: UpdateOptions{
+			GeneratePlan: true,
+			Experimental: true,
+			Targets: deploy.NewUrnTargetsFromUrns([]resource.URN{
+				resource.URN("urn:pulumi:test::test::pkgA:m:typA::resA"),
+			}),
+		},
+	}, false, p.BackendClient, nil)
+	assert.NoError(t, err)
 }

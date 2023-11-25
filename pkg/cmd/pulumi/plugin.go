@@ -39,7 +39,9 @@ func newPluginCmd() *cobra.Command {
 			"resources, although most people will never need to do this.  To understand how to\n" +
 			"write and distribute your own plugins, please consult the relevant documentation.\n" +
 			"\n" +
-			"The plugin family of commands provides a way of explicitly managing plugins.",
+			"The plugin family of commands provides a way of explicitly managing plugins.\n" +
+			"\n" +
+			"For a list of available resource plugins, please see https://www.pulumi.com/registry/.",
 		Args: cmdutil.NoArgs,
 	}
 
@@ -58,7 +60,7 @@ func getProjectPlugins() ([]workspace.PluginSpec, error) {
 	}
 
 	projinfo := &engine.Projinfo{Proj: proj, Root: root}
-	pwd, main, ctx, err := engine.ProjectInfoContext(projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil)
+	pwd, main, ctx, err := engine.ProjectInfoContext(projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -84,8 +86,10 @@ func resolvePlugins(plugins []workspace.PluginSpec) ([]workspace.PluginInfo, err
 		return nil, err
 	}
 
+	d := cmdutil.Diag()
+
 	projinfo := &engine.Projinfo{Proj: proj, Root: root}
-	_, _, ctx, err := engine.ProjectInfoContext(projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil)
+	_, _, ctx, err := engine.ProjectInfoContext(projinfo, nil, d, d, false, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +100,7 @@ func resolvePlugins(plugins []workspace.PluginSpec) ([]workspace.PluginInfo, err
 	// a plugin required by the project hasn't yet been installed, we will simply skip any errors we encounter.
 	var results []workspace.PluginInfo
 	for _, plugin := range plugins {
-		info, err := workspace.GetPluginInfo(plugin.Kind, plugin.Name, plugin.Version, ctx.Host.GetProjectPlugins())
+		info, err := workspace.GetPluginInfo(d, plugin.Kind, plugin.Name, plugin.Version, ctx.Host.GetProjectPlugins())
 		if err != nil {
 			err = info.SetFileMetadata(info.Path)
 			if err != nil {

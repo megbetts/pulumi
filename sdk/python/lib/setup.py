@@ -14,8 +14,7 @@
 
 """The Pulumi Python SDK."""
 
-from setuptools import setup, find_packages
-
+from setuptools import find_packages, setup
 
 VERSION = "3.0.0"
 
@@ -45,10 +44,10 @@ setup(name='pulumi',
       # Keep this list in sync with Pipfile
       install_requires=[
           'protobuf~=4.21',
-          'grpcio==1.47',
+          'grpcio==1.56.2',
           'dill~=0.3',
           'six~=1.12',
-          'semver~=2.8',
+          'semver~=2.13',
           'pyyaml~=6.0'
       ],
       zip_safe=False)

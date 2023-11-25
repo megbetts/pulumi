@@ -17,14 +17,14 @@ import logging
 import sys
 import traceback
 from contextlib import suppress
+
 import grpc
 
-from ._workspace import PulumiFn
 from .. import log
-from ..runtime.proto import language_pb2, plugin_pb2, LanguageRuntimeServicer
-from ..runtime import run_in_stack, reset_options, set_all_config
-from ..runtime.rpc_manager import RPC_MANAGER
 from ..errors import RunError
+from ..runtime import reset_options, run_in_stack, set_all_config
+from ..runtime.proto import LanguageRuntimeServicer, language_pb2, plugin_pb2
+from ._workspace import PulumiFn
 
 _py_version_less_than_3_7 = sys.version_info[0] == 3 and sys.version_info[1] < 7
 
@@ -42,6 +42,15 @@ class LanguageServer(LanguageRuntimeServicer):
 
     def GetRequiredPlugins(self, request, context):
         return language_pb2.GetRequiredPluginsResponse()
+
+    def _exception_handler(self, loop, context):
+        # Exception are normally handler deeper in the stack. If this class of
+        # exception bubble up to here, something is wrong and we should stop
+        # the event loop
+        if "exception" in context and isinstance(context["exception"], grpc.RpcError):
+            loop.stop()
+        else:
+            loop.default_exception_handler(context)
 
     def Run(self, request, context):
         _suppress_unobserved_task_logging()
@@ -67,6 +76,7 @@ class LanguageServer(LanguageRuntimeServicer):
         result = language_pb2.RunResponse()
         loop = asyncio.new_event_loop()
 
+        loop.set_exception_handler(self._exception_handler)
         try:
             loop.run_until_complete(run_in_stack(self.program))
         except RunError as exn:
@@ -112,7 +122,6 @@ class LanguageServer(LanguageRuntimeServicer):
             loop.close()
             sys.stdout.flush()
             sys.stderr.flush()
-            RPC_MANAGER.clear()
 
         return result
 

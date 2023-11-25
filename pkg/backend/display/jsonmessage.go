@@ -173,10 +173,6 @@ func (r *messageRenderer) writeSimpleMessage(msg string) {
 	r.colorizeAndWriteProgress(makeMessageProgress(msg))
 }
 
-func (r *messageRenderer) writeBlankLine() {
-	r.writeSimpleMessage(" ")
-}
-
 func (r *messageRenderer) println(display *ProgressDisplay, line string) {
 	r.writeSimpleMessage(line)
 }
@@ -191,8 +187,8 @@ func (r *messageRenderer) tick(display *ProgressDisplay) {
 }
 
 func (r *messageRenderer) renderRow(display *ProgressDisplay,
-	id string, colorizedColumns []string, maxColumnLengths []int) {
-
+	id string, colorizedColumns []string, maxColumnLengths []int,
+) {
 	row := renderRow(colorizedColumns, maxColumnLengths)
 	if r.isInteractive {
 		// Ensure we don't go past the end of the terminal.  Note: this is made complex due to
@@ -329,9 +325,7 @@ func (r *messageRenderer) updateTerminalDimensions() {
 // `out` is a terminal. If this is the case, it will print `\n` at the end of each line and move the
 // cursor while displaying.
 func ShowProgressOutput(in <-chan Progress, out io.Writer, isInteractive bool) {
-	var (
-		ids = make(map[string]int)
-	)
+	ids := make(map[string]int)
 
 	var info terminal.Info
 	if isInteractive {

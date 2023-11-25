@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/httputil"
@@ -106,7 +107,6 @@ func setCommandGroups(cmd *cobra.Command, rootCgs []commandGroup) {
 	}
 
 	cmd.SetHelpFunc(func(c *cobra.Command, args []string) {
-
 		header := c.Long
 		if header == "" {
 			header = c.Short
@@ -152,6 +152,7 @@ func NewPulumiCmd() *cobra.Command {
 	var profiling string
 	var verbose int
 	var color string
+	var memProfileRate int
 
 	updateCheckResult := make(chan *diag.Diag)
 
@@ -220,12 +221,12 @@ func NewPulumiCmd() *cobra.Command {
 			log.SetOutput(loggingWriter)
 
 			if profiling != "" {
-				if err := cmdutil.InitProfiling(profiling); err != nil {
+				if err := cmdutil.InitProfiling(profiling, memProfileRate); err != nil {
 					logging.Warningf("could not initialize profiling: %v", err)
 				}
 			}
 
-			if cmdutil.IsTruthy(os.Getenv("PULUMI_SKIP_UPDATE_CHECK")) {
+			if env.SkipUpdateCheck.Value() {
 				logging.V(5).Infof("skipping update check")
 			} else {
 				// Run the version check in parallel so that it doesn't block executing the command.
@@ -277,13 +278,14 @@ func NewPulumiCmd() *cobra.Command {
 		"Emit tracing to the specified endpoint. Use the `file:` scheme to write tracing data to a local file")
 	cmd.PersistentFlags().StringVar(&profiling, "profiling", "",
 		"Emit CPU and memory profiles and an execution trace to '[filename].[pid].{cpu,mem,trace}', respectively")
+	cmd.PersistentFlags().IntVar(&memProfileRate, "memprofilerate", 0,
+		"Enable more precise (and expensive) memory allocation profiles by setting runtime.MemProfileRate")
 	cmd.PersistentFlags().IntVarP(&verbose, "verbose", "v", 0,
 		"Enable verbose logging (e.g., v=3); anything >3 is very verbose")
 	cmd.PersistentFlags().StringVar(
 		&color, "color", "auto", "Colorize output. Choices are: always, never, raw, auto")
 
 	setCommandGroups(cmd, []commandGroup{
-
 		// Common commands:
 		{
 			Name: "Stack Management Commands",
@@ -295,6 +297,7 @@ func NewPulumiCmd() *cobra.Command {
 				newImportCmd(),
 				newRefreshCmd(),
 				newStateCmd(),
+				newInstallCmd(),
 			},
 		},
 		{
@@ -307,7 +310,13 @@ func NewPulumiCmd() *cobra.Command {
 			},
 		},
 		{
-			Name: "Service Commands",
+			Name: "Environment Commands",
+			Commands: []*cobra.Command{
+				newEnvCmd(),
+			},
+		},
+		{
+			Name: "Pulumi Cloud Commands",
 			Commands: []*cobra.Command{
 				newLoginCmd(),
 				newLogoutCmd(),
@@ -334,6 +343,7 @@ func NewPulumiCmd() *cobra.Command {
 			Commands: []*cobra.Command{
 				newVersionCmd(),
 				newAboutCmd(),
+				newGenCompletionCmd(cmd),
 			},
 		},
 
@@ -341,7 +351,6 @@ func NewPulumiCmd() *cobra.Command {
 		{
 			Name: "Hidden Commands",
 			Commands: []*cobra.Command{
-				newGenCompletionCmd(cmd),
 				newGenMarkdownCmd(cmd),
 			},
 		},
@@ -365,6 +374,14 @@ func NewPulumiCmd() *cobra.Command {
 				newViewTraceCmd(),
 				newConvertTraceCmd(),
 				newReplayEventsCmd(),
+			},
+		},
+		// AI Commands relating to specifically the Pulumi AI service
+		//     and its related features
+		{
+			Name: "AI Commands",
+			Commands: []*cobra.Command{
+				newAICommand(),
 			},
 		},
 	})
@@ -393,14 +410,31 @@ func checkForUpdate(ctx context.Context) *diag.Diag {
 		return nil
 	}
 
-	latestVer, oldestAllowedVer, err := getCLIVersionInfo(ctx)
-	if err != nil {
-		logging.V(3).Infof("error fetching latest version information "+
-			"(set `PULUMI_SKIP_UPDATE_CHECK=true` to skip update checks): %s", err)
+	var skipUpdateCheck bool
+	latestVer, oldestAllowedVer, err := getCachedVersionInfo()
+	if err == nil {
+		// If we have a cached version, we already warned the user once
+		// in the last 24 hours--the cache is considered stale after that.
+		// So we don't need to warn again.
+		skipUpdateCheck = true
+	} else {
+		latestVer, oldestAllowedVer, err = getCLIVersionInfo(ctx)
+		if err != nil {
+			logging.V(3).Infof("error fetching latest version information "+
+				"(set `%s=true` to skip update checks): %s", env.SkipUpdateCheck.Var().Name(), err)
+		}
 	}
 
 	if oldestAllowedVer.GT(curVer) {
-		return diag.RawMessage("", getUpgradeMessage(latestVer, curVer))
+		msg := getUpgradeMessage(latestVer, curVer)
+		if skipUpdateCheck {
+			// If we're skipping the check,
+			// still log this to the internal logging system
+			// that users don't see by default.
+			logging.Warningf(msg)
+			return nil
+		}
+		return diag.RawMessage("", msg)
 	}
 
 	return nil
@@ -409,13 +443,8 @@ func checkForUpdate(ctx context.Context) *diag.Diag {
 // getCLIVersionInfo returns information about the latest version of the CLI and the oldest version that should be
 // allowed without warning. It caches data from the server for a day.
 func getCLIVersionInfo(ctx context.Context) (semver.Version, semver.Version, error) {
-	latest, oldest, err := getCachedVersionInfo()
-	if err == nil {
-		return latest, oldest, err
-	}
-
-	client := client.NewClient(httpstate.DefaultURL(), "", cmdutil.Diag())
-	latest, oldest, err = client.GetCLIVersionInfo(ctx)
+	client := client.NewClient(httpstate.DefaultURL(), "", false, cmdutil.Diag())
+	latest, oldest, err := client.GetCLIVersionInfo(ctx)
 	if err != nil {
 		return semver.Version{}, semver.Version{}, err
 	}
@@ -444,7 +473,7 @@ func cacheVersionInfo(latest semver.Version, oldest semver.Version) error {
 		return err
 	}
 
-	file, err := os.OpenFile(updateCheckFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
+	file, err := os.OpenFile(updateCheckFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -473,7 +502,7 @@ func getCachedVersionInfo() (semver.Version, semver.Version, error) {
 		return semver.Version{}, semver.Version{}, errors.New("cached expired")
 	}
 
-	file, err := os.OpenFile(updateCheckFile, os.O_RDONLY, 0600)
+	file, err := os.OpenFile(updateCheckFile, os.O_RDONLY, 0o600)
 	if err != nil {
 		return semver.Version{}, semver.Version{}, err
 	}
@@ -513,7 +542,7 @@ func getUpgradeMessage(latest semver.Version, current semver.Version) string {
 		msg += "run \n   " + cmd + "\nor "
 	}
 
-	msg += "visit https://pulumi.com/docs/reference/install/ for manual instructions and release notes."
+	msg += "visit https://pulumi.com/docs/install/ for manual instructions and release notes."
 	return msg
 }
 
@@ -535,7 +564,7 @@ func getUpgradeCommand() string {
 		logging.V(3).Infof("error determining if the running executable was installed with brew: %s", err)
 	}
 	if isBrew {
-		return "$ brew upgrade pulumi"
+		return "$ brew update && brew upgrade pulumi"
 	}
 
 	if filepath.Dir(exe) != filepath.Join(curUser.HomeDir, workspace.BookkeepingDir, "bin") {
@@ -612,8 +641,9 @@ func getLatestBrewFormulaVersion() (semver.Version, bool, error) {
 		return semver.Version{}, false, nil
 	}
 
-	url, err := url.Parse("https://formulae.brew.sh/api/formula/pulumi.json")
-	contract.AssertNoError(err)
+	const formulaJSON = "https://formulae.brew.sh/api/formula/pulumi.json"
+	url, err := url.Parse(formulaJSON)
+	contract.AssertNoErrorf(err, "Could not parse URL %q", formulaJSON)
 
 	resp, err := httputil.DoWithRetry(&http.Request{
 		Method: http.MethodGet,
@@ -651,18 +681,27 @@ func isDevVersion(s semver.Version) bool {
 }
 
 func confirmPrompt(prompt string, name string, opts display.Options) bool {
+	out := opts.Stdout
+	if out == nil {
+		out = os.Stdout
+	}
+	in := opts.Stdin
+	if in == nil {
+		in = os.Stdin
+	}
+
 	if prompt != "" {
-		fmt.Print(
+		fmt.Fprint(out,
 			opts.Color.Colorize(
 				fmt.Sprintf("%s%s%s\n", colors.SpecAttention, prompt, colors.Reset)))
 	}
 
-	fmt.Print(
+	fmt.Fprint(out,
 		opts.Color.Colorize(
 			fmt.Sprintf("%sPlease confirm that this is what you'd like to do by typing `%s%s%s`:%s ",
 				colors.SpecAttention, colors.SpecPrompt, name, colors.SpecAttention, colors.Reset)))
 
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(in)
 	line, _ := reader.ReadString('\n')
 	return strings.TrimSpace(line) == name
 }

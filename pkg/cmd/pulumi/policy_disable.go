@@ -28,23 +28,24 @@ type policyDisableArgs struct {
 func newPolicyDisableCmd() *cobra.Command {
 	args := policyDisableArgs{}
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "disable <org-name>/<policy-pack-name>",
 		Args:  cmdutil.ExactArgs(1),
 		Short: "Disable a Policy Pack for a Pulumi organization",
 		Long:  "Disable a Policy Pack for a Pulumi organization",
 		Run: cmdutil.RunFunc(func(cmd *cobra.Command, cliArgs []string) error {
 			ctx := commandContext()
-			// Obtain current PolicyPack, tied to the Pulumi service backend.
+			// Obtain current PolicyPack, tied to the Pulumi Cloud backend.
 			var err error
-			policyPack, err := requirePolicyPack(ctx, cliArgs[0])
+			policyPack, err := requirePolicyPack(ctx, cliArgs[0], loginToCloud)
 			if err != nil {
 				return err
 			}
 
 			// Attempt to disable the Policy Pack.
 			return policyPack.Disable(ctx, args.policyGroup, backend.PolicyPackOperation{
-				VersionTag: &args.version, Scopes: cancellationScopes})
+				VersionTag: &args.version, Scopes: backend.CancellationScopes,
+			})
 		}),
 	}
 

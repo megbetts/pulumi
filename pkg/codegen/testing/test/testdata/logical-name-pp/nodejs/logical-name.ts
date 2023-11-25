@@ -2,9 +2,10 @@ import * as pulumi from "@pulumi/pulumi";
 import * as random from "@pulumi/random";
 
 export = async () => {
-    const resourceLexicalName = new random.RandomPet("aA-Alpha_alpha.🤯⁉️", {});
-    const outputLexicalName = resourceLexicalName.id;
+    const config = new pulumi.Config();
+    const configLexicalName = config.require("cC-Charlie_charlie.😃⁉️");
+    const resourceLexicalName = new random.RandomPet("aA-Alpha_alpha.🤯⁉️", {prefix: configLexicalName});
     return {
-        "bB-Beta_beta.💜⁉": outputLexicalName,
+        "bB-Beta_beta.💜⁉": resourceLexicalName.id,
     };
 }

@@ -13,40 +13,37 @@
 # limitations under the License.
 import asyncio
 import os
+import pathlib
 import traceback
-
 from typing import (
-    Optional,
+    TYPE_CHECKING,
     Any,
     Callable,
-    List,
-    NamedTuple,
     Dict,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
-    TYPE_CHECKING,
-    cast,
-    Mapping,
-    Sequence,
-    Iterable,
 )
-from google.protobuf import struct_pb2
+
 import grpc
+from google.protobuf import struct_pb2
 
-from . import rpc, settings, known_types
-from .. import log
-from ..runtime.proto import provider_pb2, resource_pb2, alias_pb2
-from .rpc_manager import RPC_MANAGER
-from .settings import handle_grpc_error
-from .resource_cycle_breaker import declare_dependency
-from ..output import Output
-from .. import _types
+from .. import _types, log
 from .. import urn as urn_util
-
+from ..output import Input, Output
+from ..runtime.proto import alias_pb2, resource_pb2, source_pb2
+from . import known_types, rpc, settings
+from .rpc import _expand_dependencies
+from .settings import _get_rpc_manager, handle_grpc_error
 
 if TYPE_CHECKING:
-    from .. import Resource, ComponentResource, CustomResource, Inputs, ProviderResource
+    from .. import Alias, CustomResource, Inputs, ProviderResource, Resource
     from ..resource import ResourceOptions
 
 
@@ -75,20 +72,76 @@ class ResourceResolverOperations(NamedTuple):
     An optional reference to a provider that should be used for this resource's CRUD operations.
     """
 
-    provider_refs: Dict[str, Optional[str]]
+    provider_refs: Dict[str, str]
     """
     An optional dict of references to providers that should be used for this resource's CRUD operations.
     """
 
-    property_dependencies: Dict[str, List[Optional[str]]]
+    property_dependencies: Dict[str, List[str]]
     """
     A map from property name to the URNs of the resources the property depends on.
     """
 
-    aliases: List[Optional[str]]
+    aliases: List[alias_pb2.Alias]
     """
     A list of aliases applied to this resource.
     """
+
+    deleted_with_urn: Optional[str]
+    """
+    If set, the providers Delete method will not be called for this resource
+    if specified resource is being deleted as well.
+    """
+
+    supports_alias_specs: bool
+    """
+    Returns whether the resource monitor supports alias specs which allows sending full alias specifications
+    to the engine.
+    """
+
+
+async def prepare_aliases(
+    resource: "Resource",
+    resource_options: Optional["ResourceOptions"],
+    supports_alias_specs: bool,
+) -> List[alias_pb2.Alias]:
+    aliases: List[alias_pb2.Alias] = []
+    if resource_options is None or resource_options.aliases is None:
+        return aliases
+
+    if supports_alias_specs:
+        for alias in resource_options.aliases:
+            resolved_alias = await Output.from_input(alias).future()
+            if resolved_alias is None:
+                continue
+            if isinstance(resolved_alias, str):
+                aliases.append(alias_pb2.Alias(urn=resolved_alias))
+            else:
+                alias_spec = await create_alias_spec(resolved_alias)  # type: ignore
+                aliases.append(alias_pb2.Alias(spec=alias_spec))
+    else:
+        # Using an version of the engine that does not support alias specs.  We will need to
+        # compute the aliases ourselves as full URNs and sent them to the engine as such.
+        alias_urns = all_aliases(
+            resource_options.aliases,
+            resource._name,
+            resource._type,
+            resource_options.parent,
+        )
+
+        distinct_alias_urns = set()
+        for alias_urn in alias_urns:
+            alias_urn_value = await Output.from_input(alias_urn).future()
+            if (
+                alias_urn_value is not None
+                and alias_urn_value not in distinct_alias_urns
+            ):
+                distinct_alias_urns.add(alias_urn_value)
+
+        for alias_urn in distinct_alias_urns:
+            aliases.append(alias_pb2.Alias(urn=alias_urn))
+
+    return aliases
 
 
 # Prepares for an RPC that will manufacture a resource, and hence deals with input and output properties.
@@ -102,7 +155,6 @@ async def prepare_resource(
     opts: Optional["ResourceOptions"],
     typ: Optional[type] = None,
 ) -> ResourceResolverOperations:
-
     # Before we can proceed, all our dependencies must be finished.
     explicit_urn_dependencies: Set[str] = set()
     if opts is not None and opts.depends_on is not None:
@@ -142,7 +194,15 @@ async def prepare_resource(
 
     # Construct the provider reference, if we were given a provider to use.
     provider_ref = None
-    if custom and opts is not None and opts.provider is not None:
+    send_provider = custom
+    if remote and opts is not None and opts.provider is not None:
+        # If it's a remote component and a provider was specified, only
+        # send the provider in the request if the provider's package is
+        # the same as the component's package.
+        pkg = _pkg_from_type(ty)
+        if pkg is not None and pkg == opts.provider.package:
+            send_provider = True
+    if send_provider and opts is not None and opts.provider is not None:
         provider = opts.provider
 
         # If we were given a provider, wait for it to resolve and construct a provider reference from it.
@@ -153,7 +213,7 @@ async def prepare_resource(
 
     # For remote resources, merge any provider opts into a single dict, and then create a new dict with all of the
     # resolved provider refs.
-    provider_refs: Dict[str, Optional[str]] = {}
+    provider_refs: Dict[str, str] = {}
     if (remote or not custom) and opts is not None:
         providers = convert_providers(opts.provider, opts.providers)
         for name, provider in providers.items():
@@ -165,21 +225,17 @@ async def prepare_resource(
             provider_refs[name] = ref
 
     dependencies: Set[str] = set(explicit_urn_dependencies)
-    property_dependencies: Dict[str, List[Optional[str]]] = {}
+    property_dependencies: Dict[str, List[str]] = {}
     for key, deps in property_dependencies_resources.items():
         urns = await _expand_dependencies(deps, from_resource=res)
         dependencies |= urns
         property_dependencies[key] = list(urns)
 
-    # Wait for all aliases. Note that we use `res._aliases` instead of `opts.aliases` as the
-    # former has been processed in the Resource constructor prior to calling
-    # `register_resource` - both adding new inherited aliases and simplifying aliases down
-    # to URNs.
-    aliases: List[Optional[str]] = []
-    for alias in res._aliases:
-        alias_val = await Output.from_input(alias).future()
-        if not alias_val in aliases:
-            aliases.append(alias_val)
+    supports_alias_specs = await settings.monitor_supports_alias_specs()
+    aliases = await prepare_aliases(res, opts, supports_alias_specs)
+    deleted_with_urn: Optional[str] = ""
+    if opts is not None and opts.deleted_with is not None:
+        deleted_with_urn = await opts.deleted_with.urn.future()
 
     return ResourceResolverOperations(
         parent_urn,
@@ -189,13 +245,248 @@ async def prepare_resource(
         provider_refs,
         property_dependencies,
         aliases,
+        deleted_with_urn,
+        supports_alias_specs,
     )
+
+
+async def create_alias_spec(resolved_alias: "Alias") -> alias_pb2.Alias.Spec:
+    name: str = ""
+    resource_type: str = ""
+    stack: str = ""
+    project: str = ""
+    parent_urn: str = ""
+    no_parent: bool = False
+
+    if resolved_alias.name is not ... and resolved_alias.name is not None:
+        name = resolved_alias.name
+
+    if resolved_alias.type_ is not ... and resolved_alias.type_ is not None:
+        resource_type = resolved_alias.type_
+
+    if resolved_alias.stack is not ...:
+        stack_value = await Output.from_input(resolved_alias.stack).future()
+        if stack_value is not None:
+            stack = stack_value
+
+    if resolved_alias.project is not ...:
+        project_value = await Output.from_input(resolved_alias.project).future()
+        if project_value is not None:
+            project = project_value
+
+    if resolved_alias.parent is ...:
+        # parent is not specified (e.g. Alias(name="Foo")),
+        # default to current parent
+        no_parent = False
+    elif resolved_alias.parent is None:
+        # parent is explicitly set to None (e.g. Alias(name="Foo", parent=None))
+        # this means that the resource previously had no parent
+        no_parent = True
+    else:
+        # pylint: disable-next=import-outside-toplevel
+        from .. import Resource
+
+        if isinstance(resolved_alias.parent, Resource):
+            parent_urn_value = await resolved_alias.parent.urn.future()
+            if parent_urn_value is not None:
+                parent_urn = parent_urn_value
+                no_parent = False
+        elif isinstance(resolved_alias.parent, str):
+            parent_urn = resolved_alias.parent
+            no_parent = False
+        else:
+            # assume parent is Input[str] where str is the URN of the parent
+            parent_urn_value = await Output.from_input(resolved_alias.parent).future()  # type: ignore
+            if parent_urn_value is not None:
+                parent_urn = parent_urn_value
+                no_parent = False
+
+    if no_parent:
+        return alias_pb2.Alias.Spec(
+            name=name,
+            type=resource_type,
+            stack=stack,
+            project=project,
+            noParent=no_parent,
+        )
+
+    return alias_pb2.Alias.Spec(
+        name=name,
+        type=resource_type,
+        stack=stack,
+        project=project,
+        parentUrn=parent_urn,
+    )
+
+
+def inherited_child_alias(
+    child_name: str, parent_name: str, parent_alias: "Input[str]", child_type: str
+) -> "Output[str]":
+    """
+    inherited_child_alias computes the alias that should be applied to a child based on an alias
+    applied to it's parent. This may involve changing the name of the resource in cases where the
+    resource has a named derived from the name of the parent, and the parent name changed.
+    """
+
+    #   If the child name has the parent name as a prefix, then we make the assumption that it was
+    #   constructed from the convention of using `{name}-details` as the name of the child resource.  To
+    #   ensure this is aliased correctly, we must then also replace the parent aliases name in the prefix of
+    #   the child resource name.
+    #
+    #   For example:
+    #   * name: "newapp-function"
+    #   * opts.parent.__name: "newapp"
+    #   * parentAlias: "urn:pulumi:stackname::projectname::awsx:ec2:Vpc::app"
+    #   * parentAliasName: "app"
+    #   * aliasName: "app-function"
+    #   * childAlias: "urn:pulumi:stackname::projectname::aws:s3/bucket:Bucket::app-function"
+    alias_name = Output.from_input(child_name)
+    if child_name.startswith(parent_name):
+        alias_name = Output.from_input(parent_alias).apply(
+            lambda u: u[u.rfind("::") + 2 :] + child_name[len(parent_name) :]
+        )
+
+    return create_urn(alias_name, child_type, parent_alias)
+
+
+# Extract the type and name parts of a URN
+def urn_type_and_name(urn: str) -> Tuple[str, str]:
+    parts = urn.split("::")
+    type_parts = parts[2].split("$")
+    return (parts[3], type_parts[-1])
+
+
+def all_aliases(
+    child_aliases: Optional[Sequence["Input[Union[str, Alias]]"]],
+    child_name: str,
+    child_type: str,
+    parent: Optional["Resource"],
+) -> "List[Input[str]]":
+    """
+    Make a copy of the aliases array, and add to it any implicit aliases inherited from its parent.
+    If there are N child aliases, and M parent aliases, there will be (M+1)*(N+1)-1 total aliases,
+    or, as calculated in the logic below, N+(M*(1+N)).
+    """
+    aliases: "List[Input[str]]" = []
+
+    for child_alias in child_aliases or []:
+        aliases.append(
+            collapse_alias_to_urn(child_alias, child_name, child_type, parent)
+        )
+
+    if parent is not None:
+        parent_name = parent._name
+        for parent_alias in parent._aliases:
+            aliases.append(
+                inherited_child_alias(
+                    child_name, parent._name, parent_alias, child_type
+                )
+            )
+            for child_alias in child_aliases or []:
+                child_alias_urn = collapse_alias_to_urn(
+                    child_alias, child_name, child_type, parent
+                )
+
+                def inherited_alias_for_child_urn(
+                    child_alias_urn: str, parent_alias=parent_alias
+                ) -> "Output[str]":
+                    aliased_child_name, aliased_child_type = urn_type_and_name(
+                        child_alias_urn
+                    )
+                    return inherited_child_alias(
+                        aliased_child_name,
+                        parent_name,
+                        parent_alias,
+                        aliased_child_type,
+                    )
+
+                inherited_alias: Output[str] = child_alias_urn.apply(
+                    inherited_alias_for_child_urn
+                )
+                aliases.append(inherited_alias)
+
+    return aliases
+
+
+def collapse_alias_to_urn(
+    alias: "Input[Union[Alias, str]]",
+    defaultName: str,
+    defaultType: str,
+    defaultParent: Optional["Resource"],
+) -> "Output[str]":
+    """
+    collapse_alias_to_urn turns an Alias into a URN given a set of default data
+    """
+
+    def collapse_alias_to_urn_worker(inner: "Union[Alias, str]") -> Output[str]:
+        if isinstance(inner, str):
+            return Output.from_input(inner)
+
+        name: str = inner.name if inner.name is not ... else defaultName  # type: ignore
+        type_: str = inner.type_ if inner.type_ is not ... else defaultType  # type: ignore
+        parent = inner.parent if inner.parent is not ... else defaultParent  # type: ignore
+        project: "Input[str]" = settings.get_project()
+        if inner.project is not ... and inner.project is not None:
+            project = inner.project
+        stack: "Input[str]" = settings.get_stack()
+        if inner.stack is not ... and inner.stack is not None:
+            stack = inner.stack
+
+        if name is None:
+            raise Exception("No valid 'name' passed in for alias.")
+
+        if type_ is None:
+            raise Exception("No valid 'type_' passed in for alias.")
+
+        all_args = [project, stack]
+        return Output.all(*all_args).apply(
+            lambda args: create_urn(name, type_, parent, args[0], args[1])
+        )
+
+    inputAlias: "Output[Union[Alias, str]]" = Output.from_input(alias)
+    return inputAlias.apply(collapse_alias_to_urn_worker)
+
+
+def create_urn(
+    name: "Input[str]",
+    type_: "Input[str]",
+    parent: Optional[Union["Resource", "Input[str]"]] = None,
+    project: Optional[str] = None,
+    stack: Optional[str] = None,
+) -> "Output[str]":
+    """
+    create_urn computes a URN from the combination of a resource name, resource type, optional
+    parent, optional project and optional stack.
+    """
+    parent_prefix: Optional[Output[str]] = None
+    if parent is not None:
+        parent_urn = None
+        # pylint: disable=import-outside-toplevel
+        from .. import Resource
+
+        if isinstance(parent, Resource):
+            parent_urn = parent.urn
+        else:
+            parent_urn = Output.from_input(parent)
+
+        parent_prefix = parent_urn.apply(lambda u: u[0 : u.rfind("::")] + "$")
+    else:
+        if stack is None:
+            stack = settings.get_stack()
+
+        if project is None:
+            project = settings.get_project()
+
+        parent_prefix = Output.from_input("urn:pulumi:" + stack + "::" + project + "::")
+
+    all_args = [parent_prefix, type_, name]
+    # invariant http://mypy.readthedocs.io/en/latest/common_issues.html#variance
+    return Output.all(*all_args).apply(lambda arr: arr[0] + arr[1] + "::" + arr[2])  # type: ignore
 
 
 def resource_output(
     res: "Resource",
 ) -> Tuple[Callable[[Any, bool, bool, Optional[Exception]], None], "Output"]:
-
     value_future: asyncio.Future[Any] = asyncio.Future()
     known_future: asyncio.Future[bool] = asyncio.Future()
     secret_future: asyncio.Future[bool] = asyncio.Future()
@@ -302,7 +593,7 @@ def get_resource(
             transform_using_type_metadata,
         )
 
-    asyncio.ensure_future(RPC_MANAGER.do_rpc("get resource", do_get)())
+    asyncio.ensure_future(_get_rpc_manager().do_rpc("get resource", do_get)())
 
 
 def _translate_ignore_changes(
@@ -358,6 +649,34 @@ def _translate_replace_on_changes(
     return replace_on_changes
 
 
+def _get_source_position(skip: int) -> Optional[source_pb2.SourcePosition]:
+    """
+    Returns the source position of the Nth stack frame, where N is skip+1.
+
+    This is used to compute the source position of the user code that instantiated a resource. The number of frames to
+    skip is parameterized in order to account for differing call stacks for different operations.
+    """
+
+    # Capture a stack that includes the Nth stack frame. If the stack is not deep enough, return the empty string.
+    stack = traceback.extract_stack(limit=skip + 2)
+    if len(stack) < skip + 2:
+        return None
+
+    # Extract the Nth stack frame. If that frame is missing file or line information, return the empty string.
+    caller = stack[0]
+    if caller.filename == "" or caller.lineno is None:
+        return None
+
+    try:
+        uri = pathlib.Path(caller.filename).as_uri()
+    except BaseException:
+        return None
+
+    # Convert the Nth source position to a source position URI by converting the filename to a URI and appending
+    # the line and column fragment.
+    return source_pb2.SourcePosition(uri=uri, line=caller.lineno)
+
+
 def read_resource(
     res: "CustomResource",
     ty: str,
@@ -394,6 +713,18 @@ def read_resource(
     # Like below, "transfer" all input properties onto unresolved futures on res.
     resolvers = rpc.transfer_properties(res, props)
 
+    # Get the source position.
+    #
+    # This is somewhat brittle in that it expects a call stack of the form:
+    # - read_resource
+    # - Resource class constructor
+    # - abstract Resource subclass constructor
+    # - concrete Resource subclass constructor
+    # - user code
+    #
+    # This stack reflects the expected class hierarchy of "cloud resource / component resource < customresource/componentresource < resource".
+    source_position = _get_source_position(4)
+
     async def do_read():
         try:
             resolver = await prepare_resource(res, ty, True, False, props, opts, typ)
@@ -429,9 +760,8 @@ def read_resource(
                 acceptSecrets=True,
                 acceptResources=accept_resources,
                 additionalSecretOutputs=additional_secret_outputs,
+                sourcePosition=source_position,
             )
-
-            from ..resource import create_urn  # pylint: disable=import-outside-toplevel
 
             mock_urn = await create_urn(name, ty, resolver.parent_urn).future()
 
@@ -439,7 +769,7 @@ def read_resource(
                 if monitor is None:
                     # If no monitor is available, we'll need to fake up a response, for testing.
                     return RegisterResponse(
-                        mock_urn, None, resolver.serialized_props, None
+                        mock_urn or "", None, resolver.serialized_props, None
                     )
 
                 # If there is a monitor available, make the true RPC request to the engine.
@@ -472,7 +802,7 @@ def read_resource(
             transform_using_type_metadata,
         )
 
-    asyncio.ensure_future(RPC_MANAGER.do_rpc("read resource", do_read)())
+    asyncio.ensure_future(_get_rpc_manager().do_rpc("read resource", do_read)())
 
 
 def register_resource(
@@ -518,8 +848,27 @@ def register_resource(
     # passed to.  However, those futures won't actually resolve until the RPC returns
     resolvers = rpc.transfer_properties(res, props)
 
-    async def do_register():
+    # Get the source position.
+    #
+    # This is somewhat brittle in that it expects a call stack of the form:
+    # - register_resource
+    # - Resource class constructor
+    # - abstract Resource subclass constructor
+    # - concrete Resource subclass constructor
+    # - user code
+    #
+    # This stack reflects the expected class hierarchy of "cloud resource / component resource < customresource/componentresource < resource".
+    source_position = _get_source_position(4)
+
+    async def do_register() -> None:
         try:
+            from ..resource import (  # pylint: disable=import-outside-toplevel
+                ResourceOptions,
+            )
+
+            nonlocal opts
+            opts = opts if opts is not None else ResourceOptions()
+
             resolver = await prepare_resource(res, ty, custom, remote, props, opts, typ)
             log.debug(f"resource registration prepared: ty={ty}, name={name}")
 
@@ -562,7 +911,10 @@ def register_resource(
                         "Expected custom_timeouts to be a CustomTimeouts object"
                     )
 
-            if opts.deleted_with and not await settings.monitor_supports_deleted_with():
+            if (
+                resolver.deleted_with_urn
+                and not await settings.monitor_supports_deleted_with()
+            ):
                 raise Exception(
                     "The Pulumi CLI does not support the DeletedWith option. Please update the Pulumi CLI."
                 )
@@ -572,18 +924,25 @@ def register_resource(
                 in {"TRUE", "1"}
             )
 
+            full_aliases_specs: List[alias_pb2.Alias] | None = None
+            alias_urns: List[str] | None = None
+            if resolver.supports_alias_specs:
+                full_aliases_specs = resolver.aliases
+            else:
+                alias_urns = [alias.urn for alias in resolver.aliases]
+
             req = resource_pb2.RegisterResourceRequest(
                 type=ty,
                 name=name,
-                parent=resolver.parent_urn,
+                parent=resolver.parent_urn or "",
                 custom=custom,
                 object=resolver.serialized_props,
-                protect=opts.protect,
-                provider=resolver.provider_ref,
+                protect=opts.protect or False,
+                provider=resolver.provider_ref or "",
                 providers=resolver.provider_refs,
                 dependencies=resolver.dependencies,
                 propertyDependencies=property_dependencies,
-                deleteBeforeReplace=opts.delete_before_replace,
+                deleteBeforeReplace=opts.delete_before_replace or False,
                 deleteBeforeReplaceDefined=opts.delete_before_replace is not None,
                 ignoreChanges=ignore_changes,
                 version=opts.version or "",
@@ -591,25 +950,27 @@ def register_resource(
                 acceptSecrets=True,
                 acceptResources=accept_resources,
                 additionalSecretOutputs=additional_secret_outputs,
-                importId=opts.import_,
+                importId=opts.import_ or "",
                 customTimeouts=custom_timeouts,
-                aliases=[alias_pb2.Alias(urn=alias) for alias in resolver.aliases],
+                aliases=full_aliases_specs,
+                aliasURNs=alias_urns,
                 supportsPartialValues=True,
                 remote=remote,
-                replaceOnChanges=replace_on_changes,
+                replaceOnChanges=replace_on_changes or [],
                 retainOnDelete=opts.retain_on_delete or False,
-                deletedWith=opts.deleted_with,
+                deletedWith=resolver.deleted_with_urn or "",
+                sourcePosition=source_position,
             )
-
-            from ..resource import create_urn  # pylint: disable=import-outside-toplevel
 
             mock_urn = await create_urn(name, ty, resolver.parent_urn).future()
 
-            def do_rpc_call():
+            def do_rpc_call() -> (
+                Optional[Union[RegisterResponse, resource_pb2.RegisterResourceResponse]]
+            ):
                 if monitor is None:
                     # If no monitor is available, we'll need to fake up a response, for testing.
                     return RegisterResponse(
-                        mock_urn, None, resolver.serialized_props, None
+                        mock_urn or "", None, resolver.serialized_props, None
                     )
 
                 # If there is a monitor available, make the true RPC request to the engine.
@@ -658,18 +1019,18 @@ def register_resource(
                 resolve_id(resp.id, is_known, False, None)
                 resolve_id_called = True
 
-            deps = {}
+            property_deps = {}
             rpc_deps = resp.propertyDependencies
             if rpc_deps:
                 for k, v in rpc_deps.items():
                     urns = list(v.urns)
-                    deps[k] = set(map(new_dependency, urns))
+                    property_deps[k] = set(map(new_dependency, urns))
 
             rpc.resolve_outputs(
                 res,
                 resolver.serialized_props,
                 resp.object,
-                deps,
+                property_deps,
                 resolvers,
                 transform_using_type_metadata,
             )
@@ -689,7 +1050,7 @@ def register_resource(
 
             raise
 
-    asyncio.ensure_future(RPC_MANAGER.do_rpc("register resource", do_register)())
+    asyncio.ensure_future(_get_rpc_manager().do_rpc("register resource", do_register)())
 
 
 def register_resource_outputs(
@@ -725,7 +1086,9 @@ def register_resource_outputs(
         )
 
     asyncio.ensure_future(
-        RPC_MANAGER.do_rpc("register resource outputs", do_register_resource_outputs)()
+        _get_rpc_manager().do_rpc(
+            "register resource outputs", do_register_resource_outputs
+        )()
     )
 
 
@@ -781,72 +1144,6 @@ def convert_providers(
     return result
 
 
-async def _add_dependency(
-    deps: Set[str], res: "Resource", from_resource: Optional["Resource"]
-):
-    """
-    _add_dependency adds a dependency on the given resource to the set of deps.
-
-    The behavior of this method depends on whether or not the resource is a custom resource, a local component resource,
-    or a remote component resource:
-
-    - Custom resources are added directly to the set, as they are "real" nodes in the dependency graph.
-    - Local component resources act as aggregations of their descendents. Rather than adding the component resource
-      itself, each child resource is added as a dependency.
-    - Remote component resources are added directly to the set, as they naturally act as aggregations of their children
-      with respect to dependencies: the construction of a remote component always waits on the construction of its
-      children.
-
-    In other words, if we had:
-
-                     Comp1
-                 |     |     |
-             Cust1   Comp2  Remote1
-                     |   |       |
-                 Cust2   Cust3  Comp3
-                 |                 |
-             Cust4                Cust5
-
-    Then the transitively reachable resources of Comp1 will be [Cust1, Cust2, Cust3, Remote1].
-    It will *not* include:
-    * Cust4 because it is a child of a custom resource
-    * Comp2 because it is a non-remote component resoruce
-    * Comp3 and Cust5 because Comp3 is a child of a remote component resource
-    """
-
-    from .. import ComponentResource  # pylint: disable=import-outside-toplevel
-
-    if isinstance(res, ComponentResource) and not res._remote:
-        # Copy the set before iterating so that any concurrent child additions during
-        # the dependency computation (which is async, so can be interleaved with other
-        # operations including child resource construction which adds children to this
-        # resource) do not trigger modification during iteration errors.
-        child_resources = res._childResources.copy()
-        for child in child_resources:
-            await _add_dependency(deps, child, from_resource)
-        return
-
-    no_cycles = declare_dependency(from_resource, res) if from_resource else True
-    if no_cycles:
-        urn = await res.urn.future()
-        if urn:
-            deps.add(urn)
-
-
-async def _expand_dependencies(
-    deps: Iterable["Resource"], from_resource: Optional["Resource"]
-) -> Set[str]:
-    """
-    _expand_dependencies expands the given iterable of Resources into a set of URNs.
-    """
-
-    urns: Set[str] = set()
-    for d in deps:
-        await _add_dependency(urns, d, from_resource)
-
-    return urns
-
-
 async def _resolve_depends_on_urns(
     options: "ResourceOptions", from_resource: "Resource"
 ) -> Set[str]:
@@ -871,4 +1168,14 @@ async def _resolve_depends_on_urns(
         if direct_dep is not None:
             all_deps.add(direct_dep)
 
-    return await _expand_dependencies(all_deps, from_resource)
+    return await rpc._expand_dependencies(all_deps, from_resource)
+
+
+def _pkg_from_type(ty: str) -> Optional[str]:
+    """
+    Extract the pkg from the type token of the form "pkg:module:member".
+    """
+    parts = ty.split(":")
+    if len(parts) != 3:
+        return None
+    return parts[0]

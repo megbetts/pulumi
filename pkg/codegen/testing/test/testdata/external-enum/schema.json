@@ -47,10 +47,9 @@
       },
       "devDependencies": {
         "typescript": "^3.7.0",
-        "@types/node": "latest"
+        "@types/node": "ts3.7"
       },
-      "respectSchemaVersion": true,
-      "pluginVersion": "3.2.1"
+      "respectSchemaVersion": true
     },
     "python": {
       "requires": {
@@ -59,9 +58,6 @@
       }
     },
     "csharp": {
-      "projectReferences": [
-        "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-      ],
       "packageReferences": {
         "Pulumi": "3.13",
         "Pulumi.GoogleNative": "0.20.0"

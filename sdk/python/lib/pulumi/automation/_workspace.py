@@ -14,12 +14,13 @@
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Callable, Mapping, Any, List, Optional
+from typing import Any, Callable, List, Mapping, Optional
 
-from ._stack_settings import StackSettings
-from ._project_settings import ProjectSettings
 from ._config import ConfigMap, ConfigValue
 from ._output import OutputMap
+from ._project_settings import ProjectSettings
+from ._stack_settings import StackSettings
+from ._tag import TagMap
 
 PulumiFn = Callable[[], None]
 
@@ -29,7 +30,7 @@ class StackSummary:
 
     name: str
     current: bool
-    update_in_progress: bool
+    update_in_progress: Optional[bool]
     last_update: Optional[datetime]
     resource_count: Optional[int]
     url: Optional[str]
@@ -38,7 +39,7 @@ class StackSummary:
         self,
         name: str,
         current: bool,
-        update_in_progress: bool = False,
+        update_in_progress: Optional[bool] = None,
         last_update: Optional[datetime] = None,
         resource_count: Optional[int] = None,
         url: Optional[str] = None,
@@ -55,9 +56,18 @@ class WhoAmIResult:
     """The currently logged-in Pulumi identity."""
 
     user: str
+    url: Optional[str]
+    organizations: Optional[List[str]]
 
-    def __init__(self, user: str):
+    def __init__(
+        self,
+        user: str,
+        url: Optional[str] = None,
+        organizations: Optional[List[str]] = None,
+    ) -> None:
         self.user = user
+        self.url = url
+        self.organizations = organizations
 
 
 class PluginInfo:
@@ -197,13 +207,16 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def get_config(self, stack_name: str, key: str) -> ConfigValue:
+    def get_config(
+        self, stack_name: str, key: str, *, path: bool = False
+    ) -> ConfigValue:
         """
         Returns the value associated with the specified stack name and key,
         scoped to the Workspace.
 
         :param stack_name: The name of the stack.
         :param key: The key for the config item to get.
+        :param path: The key contains a path to a property in a map or list to get.
         :returns: ConfigValue
         """
 
@@ -217,40 +230,50 @@ class Workspace(ABC):
         """
 
     @abstractmethod
-    def set_config(self, stack_name: str, key: str, value: ConfigValue) -> None:
+    def set_config(
+        self, stack_name: str, key: str, value: ConfigValue, *, path: bool = False
+    ) -> None:
         """
         Sets the specified key-value pair on the provided stack name.
 
         :param stack_name: The name of the stack.
         :param key: The config key to add.
         :param value: The config value to add.
+        :param path: The key contains a path to a property in a map or list to set.
         """
 
     @abstractmethod
-    def set_all_config(self, stack_name: str, config: ConfigMap) -> None:
+    def set_all_config(
+        self, stack_name: str, config: ConfigMap, *, path: bool = False
+    ) -> None:
         """
         Sets all values in the provided config map for the specified stack name.
 
         :param stack_name: The name of the stack.
         :param config: A mapping of key to ConfigValue to set to config.
+        :param path: The keys contain a path to a property in a map or list to set.
         """
 
     @abstractmethod
-    def remove_config(self, stack_name: str, key: str) -> None:
+    def remove_config(self, stack_name: str, key: str, *, path: bool = False) -> None:
         """
         Removes the specified key-value pair on the provided stack name.
 
         :param stack_name: The name of the stack.
         :param key: The key to remove from config.
+        :param path: The key contains a path to a property in a map or list to remove.
         """
 
     @abstractmethod
-    def remove_all_config(self, stack_name: str, keys: List[str]) -> None:
+    def remove_all_config(
+        self, stack_name: str, keys: List[str], *, path: bool = False
+    ) -> None:
         """
         Removes all values in the provided key list for the specified stack name.
 
         :param stack_name: The name of the stack.
         :param keys: The keys to remove from config.
+        :param path: The keys contain a path to a property in a map or list to remove.
         """
 
     @abstractmethod
@@ -259,6 +282,45 @@ class Workspace(ABC):
         Gets and sets the config map used with the last update for Stack matching stack name.
 
         :param stack_name: The name of the stack.
+        """
+
+    @abstractmethod
+    def get_tag(self, stack_name: str, key: str) -> str:
+        """
+        Returns the value associated with the specified stack name and key,
+        scoped to the Workspace.
+
+        :param stack_name: The name of the stack.
+        :param key: The key to use for the tag lookup.
+        :returns: str
+        """
+
+    @abstractmethod
+    def set_tag(self, stack_name: str, key: str, value: str) -> None:
+        """
+        Sets the specified key-value pair on the provided stack name.
+
+        :param stack_name: The name of the stack.
+        :param key: The tag key to set.
+        :param value: The tag value to set.
+        """
+
+    @abstractmethod
+    def remove_tag(self, stack_name: str, key: str) -> None:
+        """
+        Removes the specified key-value pair on the provided stack name.
+
+        :param stack_name: The name of the stack.
+        :param key: The tag key to remove.
+        """
+
+    @abstractmethod
+    def list_tags(self, stack_name: str) -> TagMap:
+        """
+        Returns the tag map for the specified tag name, scoped to the Workspace.
+
+        :param stack_name: The name of the stack.
+        :returns: TagMap
         """
 
     @abstractmethod

@@ -18,10 +18,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model/pretty"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
 // UnionType represents values that may be any one of a specified set of types.
@@ -31,7 +34,7 @@ type UnionType struct {
 	// Annotations records any annotations associated with the object type.
 	Annotations []interface{}
 
-	s string
+	s atomic.Value // Value<string>
 }
 
 // NewUnionTypeAnnotated creates a new union type with the given element types and annotations.
@@ -103,6 +106,46 @@ func IsOptionalType(t Type) bool {
 // SyntaxNode returns the syntax node for the type. This is always syntax.None.
 func (*UnionType) SyntaxNode() hclsyntax.Node {
 	return syntax.None
+}
+
+func (t *UnionType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
+	elements := slice.Prealloc[pretty.Formatter](len(t.ElementTypes))
+	isOptional := false
+	unionFormatter := &pretty.List{
+		Separator: " | ",
+		Elements:  elements,
+	}
+
+	seenFormatters[t] = unionFormatter
+
+	for _, el := range t.ElementTypes {
+		if el == NoneType {
+			isOptional = true
+			continue
+		}
+		if seenFormatter, ok := seenFormatters[el]; ok {
+			unionFormatter.Elements = append(unionFormatter.Elements, seenFormatter)
+		} else {
+			formatter := el.pretty(seenFormatters)
+			seenFormatters[el] = formatter
+			unionFormatter.Elements = append(unionFormatter.Elements, formatter)
+		}
+	}
+
+	if isOptional {
+		return &pretty.Wrap{
+			Value:           seenFormatters[t],
+			Postfix:         "?",
+			PostfixSameline: true,
+		}
+	}
+
+	return seenFormatters[t]
+}
+
+func (t *UnionType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 // Traverse attempts to traverse the union type with the given traverser. This always fails.
@@ -249,20 +292,23 @@ func (t *UnionType) String() string {
 }
 
 func (t *UnionType) string(seen map[Type]struct{}) string {
-	if t.s == "" {
-		elements := make([]string, len(t.ElementTypes))
-		for i, e := range t.ElementTypes {
-			elements[i] = e.string(seen)
-		}
-
-		annotations := ""
-		if len(t.Annotations) != 0 {
-			annotations = fmt.Sprintf(", annotated(%p)", t)
-		}
-
-		t.s = fmt.Sprintf("union(%s%v)", strings.Join(elements, ", "), annotations)
+	if s := t.s.Load(); s != nil {
+		return s.(string)
 	}
-	return t.s
+
+	elements := make([]string, len(t.ElementTypes))
+	for i, e := range t.ElementTypes {
+		elements[i] = e.string(seen)
+	}
+
+	annotations := ""
+	if len(t.Annotations) != 0 {
+		annotations = fmt.Sprintf(", annotated(%p)", t)
+	}
+
+	s := fmt.Sprintf("union(%s%v)", strings.Join(elements, ", "), annotations)
+	t.s.Store(s)
+	return s
 }
 
 func (t *UnionType) unify(other Type) (Type, ConversionKind) {
@@ -275,7 +321,7 @@ func (t *UnionType) unifyTo(other Type) (Type, ConversionKind) {
 	switch other := other.(type) {
 	case *UnionType:
 		// If the other type is also a union type, produce a new type that is the union of their elements.
-		elements := make([]Type, 0, len(t.ElementTypes)+len(other.ElementTypes))
+		elements := slice.Prealloc[Type](len(t.ElementTypes) + len(other.ElementTypes))
 		elements = append(elements, t.ElementTypes...)
 		elements = append(elements, other.ElementTypes...)
 		return NewUnionType(elements...), SafeConversion

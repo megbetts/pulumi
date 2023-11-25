@@ -17,6 +17,10 @@ package deploytest
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
@@ -25,6 +29,8 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 type ResourceMonitor struct {
@@ -39,7 +45,7 @@ func dialMonitor(ctx context.Context, endpoint string) (*ResourceMonitor, error)
 	// Connect to the resource monitor and create an appropriate client.
 	conn, err := grpc.Dial(
 		endpoint,
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		rpcutil.GrpcChannelOptions(),
 	)
 	if err != nil {
@@ -76,6 +82,35 @@ func supportsFeature(ctx context.Context, resmon pulumirpc.ResourceMonitorClient
 	return resp.GetHasSupport(), nil
 }
 
+func parseSourcePosition(raw string) (*pulumirpc.SourcePosition, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	pos := pulumirpc.SourcePosition{
+		Uri: fmt.Sprintf("%v://%v", u.Scheme, u.Path),
+	}
+
+	line, col, _ := strings.Cut(u.Fragment, ",")
+	if line != "" {
+		l, err := strconv.ParseInt(line, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		pos.Line = int32(l)
+	}
+	if col != "" {
+		c, err := strconv.ParseInt(col, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		pos.Column = int32(c)
+	}
+
+	return &pos, nil
+}
+
 func (rm *ResourceMonitor) Close() error {
 	return rm.conn.Close()
 }
@@ -94,6 +129,7 @@ type ResourceOptions struct {
 	DeleteBeforeReplace     *bool
 	Version                 string
 	PluginDownloadURL       string
+	PluginChecksums         map[string][]byte
 	IgnoreChanges           []string
 	ReplaceOnChanges        []string
 	AliasURNs               []resource.URN
@@ -106,14 +142,17 @@ type ResourceOptions struct {
 	Remote                  bool
 	Providers               map[string]string
 	AdditionalSecretOutputs []resource.PropertyKey
+	AliasSpecs              bool
 
+	SourcePosition            string
 	DisableSecrets            bool
 	DisableResourceReferences bool
+	GrpcRequestHeaders        map[string]string
 }
 
 func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom bool,
-	options ...ResourceOptions) (resource.URN, resource.ID, resource.PropertyMap, error) {
-
+	options ...ResourceOptions,
+) (resource.URN, resource.ID, resource.PropertyMap, error) {
 	var opts ResourceOptions
 	if len(options) > 0 {
 		opts = options[0]
@@ -154,8 +193,8 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 				Project: a.Project,
 				Stack:   a.Stack,
 			}
-			if a.NoParent() {
-				alias.Parent = &pulumirpc.Alias_Spec_NoParent{NoParent: a.NoParent()}
+			if a.NoParent {
+				alias.Parent = &pulumirpc.Alias_Spec_NoParent{NoParent: a.NoParent}
 			} else if a.Parent != "" {
 				alias.Parent = &pulumirpc.Alias_Spec_ParentUrn{ParentUrn: string(a.Parent)}
 			}
@@ -177,11 +216,13 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 		}
 	}
 
-	var timeouts pulumirpc.RegisterResourceRequest_CustomTimeouts
+	var timeouts *pulumirpc.RegisterResourceRequest_CustomTimeouts
 	if opts.CustomTimeouts != nil {
-		timeouts.Create = prepareTestTimeout(opts.CustomTimeouts.Create)
-		timeouts.Update = prepareTestTimeout(opts.CustomTimeouts.Update)
-		timeouts.Delete = prepareTestTimeout(opts.CustomTimeouts.Delete)
+		timeouts = &pulumirpc.RegisterResourceRequest_CustomTimeouts{
+			Create: prepareTestTimeout(opts.CustomTimeouts.Create),
+			Update: prepareTestTimeout(opts.CustomTimeouts.Update),
+			Delete: prepareTestTimeout(opts.CustomTimeouts.Delete),
+		}
 	}
 
 	deleteBeforeReplace := false
@@ -196,6 +237,15 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 	for i, v := range opts.AdditionalSecretOutputs {
 		additionalSecretOutputs[i] = string(v)
 	}
+
+	var sourcePosition *pulumirpc.SourcePosition
+	if opts.SourcePosition != "" {
+		sourcePosition, err = parseSourcePosition(opts.SourcePosition)
+		if err != nil {
+			return "", "", nil, err
+		}
+	}
+
 	requestInput := &pulumirpc.RegisterResourceRequest{
 		Type:                       string(t),
 		Name:                       name,
@@ -214,20 +264,28 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 		Version:                    opts.Version,
 		AliasURNs:                  aliasStrings,
 		ImportId:                   string(opts.ImportID),
-		CustomTimeouts:             &timeouts,
+		CustomTimeouts:             timeouts,
 		SupportsPartialValues:      supportsPartialValues,
 		Remote:                     opts.Remote,
 		ReplaceOnChanges:           opts.ReplaceOnChanges,
 		Providers:                  opts.Providers,
 		PluginDownloadURL:          opts.PluginDownloadURL,
+		PluginChecksums:            opts.PluginChecksums,
 		RetainOnDelete:             opts.RetainOnDelete,
 		AdditionalSecretOutputs:    additionalSecretOutputs,
 		Aliases:                    aliasObjects,
 		DeletedWith:                string(opts.DeletedWith),
+		AliasSpecs:                 opts.AliasSpecs,
+		SourcePosition:             sourcePosition,
+	}
+
+	ctx := context.Background()
+	if len(opts.GrpcRequestHeaders) > 0 {
+		ctx = metadata.NewOutgoingContext(ctx, metadata.New(opts.GrpcRequestHeaders))
 	}
 
 	// submit request
-	resp, err := rm.resmon.RegisterResource(context.Background(), requestInput)
+	resp, err := rm.resmon.RegisterResource(ctx, requestInput)
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -266,8 +324,8 @@ func (rm *ResourceMonitor) RegisterResourceOutputs(urn resource.URN, outputs res
 }
 
 func (rm *ResourceMonitor) ReadResource(t tokens.Type, name string, id resource.ID, parent resource.URN,
-	inputs resource.PropertyMap, provider string, version string) (resource.URN, resource.PropertyMap, error) {
-
+	inputs resource.PropertyMap, provider, version, sourcePosition string,
+) (resource.URN, resource.PropertyMap, error) {
 	// marshal inputs
 	ins, err := plugin.MarshalProperties(inputs, plugin.MarshalOptions{
 		KeepUnknowns:  true,
@@ -277,15 +335,24 @@ func (rm *ResourceMonitor) ReadResource(t tokens.Type, name string, id resource.
 		return "", nil, err
 	}
 
+	var sourcePos *pulumirpc.SourcePosition
+	if sourcePosition != "" {
+		sourcePos, err = parseSourcePosition(sourcePosition)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
 	// submit request
 	resp, err := rm.resmon.ReadResource(context.Background(), &pulumirpc.ReadResourceRequest{
-		Type:       string(t),
-		Name:       name,
-		Id:         string(id),
-		Parent:     string(parent),
-		Provider:   provider,
-		Properties: ins,
-		Version:    version,
+		Type:           string(t),
+		Name:           name,
+		Id:             string(id),
+		Parent:         string(parent),
+		Provider:       provider,
+		Properties:     ins,
+		Version:        version,
+		SourcePosition: sourcePos,
 	})
 	if err != nil {
 		return "", nil, err
@@ -304,8 +371,8 @@ func (rm *ResourceMonitor) ReadResource(t tokens.Type, name string, id resource.
 }
 
 func (rm *ResourceMonitor) Invoke(tok tokens.ModuleMember, inputs resource.PropertyMap,
-	provider string, version string) (resource.PropertyMap, []*pulumirpc.CheckFailure, error) {
-
+	provider string, version string,
+) (resource.PropertyMap, []*pulumirpc.CheckFailure, error) {
 	// marshal inputs
 	ins, err := plugin.MarshalProperties(inputs, plugin.MarshalOptions{
 		KeepUnknowns:  true,
@@ -345,8 +412,8 @@ func (rm *ResourceMonitor) Invoke(tok tokens.ModuleMember, inputs resource.Prope
 
 func (rm *ResourceMonitor) Call(tok tokens.ModuleMember, inputs resource.PropertyMap,
 	provider string, version string) (resource.PropertyMap, map[resource.PropertyKey][]resource.URN,
-	[]*pulumirpc.CheckFailure, error) {
-
+	[]*pulumirpc.CheckFailure, error,
+) {
 	// marshal inputs
 	ins, err := plugin.MarshalProperties(inputs, plugin.MarshalOptions{
 		KeepUnknowns:  true,
@@ -383,18 +450,20 @@ func (rm *ResourceMonitor) Call(tok tokens.ModuleMember, inputs resource.Propert
 
 	// unmarshal return deps
 	deps := make(map[resource.PropertyKey][]resource.URN)
-	for _, p := range resp.ReturnDependencies {
+	for k, p := range resp.ReturnDependencies {
 		var urns []resource.URN
 		for _, urn := range p.Urns {
 			urns = append(urns, resource.URN(urn))
 		}
+		deps[resource.PropertyKey(k)] = urns
 	}
 
 	return outs, deps, nil, nil
 }
 
 func prepareTestTimeout(timeout float64) string {
-	mins := int(timeout) / 60
-
-	return fmt.Sprintf("%dm", mins)
+	if timeout == 0 {
+		return ""
+	}
+	return time.Duration(timeout * float64(time.Second)).String()
 }

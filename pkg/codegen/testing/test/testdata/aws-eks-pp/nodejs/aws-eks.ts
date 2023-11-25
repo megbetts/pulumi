@@ -31,7 +31,7 @@ export = async () => {
     // Subnets, one for each AZ in a region
     const zones = await aws.getAvailabilityZones({});
     const vpcSubnet: aws.ec2.Subnet[] = [];
-    for (const range of zones.names.map((k, v) => {key: k, value: v})) {
+    for (const range of zones.names.map((v, k) => ({key: k, value: v}))) {
         vpcSubnet.push(new aws.ec2.Subnet(`vpcSubnet-${range.key}`, {
             assignIpv6AddressOnCreation: false,
             vpcId: eksVpc.id,
@@ -44,7 +44,7 @@ export = async () => {
         }));
     }
     const rta: aws.ec2.RouteTableAssociation[] = [];
-    for (const range of zones.names.map((k, v) => {key: k, value: v})) {
+    for (const range of zones.names.map((v, k) => ({key: k, value: v}))) {
         rta.push(new aws.ec2.RouteTableAssociation(`rta-${range.key}`, {
             routeTableId: eksRouteTable.id,
             subnetId: vpcSubnet[range.key].id,
@@ -144,41 +144,39 @@ export = async () => {
             minSize: 1,
         },
     });
-    const clusterName = eksCluster.name;
-    const kubeconfig = pulumi.all([eksCluster.endpoint, eksCluster.certificateAuthority, eksCluster.name]).apply(([endpoint, certificateAuthority, name]) => JSON.stringify({
-        apiVersion: "v1",
-        clusters: [{
-            cluster: {
-                server: endpoint,
-                "certificate-authority-data": certificateAuthority.data,
-            },
-            name: "kubernetes",
-        }],
-        contexts: [{
-            contest: {
-                cluster: "kubernetes",
-                user: "aws",
-            },
-        }],
-        "current-context": "aws",
-        kind: "Config",
-        users: [{
-            name: "aws",
-            user: {
-                exec: {
-                    apiVersion: "client.authentication.k8s.io/v1alpha1",
-                    command: "aws-iam-authenticator",
-                },
-                args: [
-                    "token",
-                    "-i",
-                    name,
-                ],
-            },
-        }],
-    }));
     return {
-        clusterName: clusterName,
-        kubeconfig: kubeconfig,
+        clusterName: eksCluster.name,
+        kubeconfig: pulumi.all([eksCluster.endpoint, eksCluster.certificateAuthority, eksCluster.name]).apply(([endpoint, certificateAuthority, name]) => JSON.stringify({
+            apiVersion: "v1",
+            clusters: [{
+                cluster: {
+                    server: endpoint,
+                    "certificate-authority-data": certificateAuthority.data,
+                },
+                name: "kubernetes",
+            }],
+            contexts: [{
+                contest: {
+                    cluster: "kubernetes",
+                    user: "aws",
+                },
+            }],
+            "current-context": "aws",
+            kind: "Config",
+            users: [{
+                name: "aws",
+                user: {
+                    exec: {
+                        apiVersion: "client.authentication.k8s.io/v1alpha1",
+                        command: "aws-iam-authenticator",
+                    },
+                    args: [
+                        "token",
+                        "-i",
+                        name,
+                    ],
+                },
+            }],
+        })),
     };
 }

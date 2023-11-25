@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,18 +25,24 @@ import (
 	"strings"
 
 	"github.com/blang/semver"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl/v2"
 
 	"github.com/spf13/cobra"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/importer"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
+	"github.com/pulumi/pulumi/pkg/v3/importer"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
@@ -48,9 +54,6 @@ import (
 	javagen "github.com/pulumi/pulumi-java/pkg/codegen/java"
 	yamlgen "github.com/pulumi/pulumi-yaml/pkg/pulumiyaml/codegen"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/dotnet"
-	gogen "github.com/pulumi/pulumi/pkg/v3/codegen/go"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/nodejs"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/python"
 )
 
 func parseResourceSpec(spec string) (string, resource.URN, error) {
@@ -59,23 +62,50 @@ func parseResourceSpec(spec string) (string, resource.URN, error) {
 		return "", "", fmt.Errorf("spec must be of the form name=URN")
 	}
 
-	name, urn := spec[:equals], spec[equals+1:]
+	name, urn := spec[:equals], resource.URN(spec[equals+1:])
 	if name == "" || urn == "" {
 		return "", "", fmt.Errorf("spec must be of the form name=URN")
 	}
 
-	return name, resource.URN(urn), nil
+	if !urn.IsValid() {
+		if ref, err := providers.ParseReference(string(urn)); err == nil {
+			return "", "", fmt.Errorf("expected a URN but got a Provider Reference, use '%s' instead", ref.URN())
+		}
+		return "", "", fmt.Errorf("expected a URN but got '%s'", urn)
+	}
+
+	return name, urn, nil
+}
+
+func makeImportFileFromResourceList(resources []plugin.ResourceImport) (importFile, error) {
+	nameTable := map[string]resource.URN{}
+	specs := make([]importSpec, len(resources))
+	for i, res := range resources {
+		specs[i] = importSpec{
+			Type:              tokens.Type(res.Type),
+			Name:              res.Name,
+			ID:                resource.ID(res.ID),
+			Version:           res.Version,
+			PluginDownloadURL: res.PluginDownloadURL,
+			// TODO(https://github.com/pulumi/pulumi/issues/14532): Add Component and Remote to ResourceImport
+		}
+	}
+
+	return importFile{
+		NameTable: nameTable,
+		Resources: specs,
+	}, nil
 }
 
 func makeImportFile(
 	typ, name, id string,
 	properties []string,
-	parentSpec, providerSpec, version string) (importFile, error) {
-
+	parentSpec, providerSpec, version string,
+) (importFile, error) {
 	nameTable := map[string]resource.URN{}
-	resource := importSpec{
+	res := importSpec{
 		Type:       tokens.Type(typ),
-		Name:       tokens.QName(name),
+		Name:       name,
 		ID:         resource.ID(id),
 		Version:    version,
 		Properties: properties,
@@ -84,35 +114,46 @@ func makeImportFile(
 	if parentSpec != "" {
 		parentName, parentURN, err := parseResourceSpec(parentSpec)
 		if err != nil {
-			return importFile{}, fmt.Errorf("could not parse parent spec '%v': %w", parentSpec, err)
+			parentName = "parent"
+			parentURN = resource.URN(parentSpec)
+			if !parentURN.IsValid() {
+				return importFile{}, fmt.Errorf("invalid parent URN: '%s'", parentURN)
+			}
 		}
 		nameTable[parentName] = parentURN
-		resource.Parent = parentName
+		res.Parent = parentName
 	}
 
 	if providerSpec != "" {
 		providerName, providerURN, err := parseResourceSpec(providerSpec)
 		if err != nil {
-			return importFile{}, fmt.Errorf("could not parse provider spec '%v': %w", providerSpec, err)
+			providerName = "provider"
+			providerURN = resource.URN(providerSpec)
+		}
+		if _, exists := nameTable[providerName]; exists {
+			return importFile{}, fmt.Errorf("provider and parent must have distinct names, both were '%s'", providerName)
 		}
 		nameTable[providerName] = providerURN
-		resource.Provider = providerName
+		res.Provider = providerName
 	}
 
 	return importFile{
 		NameTable: nameTable,
-		Resources: []importSpec{resource},
+		Resources: []importSpec{res},
 	}, nil
 }
 
 type importSpec struct {
-	Type       tokens.Type  `json:"type"`
-	Name       tokens.QName `json:"name"`
-	ID         resource.ID  `json:"id"`
-	Parent     string       `json:"parent"`
-	Provider   string       `json:"provider"`
-	Version    string       `json:"version"`
-	Properties []string     `json:"properties"`
+	Type              tokens.Type `json:"type"`
+	Name              string      `json:"name"`
+	ID                resource.ID `json:"id,omitempty"`
+	Parent            string      `json:"parent,omitempty"`
+	Provider          string      `json:"provider,omitempty"`
+	Version           string      `json:"version,omitempty"`
+	PluginDownloadURL string      `json:"pluginDownloadUrl,omitempty"`
+	Properties        []string    `json:"properties,omitempty"`
+	Component         bool        `json:"component,omitempty"`
+	Remote            bool        `json:"remote,omitempty"`
 }
 
 type importFile struct {
@@ -134,59 +175,250 @@ func readImportFile(p string) (importFile, error) {
 	return result, nil
 }
 
-func parseImportFile(f importFile, protectResources bool) ([]deploy.Import, importer.NameTable, error) {
-	// Build the name table.
-	names := importer.NameTable{}
+func writeImportFile(v importFile) (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("working directory: %w", err)
+	}
+	f, err := os.CreateTemp(wd, "pulumi-import-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	path := f.Name()
+	defer contract.IgnoreClose(f)
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "    ")
+	err = enc.Encode(v)
+	if err != nil {
+		return "", errors.Join(err, f.Close(), os.Remove(path))
+	}
+	return path, f.Close()
+}
+
+func parseImportFile(
+	f importFile, stack tokens.StackName, proj tokens.PackageName, protectResources bool,
+) ([]deploy.Import, importer.NameTable, error) {
+	// First check for uniqueness and ambiguity, takenNames tracks both that a name is used (it's in the map) and if
+	// it's ambiguous (it's true).
+	takenNames := map[string]bool{}
+	// Prefill takenNames with all the resource names so we can do quick uniqness checks below
+	for _, spec := range f.Resources {
+		takenNames[spec.Name] = false
+	}
+	// A remapping by index from the resource list to it's final unique name.
+	nameMapping := make([]string, 0, len(f.Resources))
+	for i, spec := range f.Resources {
+		// Check if any earlier resource has this name, if so mark it as ambiguous
+		for j, other := range f.Resources {
+			if i > j && spec.Name == other.Name {
+				takenNames[spec.Name] = true
+			}
+		}
+
+		if !takenNames[spec.Name] {
+			// This name isn't ambiguous so we can use it as is
+			nameMapping = append(nameMapping, spec.Name)
+		} else {
+			// This names already used so we need to make it unique
+			newName := spec.Name
+			for suffix := 1; ; suffix++ {
+				if _, exists := takenNames[newName]; !exists {
+					break
+				}
+				newName = fmt.Sprintf("%s_%d", spec.Name, suffix)
+			}
+			// At this point newName is unique and can't clash with other names, but need to ensure nothing
+			// else tries to now use it.
+			takenNames[newName] = false
+			nameMapping = append(nameMapping, newName)
+		}
+	}
+
+	// TODO: When Go 1.21 is released, switch to errors.Join.
+	var errs error
+	pusherrf := func(format string, args ...interface{}) {
+		errs = multierror.Append(errs, fmt.Errorf(format, args...))
+	}
+
+	// Attempts to generate a human-readable description of the given import spec
+	// for use in error messages using whatever information is available.
+	// For example:
+	//
+	//	resource 'foo' of type 'aws:ec2/vpc:Vpc'
+	//	resource 'foo'
+	//	resource 3 of type 'aws:ec2/vpc:Vpc'
+	//	resource 3
+	describeResource := func(idx int, spec importSpec) string {
+		var sb strings.Builder
+		sb.WriteString("resource ")
+
+		switch {
+		case spec.Name != "":
+			fmt.Fprintf(&sb, "'%v'", spec.Name)
+		case spec.ID != "":
+			fmt.Fprintf(&sb, "'%v'", spec.ID)
+		default:
+			fmt.Fprintf(&sb, "%d", idx)
+		}
+
+		if spec.Type != "" {
+			fmt.Fprintf(&sb, " of type '%v'", spec.Type)
+		}
+
+		return sb.String()
+	}
+
+	// A mapping from name to URN, prefilled with emptys and what was in the name table so we can do existence checks
+	// for expected names.
+	urnMapping := make(map[string]resource.URN)
 	for name, urn := range f.NameTable {
-		names[urn] = name
+		urnMapping[name] = urn
+	}
+	for _, spec := range f.Resources {
+		urnMapping[spec.Name] = ""
+	}
+
+	// We need to keep going till all the URNs are filled in or we have an error.
+	done := func() bool {
+		if errs != nil {
+			return true
+		}
+		for _, urn := range urnMapping {
+			if urn == "" {
+				return false
+			}
+		}
+		return true
+	}
+
+	for !done() {
+		for i, spec := range f.Resources {
+			// If we've already done this URN no need to do it again
+			if urnMapping[spec.Name] != "" {
+				continue
+			}
+
+			var parentType tokens.Type
+			if spec.Parent != "" {
+				// We can find the parent type by looking up the parent by name then finding it's type
+
+				// takenNames will be true if this name is ambiguous, in which case we can't use it as a
+				// parent but we just let the rest of the code below run so we can collect further errors.
+				if takenNames[spec.Parent] {
+					pusherrf("%v has an ambiguous parent",
+						describeResource(i, spec))
+				}
+
+				// Is this name already in the name table?
+				if urn, ok := f.NameTable[spec.Parent]; ok {
+					parentType = urn.QualifiedType()
+				} else {
+					// Not in the name table, is it in the urn mapping yet?
+					urn, ok := urnMapping[spec.Parent]
+
+					// There's three cases to cover here:
+					// 1. We didn't find the parent, in which case just push an error
+					// 2. We found the parent but it's urn is currently blank, in which case we'll loop around
+					// 3. We found the parent and got it's URN
+					if !ok {
+						pusherrf("the parent '%v' for %v has no entry in 'nameTable'",
+							spec.Parent, describeResource(i, spec))
+					} else if urn == "" {
+						// Skip this resource for now, we'll have to loop again to get it once it's parent URN is worked out
+						continue
+					} else {
+						parentType = urn.QualifiedType()
+					}
+				}
+			}
+
+			actualName := nameMapping[i]
+			urnMapping[spec.Name] = resource.NewURN(stack.Q(), proj, parentType, spec.Type, actualName)
+		}
+	}
+
+	// If we've got errors already just exit
+	if errs != nil {
+		return nil, nil, errs
 	}
 
 	imports := make([]deploy.Import, len(f.Resources))
 	for i, spec := range f.Resources {
+		if spec.Type == "" {
+			pusherrf("%v has no type", describeResource(i, spec))
+		}
+		if spec.Name == "" {
+			pusherrf("%v has no name", describeResource(i, spec))
+		}
+		if !spec.Component && spec.ID == "" {
+			pusherrf("%v has no ID", describeResource(i, spec))
+		} else if spec.Component && spec.ID != "" {
+			pusherrf("%v has an ID, but is marked as a component", describeResource(i, spec))
+		}
+		if spec.Remote && !spec.Component {
+			pusherrf("%v is marked as remote, but not as a component", describeResource(i, spec))
+		}
+
 		imp := deploy.Import{
-			Type:       spec.Type,
-			Name:       spec.Name,
-			ID:         spec.ID,
-			Protect:    protectResources,
-			Properties: spec.Properties,
+			Type:              spec.Type,
+			Name:              nameMapping[i],
+			ID:                spec.ID,
+			Protect:           protectResources,
+			Properties:        spec.Properties,
+			PluginDownloadURL: spec.PluginDownloadURL,
+			Component:         spec.Component,
+			Remote:            spec.Remote,
 		}
 
 		if spec.Parent != "" {
-			urn, ok := f.NameTable[spec.Parent]
-			if !ok {
-				return nil, nil, fmt.Errorf("the parent '%v' for resource '%v' of type '%v' has no name",
-					spec.Parent, spec.Name, spec.Type)
+			urn, ok := urnMapping[spec.Parent]
+			if ok {
+				// No need to add errors here, we'll have done that above when building URNs
+				imp.Parent = urn
 			}
-			imp.Parent = urn
 		}
 
 		if spec.Provider != "" {
+			if takenNames[spec.Provider] {
+				pusherrf("%v has an ambiguous provider",
+					describeResource(i, spec))
+			}
 			urn, ok := f.NameTable[spec.Provider]
 			if !ok {
-				return nil, nil, fmt.Errorf("the provider '%v' for resource '%v' of type '%v' has no name",
-					spec.Provider, spec.Name, spec.Type)
+				pusherrf("the provider '%v' for %v has no entry in 'nameTable'",
+					spec.Provider, describeResource(i, spec))
+			} else {
+				imp.Provider = urn
 			}
-			imp.Provider = urn
 		}
 
 		if spec.Version != "" {
 			v, err := semver.ParseTolerant(spec.Version)
 			if err != nil {
-				return nil, nil, fmt.Errorf("could not parse version '%v' for resource '%v' of type '%v': %w",
-					spec.Version, spec.Name, spec.Type, err)
+				pusherrf("could not parse version '%v' for %v: %w",
+					spec.Version, describeResource(i, spec), err)
+			} else {
+				imp.Version = &v
 			}
-			imp.Version = &v
 		}
 
 		imports[i] = imp
 	}
 
-	return imports, names, nil
+	// Build the name table.
+	names := importer.NameTable{}
+	for name, urn := range urnMapping {
+		names[urn] = name
+	}
+
+	return imports, names, errs
 }
 
 func getCurrentDeploymentForStack(
 	ctx context.Context,
-	s backend.Stack) (*deploy.Snapshot, error) {
+	s backend.Stack,
+) (*deploy.Snapshot, error) {
 	deployment, err := s.ExportDeployment(ctx)
 	if err != nil {
 		return nil, err
@@ -206,12 +438,16 @@ func getCurrentDeploymentForStack(
 	return snap, err
 }
 
-type programGeneratorFunc func(p *pcl.Program) (map[string][]byte, hcl.Diagnostics, error)
+type programGeneratorFunc func(
+	p *pcl.Program,
+	loader schema.ReferenceLoader,
+) (map[string][]byte, hcl.Diagnostics, error)
 
-func generateImportedDefinitions(out io.Writer, stackName tokens.Name, projectName tokens.PackageName,
+func generateImportedDefinitions(ctx *plugin.Context,
+	out io.Writer, stackName tokens.StackName, projectName tokens.PackageName,
 	snap *deploy.Snapshot, programGenerator programGeneratorFunc, names importer.NameTable,
-	imports []deploy.Import, protectResources bool) (bool, error) {
-
+	imports []deploy.Import, protectResources bool,
+) (bool, error) {
 	defer func() {
 		v := recover()
 		if v != nil {
@@ -221,7 +457,7 @@ func generateImportedDefinitions(out io.Writer, stackName tokens.Name, projectNa
 			if strings.Contains(fmt.Sprintf("%v", v), "invalid Go source code:") {
 				errMsg.WriteString("You will need to copy and paste the generated code into your Pulumi application and manually edit it to correct any errors.\n\n") //nolint:lll
 			}
-			errMsg.WriteString(fmt.Sprintf("%v\n", v))
+			fmt.Fprintf(&errMsg, "%v\n", v)
 			fmt.Print(errMsg.String())
 		}
 	}()
@@ -252,18 +488,9 @@ func generateImportedDefinitions(out io.Writer, stackName tokens.Name, projectNa
 		return false, nil
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return false, err
-	}
-	sink := cmdutil.Diag()
-	ctx, err := plugin.NewContext(sink, sink, nil, nil, cwd, nil, true, nil)
-	if err != nil {
-		return false, err
-	}
 	loader := schema.NewPluginLoader(ctx.Host)
 	return true, importer.GenerateLanguageDefinitions(out, loader, func(w io.Writer, p *pcl.Program) error {
-		files, _, err := programGenerator(p)
+		files, _, err := programGenerator(p, loader)
 		if err != nil {
 			return err
 		}
@@ -289,7 +516,7 @@ func newImportCmd() *cobra.Command {
 
 	var debug bool
 	var message string
-	var stack string
+	var stackName string
 	var execKind string
 	var execAgent string
 
@@ -305,9 +532,10 @@ func newImportCmd() *cobra.Command {
 	var protectResources bool
 	var properties []string
 
+	var from string
+
 	cmd := &cobra.Command{
 		Use:   "import [type] [name] [id]",
-		Args:  cmdutil.MaximumNArgs(3),
 		Short: "Import resources into an existing stack",
 		Long: "Import resources into an existing stack.\n" +
 			"\n" +
@@ -318,12 +546,25 @@ func newImportCmd() *cobra.Command {
 			"by default.\n" +
 			"\n" +
 			"Should you want to import your resource(s) without protection, you can pass\n" +
-			"`--protect=false` as an argument to the command. This will leave all resources unprotected." +
-			"\n" +
+			"`--protect=false` as an argument to the command. This will leave all resources unprotected.\n" +
 			"\n" +
 			"A single resource may be specified in the command line arguments or a set of\n" +
-			"resources may be specified by a JSON file. This file must contain an object\n" +
-			"of the following form:\n" +
+			"resources may be specified by a JSON file.\n" +
+			"\n" +
+			"If using the command line args directly, the type, name, id and optional flags\n" +
+			"must be provided.  For example:\n" +
+			"\n" +
+			"    pulumi import 'aws:iam/user:User' name id\n" +
+			"\n" +
+			"Or to fully specify parent and/or provider, subsitute the <urn> for each into the following:\n" +
+			"\n" +
+			"     pulumi import 'aws:iam/user:User' name id --parent 'parent=<urn>' --provider 'admin=<urn>'\n" +
+			"\n" +
+			"If using the JSON file format to define the imported resource(s), use this instead:\n" +
+			"\n" +
+			"     pulumi import -f import.json\n" +
+			"\n" +
+			"Where import.json is a file that matches the following JSON format:\n" +
 			"\n" +
 			"    {\n" +
 			"        \"nameTable\": {\n" +
@@ -360,25 +601,121 @@ func newImportCmd() *cobra.Command {
 			"specify a provider, it will be imported using the default provider for its type. A\n" +
 			"resource that does specify a provider may specify the version of the provider\n" +
 			"that will be used for its import.\n" +
+			"\n" +
 			"Each resource may specify which input properties to import with;\n" +
+			"\n" +
 			"If a resource does not specify any properties the default behaviour is to\n" +
 			"import using all required properties.\n",
 		Run: cmdutil.RunResultFunc(func(cmd *cobra.Command, args []string) result.Result {
 			ctx := commandContext()
 
+			cwd, err := os.Getwd()
+			if err != nil {
+				return result.FromError(fmt.Errorf("get working directory: %w", err))
+			}
+			sink := cmdutil.Diag()
+			pCtx, err := plugin.NewContext(sink, sink, nil, nil, cwd, nil, true, nil)
+			if err != nil {
+				return result.FromError(fmt.Errorf("create plugin context: %w", err))
+			}
+
 			var importFile importFile
 			if importFilePath != "" {
 				if len(args) != 0 || parentSpec != "" || providerSpec != "" || len(properties) != 0 {
+					contract.IgnoreError(cmd.Help())
 					return result.Errorf("an inline resource may not be specified in conjunction with an import file")
+				}
+				if from != "" {
+					contract.IgnoreError(cmd.Help())
+					return result.Errorf("a converter may not be specified in conjunction with an import file")
 				}
 				f, err := readImportFile(importFilePath)
 				if err != nil {
 					return result.FromError(fmt.Errorf("could not read import file: %w", err))
 				}
 				importFile = f
+			} else if from != "" {
+				log := func(sev diag.Severity, msg string) {
+					pCtx.Diag.Logf(sev, diag.RawMessage("", msg))
+				}
+				converter, err := loadConverterPlugin(pCtx, from, log)
+				if err != nil {
+					return result.Errorf("load converter plugin: %w", err)
+				}
+				defer contract.IgnoreClose(converter)
+
+				installProvider := func(provider tokens.Package) *semver.Version {
+					// If auto plugin installs are disabled just return nil, the mapper will still carry on
+					if env.DisableAutomaticPluginAcquisition.Value() {
+						return nil
+					}
+
+					log := func(sev diag.Severity, msg string) {
+						pCtx.Diag.Logf(sev, diag.RawMessage("", msg))
+					}
+
+					pluginSpec := workspace.PluginSpec{
+						Name: string(provider),
+						Kind: workspace.ResourcePlugin,
+					}
+					version, err := pkgWorkspace.InstallPlugin(pluginSpec, log)
+					if err != nil {
+						pCtx.Diag.Warningf(diag.Message("", "failed to install provider %q: %v"), provider, err)
+						return nil
+					}
+					return version
+				}
+
+				mapper, err := convert.NewPluginMapper(
+					convert.DefaultWorkspace(), convert.ProviderFactoryFromHost(pCtx.Host),
+					from, nil, installProvider)
+				if err != nil {
+					return result.FromError(err)
+				}
+
+				mapperServer := convert.NewMapperServer(mapper)
+				grpcServer, err := plugin.NewServer(pCtx, convert.MapperRegistration(mapperServer))
+				if err != nil {
+					return result.FromError(err)
+				}
+
+				resp, err := converter.ConvertState(ctx, &plugin.ConvertStateRequest{
+					MapperTarget: grpcServer.Addr(),
+					Args:         args,
+				})
+				if err != nil {
+					return result.FromError(err)
+				}
+
+				printDiagnostics(sink, resp.Diagnostics)
+				if resp.Diagnostics.HasErrors() {
+					// If we've got error diagnostics then state conversion failed, we've printed the error above so
+					// just return a plain message here.
+					return result.Error("conversion failed")
+				}
+
+				f, err := makeImportFileFromResourceList(resp.Resources)
+				if err != nil {
+					return result.FromError(err)
+				}
+				importFile = f
 			} else {
-				if len(args) < 3 {
-					return result.Errorf("an inline resource must be specified if no import file is used")
+				msg := "an inline resource must be specified if no converter or import file is used, missing "
+				if len(args) == 0 {
+					contract.IgnoreError(cmd.Help())
+					return result.Errorf(msg + "type, name, and id")
+				}
+				if len(args) == 1 {
+					contract.IgnoreError(cmd.Help())
+					return result.Errorf(msg + "name and id")
+				}
+				if len(args) == 2 {
+					contract.IgnoreError(cmd.Help())
+					return result.Errorf(msg + "id")
+				}
+				if len(args) > 3 {
+					contract.IgnoreError(cmd.Help())
+					return result.Errorf("only expected at most three arguments")
 				}
 				f, err := makeImportFile(args[0], args[1], args[2], properties, parentSpec, providerSpec, "")
 				if err != nil {
@@ -402,7 +739,8 @@ func newImportCmd() *cobra.Command {
 				output = f
 			}
 
-			imports, nameTable, err := parseImportFile(importFile, protectResources)
+			// Fetch the project.
+			proj, root, err := readProject()
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -419,7 +757,7 @@ func newImportCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			var displayType = display.DisplayProgress
+			displayType := display.DisplayProgress
 			if diffDisplay {
 				displayType = display.DisplayDiff
 			}
@@ -453,47 +791,76 @@ func newImportCmd() *cobra.Command {
 				opts.Display.SuppressPermalink = true
 			}
 
-			// Fetch the project.
-			proj, root, err := readProject()
+			// Fetch the current stack.
+			s, err := requireStack(ctx, stackName, stackLoadOnly, opts.Display)
 			if err != nil {
 				return result.FromError(err)
+			}
+
+			imports, nameTable, err := parseImportFile(importFile, s.Ref().Name(), proj.Name, protectResources)
+			if err != nil {
+				return result.FromError(err)
+			}
+
+			wrapper := func(
+				f func(*pcl.Program) (map[string][]byte, hcl.Diagnostics, error),
+			) func(*pcl.Program, schema.ReferenceLoader) (map[string][]byte, hcl.Diagnostics, error) {
+				return func(p *pcl.Program, loader schema.ReferenceLoader) (map[string][]byte, hcl.Diagnostics, error) {
+					return f(p)
+				}
 			}
 
 			var programGenerator programGeneratorFunc
 			switch proj.Runtime.Name() {
-			case "dotnet": // nolint: goconst
-				programGenerator = dotnet.GenerateProgram
-			case "go":
-				programGenerator = gogen.GenerateProgram
-			case "nodejs": // nolint: goconst
-				programGenerator = nodejs.GenerateProgram
-			case "python":
-				programGenerator = python.GenerateProgram
+			case "dotnet":
+				programGenerator = wrapper(dotnet.GenerateProgram)
 			case "java":
-				programGenerator = javagen.GenerateProgram
+				programGenerator = wrapper(javagen.GenerateProgram)
 			case "yaml":
-				programGenerator = yamlgen.GenerateProgram
+				programGenerator = wrapper(yamlgen.GenerateProgram)
 			default:
-				return result.Errorf("cannot generate resource definitions for %v", proj.Runtime.Name())
+				programGenerator = func(
+					program *pcl.Program, loader schema.ReferenceLoader,
+				) (map[string][]byte, hcl.Diagnostics, error) {
+					cwd, err := os.Getwd()
+					if err != nil {
+						return nil, nil, err
+					}
+					sink := cmdutil.Diag()
+
+					ctx, err := plugin.NewContext(sink, sink, nil, nil, cwd, nil, true, nil)
+					if err != nil {
+						return nil, nil, err
+					}
+					defer contract.IgnoreClose(pCtx.Host)
+
+					languagePlugin, err := ctx.Host.LanguageRuntime(cwd, cwd, proj.Runtime.Name(), nil)
+					if err != nil {
+						return nil, nil, err
+					}
+
+					loaderServer := schema.NewLoaderServer(loader)
+					grpcServer, err := plugin.NewServer(pCtx, schema.LoaderRegistration(loaderServer))
+					if err != nil {
+						return nil, nil, err
+					}
+					defer contract.IgnoreClose(grpcServer)
+
+					files, diagnostics, err := languagePlugin.GenerateProgram(program.Source(), grpcServer.Addr())
+					if err != nil {
+						return nil, nil, err
+					}
+
+					return files, diagnostics, nil
+				}
 			}
 
-			// Fetch the current stack.
-			s, err := requireStack(ctx, stack, false, opts.Display, false /*setCurrent*/)
-			if err != nil {
-				return result.FromError(err)
-			}
-
-			m, err := getUpdateMetadata(message, root, execKind, execAgent, false)
+			m, err := getUpdateMetadata(message, root, execKind, execAgent, false, cmd.Flags())
 			if err != nil {
 				return result.FromError(fmt.Errorf("gathering environment metadata: %w", err))
 			}
 
-			sm, err := getStackSecretsManager(s)
-			if err != nil {
-				return result.FromError(fmt.Errorf("getting secrets manager: %w", err))
-			}
-
-			cfg, err := getStackConfiguration(ctx, s, proj, sm)
+			cfg, sm, err := getStackConfiguration(ctx, s, proj, nil)
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack configuration: %w", err))
 			}
@@ -502,9 +869,19 @@ func newImportCmd() *cobra.Command {
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack decrypter: %w", err))
 			}
+			encrypter, err := sm.Encrypter()
+			if err != nil {
+				return result.FromError(fmt.Errorf("getting stack encrypter: %w", err))
+			}
 
 			stackName := s.Ref().Name().String()
-			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+				stackName,
+				proj,
+				cfg.Environment,
+				cfg.Config,
+				encrypter,
+				decrypter)
 			if configErr != nil {
 				return result.FromError(fmt.Errorf("validating stack config: %w", configErr))
 			}
@@ -523,7 +900,8 @@ func newImportCmd() *cobra.Command {
 				Opts:               opts,
 				StackConfiguration: cfg,
 				SecretsManager:     sm,
-				Scopes:             cancellationScopes,
+				SecretsProvider:    stack.DefaultSecretsProvider,
+				Scopes:             backend.CancellationScopes,
 			}, imports)
 
 			if generateCode {
@@ -533,7 +911,7 @@ func newImportCmd() *cobra.Command {
 				}
 
 				validImports, err := generateImportedDefinitions(
-					output, s.Ref().Name(), proj.Name, deployment, programGenerator, nameTable, imports,
+					pCtx, output, s.Ref().Name(), proj.Name, deployment, programGenerator, nameTable, imports,
 					protectResources)
 				if err != nil {
 					if _, ok := err.(*importer.DiagnosticsError); ok {
@@ -566,6 +944,19 @@ func newImportCmd() *cobra.Command {
 				if res.Error() == context.Canceled {
 					return result.FromError(errors.New("import cancelled"))
 				}
+
+				// If we did a conversion import (i.e. from!="") then lets write the file we've built out to the local
+				// directory so if there's any issues users can manually edit the file and try again with --file
+				if from != "" {
+					path, err := writeImportFile(importFile)
+					if err != nil {
+						return result.FromError(err)
+					}
+					pCtx.Diag.Infof(diag.Message("",
+						"Generated import file written out, edit and rerun import with --file %s"),
+						path, path)
+				}
+
 				return PrintEngineResult(res)
 			}
 			return nil
@@ -595,7 +986,7 @@ func newImportCmd() *cobra.Command {
 		&message, "message", "m", "",
 		"Optional message to associate with the update operation")
 	cmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
 		&stackConfigFile, "config-file", "",
@@ -624,6 +1015,9 @@ func newImportCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVarP(
 		&protectResources, "protect", "", true,
 		"Allow resources to be imported with protection from deletion enabled")
+	cmd.PersistentFlags().StringVar(
+		&from, "from", "",
+		"Invoke a converter to import the resources")
 
 	if hasDebugCommands() {
 		cmd.PersistentFlags().StringVar(

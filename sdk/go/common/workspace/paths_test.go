@@ -15,22 +15,21 @@
 package workspace
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // In the tests below we use temporary directories and then expect DetectProjectAndPath to return a path to
-// that directory. However DetectProjectAndPath will do symlink resolution, while ioutil.TempDir normally does
+// that directory. However DetectProjectAndPath will do symlink resolution, while t.TempDir() normally does
 // not. This can lead to asserts especially on macos where TmpDir will have returned /var/folders/XX, but
 // after sym link resolution that is /private/var/folders/XX.
-func mkTempDir(t *testing.T, pattern string) string {
-	tmpDir, err := ioutil.TempDir("", pattern)
-	assert.NoError(t, err)
+func mkTempDir(t *testing.T) string {
+	tmpDir := t.TempDir()
 	result, err := filepath.EvalSymlinks(tmpDir)
 	assert.NoError(t, err)
 	return result
@@ -38,7 +37,7 @@ func mkTempDir(t *testing.T, pattern string) string {
 
 //nolint:paralleltest // Theses test use and change the current working directory
 func TestDetectProjectAndPath(t *testing.T) {
-	tmpDir := mkTempDir(t, "TestDetectProjectAndPath")
+	tmpDir := mkTempDir(t)
 	cwd, err := os.Getwd()
 	assert.NoError(t, err)
 	defer func() { err := os.Chdir(cwd); assert.NoError(t, err) }()
@@ -46,10 +45,9 @@ func TestDetectProjectAndPath(t *testing.T) {
 	assert.NoError(t, err)
 
 	yamlPath := filepath.Join(tmpDir, "Pulumi.yaml")
-	yamlContents :=
-		"name: some_project\ndescription: Some project\nruntime: nodejs\n"
+	yamlContents := "name: some_project\ndescription: Some project\nruntime: nodejs\n"
 
-	err = os.WriteFile(yamlPath, []byte(yamlContents), 0600)
+	err = os.WriteFile(yamlPath, []byte(yamlContents), 0o600)
 	assert.NoError(t, err)
 
 	project, path, err := DetectProjectAndPath()
@@ -99,7 +97,7 @@ func TestProjectStackPath(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := mkTempDir(t, "TestProjectStackPath")
+			tmpDir := mkTempDir(t)
 			cwd, err := os.Getwd()
 			assert.NoError(t, err)
 			defer func() { err := os.Chdir(cwd); assert.NoError(t, err) }()
@@ -109,11 +107,39 @@ func TestProjectStackPath(t *testing.T) {
 			err = os.WriteFile(
 				filepath.Join(tmpDir, "Pulumi.yaml"),
 				[]byte(tt.yamlContents),
-				0600)
+				0o600)
 			assert.NoError(t, err)
 
 			_, path, err := DetectProjectStackPath("my_stack")
 			tt.validate(t, tmpDir, path, err)
 		})
 	}
+}
+
+//nolint:paralleltest // Theses test use and change the current working directory
+func TestDetectProjectUnreadableParent(t *testing.T) {
+	// Regression test for https://github.com/pulumi/pulumi/issues/12481
+
+	tmpDir := mkTempDir(t)
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	defer func() { err := os.Chdir(cwd); assert.NoError(t, err) }()
+
+	// unreadable parent directory
+	parentDir := filepath.Join(tmpDir, "root")
+	err = os.Mkdir(parentDir, 0o300)
+	require.NoError(t, err)
+	// Make it readable so we can clean it up later
+	defer func() { err := os.Chmod(parentDir, 0o700); assert.NoError(t, err) }()
+
+	// readable current directory
+	currentDir := filepath.Join(parentDir, "current")
+	err = os.Mkdir(currentDir, 0o700)
+	require.NoError(t, err)
+
+	err = os.Chdir(currentDir)
+	require.NoError(t, err)
+
+	_, _, err = DetectProjectAndPath()
+	assert.ErrorIs(t, err, ErrProjectNotFound)
 }

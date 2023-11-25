@@ -20,21 +20,11 @@
 import * as v8 from "v8";
 v8.setFlagsFromString("--allow-natives-syntax");
 
-import * as semver from "semver";
-
-// On node11 and above, create an 'inspector session' that can be used to keep track of what is
-// happening through a supported API.  Pre-11 we can just call into % intrinsics for the same data.
-/** @internal */
-export const isNodeAtLeastV11 = semver.gte(process.version, "11.0.0");
-
 let session: Promise<import("inspector").Session | undefined> | undefined = undefined;
 
 function getSession() {
     if (session !== undefined) {
         return session;
-    }
-    if (!isNodeAtLeastV11) {
-        return Promise.resolve(undefined);
     }
     session = createInspectorSessionAsync();
     return session;
@@ -52,10 +42,10 @@ async function createInspectorSessionAsync(): Promise<import("inspector").Sessio
     // Enable debugging support so we can hear about the Debugger.scriptParsed event. We need that
     // event to know how to map from scriptId's to file-urls.
     await new Promise<import("inspector").Debugger.EnableReturnType>((resolve, reject) => {
-        inspectorSession.post("Debugger.enable", (err, res) => err ? reject(err) : resolve(res));
+        inspectorSession.post("Debugger.enable", (err, res) => (err ? reject(err) : resolve(res)));
     });
 
-    inspectorSession.addListener("Debugger.scriptParsed", event => {
+    inspectorSession.addListener("Debugger.scriptParsed", (event) => {
         const { scriptId, url } = event.params;
         scriptIdToUrlMap.set(scriptId, url);
     });
@@ -69,10 +59,6 @@ async function createInspectorSessionAsync(): Promise<import("inspector").Sessio
  * @internal
  */
 export async function getSessionAsync() {
-    if (!isNodeAtLeastV11) {
-        throw new Error("Should not call getSessionAsync unless on Node11 or above.");
-    }
-
     return getSession();
 }
 

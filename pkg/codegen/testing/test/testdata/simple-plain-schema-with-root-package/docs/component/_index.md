@@ -265,7 +265,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#bar_csharp" style="color: inherit; text-decoration: inherit;">Bar</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args</a></span>
+        <span class="property-type"><a href="#foo">Foo</a></span>
     </dt>
     <dd></dd><dt class="property-optional"
             title="Optional">
@@ -273,7 +273,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#baz_csharp" style="color: inherit; text-decoration: inherit;">Baz</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">List&lt;Foo<wbr>Args&gt;</a></span>
+        <span class="property-type"><a href="#foo">List&lt;Foo&gt;</a></span>
     </dt>
     <dd></dd><dt class="property-optional"
             title="Optional">
@@ -297,7 +297,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#foo_csharp" style="color: inherit; text-decoration: inherit;">Foo</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args</a></span>
+        <span class="property-type"><a href="#foo">Foo</a></span>
     </dt>
     <dd></dd></dl>
 </pulumi-choosable>
@@ -421,7 +421,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#bar_java" style="color: inherit; text-decoration: inherit;">bar</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args</a></span>
+        <span class="property-type"><a href="#foo">Foo</a></span>
     </dt>
     <dd></dd><dt class="property-optional"
             title="Optional">
@@ -429,7 +429,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#baz_java" style="color: inherit; text-decoration: inherit;">baz</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">List&lt;Foo<wbr>Args&gt;</a></span>
+        <span class="property-type"><a href="#foo">List&lt;Foo&gt;</a></span>
     </dt>
     <dd></dd><dt class="property-optional"
             title="Optional">
@@ -453,7 +453,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#foo_java" style="color: inherit; text-decoration: inherit;">foo</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args</a></span>
+        <span class="property-type"><a href="#foo">Foo</a></span>
     </dt>
     <dd></dd></dl>
 </pulumi-choosable>
@@ -499,7 +499,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#bar_nodejs" style="color: inherit; text-decoration: inherit;">bar</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args</a></span>
+        <span class="property-type"><a href="#foo">Foo</a></span>
     </dt>
     <dd></dd><dt class="property-optional"
             title="Optional">
@@ -507,7 +507,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#baz_nodejs" style="color: inherit; text-decoration: inherit;">baz</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args[]</a></span>
+        <span class="property-type"><a href="#foo">Foo[]</a></span>
     </dt>
     <dd></dd><dt class="property-optional"
             title="Optional">
@@ -531,7 +531,7 @@ The Component resource accepts the following [input](/docs/intro/concepts/inputs
 <a data-swiftype-name="resource-property" data-swiftype-type="text" href="#foo_nodejs" style="color: inherit; text-decoration: inherit;">foo</a>
 </span>
         <span class="property-indicator"></span>
-        <span class="property-type"><a href="#foo">Foo<wbr>Args</a></span>
+        <span class="property-type"><a href="#foo">Foo</a></span>
     </dt>
     <dd></dd></dl>
 </pulumi-choosable>
@@ -702,91 +702,37 @@ All [input](#inputs) properties are implicitly available as output properties. A
 
 <div>
 <pulumi-choosable type="language" values="csharp">
-<dl class="resources-properties"><dt class="property-"
-            title="">
-        <span id="id_csharp">
-<a data-swiftype-name="resource-property" data-swiftype-type="text" href="#id_csharp" style="color: inherit; text-decoration: inherit;">Id</a>
-</span>
-        <span class="property-indicator"></span>
-        <span class="property-type">string</span>
-    </dt>
-    <dd><p>The provider-assigned unique ID for this managed resource.</p>
-</dd></dl>
+<dl class="resources-properties"></dl>
 </pulumi-choosable>
 </div>
 
 <div>
 <pulumi-choosable type="language" values="go">
-<dl class="resources-properties"><dt class="property-"
-            title="">
-        <span id="id_go">
-<a data-swiftype-name="resource-property" data-swiftype-type="text" href="#id_go" style="color: inherit; text-decoration: inherit;">Id</a>
-</span>
-        <span class="property-indicator"></span>
-        <span class="property-type">string</span>
-    </dt>
-    <dd><p>The provider-assigned unique ID for this managed resource.</p>
-</dd></dl>
+<dl class="resources-properties"></dl>
 </pulumi-choosable>
 </div>
 
 <div>
 <pulumi-choosable type="language" values="java">
-<dl class="resources-properties"><dt class="property-"
-            title="">
-        <span id="id_java">
-<a data-swiftype-name="resource-property" data-swiftype-type="text" href="#id_java" style="color: inherit; text-decoration: inherit;">id</a>
-</span>
-        <span class="property-indicator"></span>
-        <span class="property-type">String</span>
-    </dt>
-    <dd><p>The provider-assigned unique ID for this managed resource.</p>
-</dd></dl>
+<dl class="resources-properties"></dl>
 </pulumi-choosable>
 </div>
 
 <div>
 <pulumi-choosable type="language" values="javascript,typescript">
-<dl class="resources-properties"><dt class="property-"
-            title="">
-        <span id="id_nodejs">
-<a data-swiftype-name="resource-property" data-swiftype-type="text" href="#id_nodejs" style="color: inherit; text-decoration: inherit;">id</a>
-</span>
-        <span class="property-indicator"></span>
-        <span class="property-type">string</span>
-    </dt>
-    <dd><p>The provider-assigned unique ID for this managed resource.</p>
-</dd></dl>
+<dl class="resources-properties"></dl>
 </pulumi-choosable>
 </div>
 
 <div>
 <pulumi-choosable type="language" values="python">
-<dl class="resources-properties"><dt class="property-"
-            title="">
-        <span id="id_python">
-<a data-swiftype-name="resource-property" data-swiftype-type="text" href="#id_python" style="color: inherit; text-decoration: inherit;">id</a>
-</span>
-        <span class="property-indicator"></span>
-        <span class="property-type">str</span>
-    </dt>
-    <dd><p>The provider-assigned unique ID for this managed resource.</p>
-</dd></dl>
+<dl class="resources-properties"></dl>
 </pulumi-choosable>
 </div>
 
 <div>
 <pulumi-choosable type="language" values="yaml">
-<dl class="resources-properties"><dt class="property-"
-            title="">
-        <span id="id_yaml">
-<a data-swiftype-name="resource-property" data-swiftype-type="text" href="#id_yaml" style="color: inherit; text-decoration: inherit;">id</a>
-</span>
-        <span class="property-indicator"></span>
-        <span class="property-type">String</span>
-    </dt>
-    <dd><p>The provider-assigned unique ID for this managed resource.</p>
-</dd></dl>
+<dl class="resources-properties"></dl>
 </pulumi-choosable>
 </div>
 
@@ -800,7 +746,9 @@ All [input](#inputs) properties are implicitly available as output properties. A
 
 
 
-<h4 id="foo">Foo</h4>
+<h4 id="foo">
+Foo<pulumi-choosable type="language" values="python,go" class="inline">, Foo<wbr>Args</pulumi-choosable>
+</h4>
 
 <div>
 <pulumi-choosable type="language" values="csharp">
@@ -1130,7 +1078,7 @@ All [input](#inputs) properties are implicitly available as output properties. A
 <h2 id="package-details">Package Details</h2>
 <dl class="package-details">
 	<dt>Repository</dt>
-	<dd><a href=""></a></dd>
+	<dd><a href="">example </a></dd>
 	<dt>License</dt>
 	<dd></dd>
 </dl>

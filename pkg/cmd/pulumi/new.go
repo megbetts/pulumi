@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: goconst
 package main
 
 import (
@@ -27,8 +26,6 @@ import (
 	"strings"
 	"unicode"
 
-	"gopkg.in/yaml.v3"
-
 	survey "github.com/AlecAivazis/survey/v2"
 	surveycore "github.com/AlecAivazis/survey/v2/core"
 	"github.com/opentracing/opentracing-go"
@@ -38,7 +35,6 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/backend/state"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
-	"github.com/pulumi/pulumi/pkg/v3/util/yamlutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
@@ -48,6 +44,12 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
+
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
+)
+
+const (
+	brokenTemplateDescription = "(This template is currently broken)"
 )
 
 type promptForValueFunc func(yes bool, valueType string, defaultValue string, secret bool,
@@ -83,8 +85,8 @@ func runNew(ctx context.Context, args newArgs) error {
 	}
 
 	// Validate name (if specified) before further prompts/operations.
-	if args.name != "" && workspace.ValidateProjectName(args.name) != nil {
-		return fmt.Errorf("'%s' is not a valid project name. %w", args.name, workspace.ValidateProjectName(args.name))
+	if args.name != "" && pkgWorkspace.ValidateProjectName(args.name) != nil {
+		return fmt.Errorf("'%s' is not a valid project name: %w", args.name, pkgWorkspace.ValidateProjectName(args.name))
 	}
 
 	// Validate secrets provider type
@@ -117,15 +119,25 @@ func runNew(ctx context.Context, args newArgs) error {
 
 	// If we're going to be creating a stack, get the current backend, which
 	// will kick off the login flow (if not already logged-in).
+	var b backend.Backend
 	if !args.generateOnly {
-		if _, err = currentBackend(ctx, opts); err != nil {
+		// There is no current project at this point to pass into currentBackend
+		b, err = currentBackend(ctx, nil, opts)
+		if err != nil {
+			return err
+		}
+
+		// Check project name and stack reference project name are the same, we skip this check if
+		// --generate-only is set because we're not going to actually use the --stack argument given.
+		if err := compareStackProjectName(b, args.stack, args.name); err != nil {
 			return err
 		}
 	}
 
 	// Ensure the project doesn't already exist.
 	if args.name != "" {
-		if err := validateProjectName(ctx, args.name, args.generateOnly, opts); err != nil {
+		// There is no --org flag at the moment. The backend determines the orgName value if it is "".
+		if err := validateProjectName(ctx, b, "" /* orgName */, args.name, args.generateOnly, opts); err != nil {
 			return err
 		}
 	}
@@ -155,6 +167,9 @@ func runNew(ctx context.Context, args newArgs) error {
 			return err
 		}
 	}
+	if template.Errored() {
+		return fmt.Errorf("template '%s' is currently broken: %w", template.Name, template.Error)
+	}
 
 	// Do a dry run, if we're not forcing files to be overwritten.
 	if !args.force {
@@ -172,22 +187,30 @@ func runNew(ctx context.Context, args newArgs) error {
 	// The main purpose of this lookup is getting a proper start with a project
 	// created via the web app.
 	var s backend.Stack
-	if args.stack != "" && strings.Count(args.stack, "/") == 2 {
+	var orgName string
+	if !args.generateOnly && args.stack != "" && strings.Count(args.stack, "/") == 2 {
+		parts := strings.SplitN(args.stack, "/", 3)
+
+		// Set the org name for future use.
+		orgName = parts[0]
+		projectName := parts[1]
+
 		stackName, err := buildStackName(args.stack)
 		if err != nil {
 			return err
 		}
-		existingStack, existingName, existingDesc, err := getStack(ctx, stackName, opts)
+
+		existingStack, _, existingDesc, err := getStack(ctx, b, stackName, opts)
 		if err != nil {
 			return err
 		}
-		s = existingStack
-		if args.name == "" {
-			args.name = existingName
+		if existingStack != nil {
+			s = existingStack
+			if args.description == "" {
+				args.description = existingDesc
+			}
 		}
-		if args.description == "" {
-			args.description = existingDesc
-		}
+		args.name = projectName
 	}
 
 	// Show instructions, if we're going to show at least one prompt.
@@ -207,19 +230,20 @@ func runNew(ctx context.Context, args newArgs) error {
 
 	// Prompt for the project name, if it wasn't already specified.
 	if args.name == "" {
-		defaultValue := workspace.ValueOrSanitizedDefaultProjectName(args.name, template.ProjectName, filepath.Base(cwd))
-		if err := validateProjectName(ctx, defaultValue, args.generateOnly, opts); err != nil {
+		defaultValue := pkgWorkspace.ValueOrSanitizedDefaultProjectName(args.name, template.ProjectName, filepath.Base(cwd))
+		err := validateProjectName(
+			ctx, b, orgName, defaultValue, args.generateOnly, opts.WithIsInteractive(false))
+		if err != nil {
 			// If --yes is given error out now that the default value is invalid. If we allow prompt to catch
 			// this case it can lead to a confusing error message because we set the defaultValue to "" below.
 			// See https://github.com/pulumi/pulumi/issues/8747.
 			if args.yes {
 				return fmt.Errorf("'%s' is not a valid project name. %w", defaultValue, err)
 			}
-
-			// Do not suggest an invalid or existing name as the default project name.
-			defaultValue = ""
 		}
-		validate := func(s string) error { return validateProjectName(ctx, s, args.generateOnly, opts) }
+		validate := func(s string) error {
+			return validateProjectName(ctx, b, orgName, s, args.generateOnly, opts)
+		}
 		args.name, err = args.prompt(args.yes, "project name", defaultValue, false, validate, opts)
 		if err != nil {
 			return err
@@ -228,10 +252,10 @@ func runNew(ctx context.Context, args newArgs) error {
 
 	// Prompt for the project description, if it wasn't already specified.
 	if args.description == "" {
-		defaultValue := workspace.ValueOrDefaultProjectDescription(
+		defaultValue := pkgWorkspace.ValueOrDefaultProjectDescription(
 			args.description, template.ProjectDescription, template.Description)
 		args.description, err = args.prompt(
-			args.yes, "project description", defaultValue, false, workspace.ValidateProjectDescription, opts)
+			args.yes, "project description", defaultValue, false, pkgWorkspace.ValidateProjectDescription, opts)
 		if err != nil {
 			return err
 		}
@@ -249,76 +273,39 @@ func runNew(ctx context.Context, args newArgs) error {
 	fmt.Println()
 
 	// Load the project, update the name & description, remove the template section, and save it.
-	proj, path, err := readProjectWithPath()
-	root := filepath.Dir(path)
+	proj, root, err := readProject()
 	if err != nil {
 		return err
 	}
+	proj.Name = tokens.PackageName(args.name)
+	proj.Description = &args.description
+	proj.Template = nil
+	// Workaround for python, most of our templates don't specify a venv but we want to use one
+	if proj.Runtime.Name() == "python" {
+		// If the template does give virtualenv use it, else default to "venv"
+		if _, has := proj.Runtime.Options()["virtualenv"]; !has {
+			proj.Runtime.SetOption("virtualenv", "venv")
+		}
+	}
 
-	if filepath.Ext(path) == ".yaml" {
-		filedata, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		var workspaceDocument yaml.Node
-		err = yaml.Unmarshal(filedata, &workspaceDocument)
-		if err != nil {
-			return err
-		}
-
-		proj.Name = tokens.PackageName(args.name)
-		err = yamlutil.Insert(&workspaceDocument, "name", args.name)
-		if err != nil {
-			return err
-		}
-		proj.Description = &args.description
-		err = yamlutil.Insert(&workspaceDocument, "description", args.description)
-		if err != nil {
-			return err
-		}
-		proj.Template = nil
-		err = yamlutil.Delete(&workspaceDocument, "template")
-		if err != nil {
-			return err
-		}
-		if proj.Runtime.Name() == "python" {
-			// If the template does give virtualenv use it, else default to "venv"
-			if len(proj.Runtime.Options()) == 0 {
-				proj.Runtime.SetOption("virtualenv", "venv")
-				err = yamlutil.Insert(&workspaceDocument, "runtime", strings.TrimSpace(`
-name: python
-options:
-  virtualenv: venv
-`))
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		contract.Assert(len(workspaceDocument.Content) == 1)
-		projFile, err := yaml.Marshal(workspaceDocument.Content[0])
-		if err != nil {
-			return err
-		}
-
-		err = os.WriteFile(path, projFile, 0600)
-		if err != nil {
-			return err
-		}
+	if err = workspace.SaveProject(proj); err != nil {
+		return fmt.Errorf("saving project: %w", err)
+	}
+	if b != nil {
+		b.SetCurrentProject(proj)
 	}
 
 	appendFileName := "Pulumi.yaml.append"
 	appendFile := filepath.Join(root, appendFileName)
-	os.Remove(appendFile)
+	err = os.Remove(appendFile)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
 	// Create the stack, if needed.
 	if !args.generateOnly && s == nil {
-		if s, err = promptAndCreateStack(ctx, args.prompt,
-			args.stack, args.name, true /*setCurrent*/, args.yes, opts, args.secretsProvider); err != nil {
+		if s, err = promptAndCreateStack(ctx, b, args.prompt,
+			args.stack, root, true /*setCurrent*/, args.yes, opts, args.secretsProvider); err != nil {
 			return err
 		}
 		// The backend will print "Created stack '<stack>'" on success.
@@ -327,7 +314,10 @@ options:
 
 	// Prompt for config values (if needed) and save.
 	if !args.generateOnly {
-		err = handleConfig(ctx, s, args.templateNameOrURL, template, args.configArray, args.yes, args.configPath, opts)
+		err = handleConfig(
+			ctx, args.prompt, proj, s,
+			args.templateNameOrURL, template, args.configArray,
+			args.yes, args.configPath, opts)
 		if err != nil {
 			return err
 		}
@@ -349,6 +339,7 @@ options:
 			cmdutil.Diag(),
 			false,
 			span,
+			nil,
 		)
 		if err != nil {
 			return err
@@ -401,9 +392,10 @@ func useSpecifiedDir(dir string) (string, error) {
 
 // newNewCmd creates a New command with default dependencies.
 // Intentionally disabling here for cleaner err declaration/assignment.
-// nolint: vetshadow
+//
+//nolint:vetshadow
 func newNewCmd() *cobra.Command {
-	var args = newArgs{
+	args := newArgs{
 		interactive: cmdutil.Interactive(),
 		prompt:      promptForValue,
 	}
@@ -427,8 +419,9 @@ func newNewCmd() *cobra.Command {
 		Long: "Create a new Pulumi project and stack from a template.\n" +
 			"\n" +
 			"To create a project from a specific template, pass the template name (such as `aws-typescript`\n" +
-			"or `azure-python`).  If no template name is provided, a list of suggested templates will be presented\n" +
+			"or `azure-python`). If no template name is provided, a list of suggested templates will be presented\n" +
 			"which can be selected interactively.\n" +
+			"For testing, a path to a local template may be passed instead (such as `~/templates/aws-typescript`)\n" +
 			"\n" +
 			"By default, a stack created using the pulumi.com backend will use the pulumi.com secrets\n" +
 			"provider and a stack created using the local or cloud object storage backend will use the\n" +
@@ -453,7 +446,14 @@ func newNewCmd() *cobra.Command {
 			"To create the project from a branch of a specific source control location, pass the url to the branch, e.g.\n" +
 			"* `pulumi new https://gitlab.com/<user>/<repo>/tree/<branch>`\n" +
 			"* `pulumi new https://bitbucket.org/<user>/<repo>/tree/<branch>`\n" +
-			"* `pulumi new https://github.com/<user>/<repo>/tree/<branch>`\n",
+			"* `pulumi new https://github.com/<user>/<repo>/tree/<branch>`\n" +
+			"\n" +
+			"To use a private repository as a template source, provide an HTTPS or SSH URL with relevant credentials.\n" +
+			"Ensure your SSH agent has the correct identity (ssh-add) or you may be prompted for your key's passphrase.\n" +
+			"* `pulumi new git@github.com:<user>/<private-repo>`\n" +
+			"* `pulumi new https://<user>:<password>@<hostname>/<project>/<repo>`\n" +
+			"* `pulumi new <user>@<hostname>:<project>/<repo>`\n" +
+			"* `PULUMI_GITSSH_PASSPHRASE=<passphrase> pulumi new ssh://<user>@<hostname>/<project>/<repo>`\n",
 		Args: cmdutil.MaximumNArgs(1),
 		Run: cmdutil.RunFunc(func(cmd *cobra.Command, cliArgs []string) error {
 			ctx := commandContext()
@@ -539,6 +539,14 @@ func newNewCmd() *cobra.Command {
 	return cmd
 }
 
+// File or directory names that are considered invisible
+// when considering whether a directory is empty.
+var invisibleDirEntries = map[string]struct{}{
+	".git": {},
+	".hg":  {},
+	".bzr": {},
+}
+
 // errorIfNotEmptyDirectory returns an error if path is not empty.
 func errorIfNotEmptyDirectory(path string) error {
 	infos, err := os.ReadDir(path)
@@ -546,7 +554,16 @@ func errorIfNotEmptyDirectory(path string) error {
 		return err
 	}
 
-	if len(infos) > 0 {
+	var nonEmpty bool
+	for _, info := range infos {
+		if _, ignore := invisibleDirEntries[info.Name()]; ignore {
+			continue
+		}
+		nonEmpty = true
+		break
+	}
+
+	if nonEmpty {
 		return fmt.Errorf("%s is not empty; "+
 			"rerun in an empty directory, pass the path to an empty directory to --dir, or use --force", path)
 	}
@@ -554,25 +571,51 @@ func errorIfNotEmptyDirectory(path string) error {
 	return nil
 }
 
-func validateProjectName(ctx context.Context, projectName string, generateOnly bool, opts display.Options) error {
-	err := workspace.ValidateProjectName(projectName)
+func validateProjectName(ctx context.Context, b backend.Backend,
+	orgName string, projectName string, generateOnly bool, opts display.Options,
+) error {
+	handleExistingProjectName := func(projectName string) error {
+		prompt := "\b\n" + opts.Color.Colorize(colors.SpecPrompt+
+			fmt.Sprintf("A project with the name `%s` already exists.", projectName)+
+			colors.Reset)
+
+		accept := fmt.Sprintf("Use '%s' anyway", projectName)
+		retry := "Specify a different project name"
+		response := promptUser(prompt, []string{accept, retry}, accept, opts.Color)
+
+		if response != accept {
+			return errRetry
+		}
+		return nil
+	}
+	if !opts.IsInteractive {
+		handleExistingProjectName = func(projectName string) error {
+			return fmt.Errorf("a project with this name already exists: %s", projectName)
+		}
+	}
+	return validateProjectNameInternal(
+		ctx, b, orgName, projectName, generateOnly, opts, handleExistingProjectName)
+}
+
+func validateProjectNameInternal(ctx context.Context, b backend.Backend,
+	orgName string, projectName string, generateOnly bool, opts display.Options,
+	handleExistingProjectName func(string) error,
+) error {
+	err := pkgWorkspace.ValidateProjectName(projectName)
 	if err != nil {
 		return err
 	}
 
 	if !generateOnly {
-		b, err := currentBackend(ctx, opts)
-		if err != nil {
-			return err
-		}
+		contract.Requiref(b != nil, "b", "must not be nil")
 
-		exists, err := b.DoesProjectExist(ctx, projectName)
+		exists, err := b.DoesProjectExist(ctx, orgName, projectName)
 		if err != nil {
 			return err
 		}
 
 		if exists {
-			return errors.New("A project with this name already exists")
+			return handleExistingProjectName(projectName)
 		}
 	}
 
@@ -580,11 +623,10 @@ func validateProjectName(ctx context.Context, projectName string, generateOnly b
 }
 
 // getStack gets a stack and the project name & description, or returns nil if the stack doesn't exist.
-func getStack(ctx context.Context, stack string, opts display.Options) (backend.Stack, string, string, error) {
-	b, err := currentBackend(ctx, opts)
-	if err != nil {
-		return nil, "", "", err
-	}
+func getStack(ctx context.Context, b backend.Backend,
+	stack string, opts display.Options,
+) (backend.Stack, string, string, error) {
+	contract.Requiref(b != nil, "b", "must not be nil")
 
 	stackRef, err := b.ParseStackReference(stack)
 	if err != nil {
@@ -609,21 +651,19 @@ func getStack(ctx context.Context, stack string, opts display.Options) (backend.
 }
 
 // promptAndCreateStack creates and returns a new stack (prompting for the name as needed).
-func promptAndCreateStack(ctx context.Context, prompt promptForValueFunc,
-	stack string, projectName string, setCurrent bool, yes bool, opts display.Options,
-	secretsProvider string) (backend.Stack, error) {
-
-	b, err := currentBackend(ctx, opts)
-	if err != nil {
-		return nil, err
-	}
+func promptAndCreateStack(ctx context.Context, b backend.Backend, prompt promptForValueFunc,
+	stack string, root string, setCurrent bool, yes bool, opts display.Options,
+	secretsProvider string,
+) (backend.Stack, error) {
+	contract.Requiref(b != nil, "b", "must not be nil")
+	contract.Requiref(root != "", "root", "must not be empty")
 
 	if stack != "" {
 		stackName, err := buildStackName(stack)
 		if err != nil {
 			return nil, err
 		}
-		s, err := stackInit(ctx, b, stackName, setCurrent, secretsProvider)
+		s, err := stackInit(ctx, b, stackName, root, setCurrent, secretsProvider)
 		if err != nil {
 			return nil, err
 		}
@@ -645,10 +685,7 @@ func promptAndCreateStack(ctx context.Context, prompt promptForValueFunc,
 		if err != nil {
 			return nil, err
 		}
-		if err != nil {
-			return nil, err
-		}
-		s, err := stackInit(ctx, b, formattedStackName, setCurrent, secretsProvider)
+		s, err := stackInit(ctx, b, formattedStackName, root, setCurrent, secretsProvider)
 		if err != nil {
 			if !yes {
 				// Let the user know about the error and loop around to try again.
@@ -664,12 +701,13 @@ func promptAndCreateStack(ctx context.Context, prompt promptForValueFunc,
 // stackInit creates the stack.
 func stackInit(
 	ctx context.Context, b backend.Backend, stackName string,
-	setCurrent bool, secretsProvider string) (backend.Stack, error) {
+	root string, setCurrent bool, secretsProvider string,
+) (backend.Stack, error) {
 	stackRef, err := b.ParseStackReference(stackName)
 	if err != nil {
 		return nil, err
 	}
-	return createStack(ctx, b, stackRef, nil, setCurrent, secretsProvider)
+	return createStack(ctx, b, stackRef, root, nil, setCurrent, secretsProvider)
 }
 
 // saveConfig saves the config for the stack.
@@ -815,32 +853,22 @@ func chooseTemplate(templates []workspace.Template, opts display.Options) (works
 	// Customize the prompt a little bit (and disable color since it doesn't match our scheme).
 	surveycore.DisableColor = true
 
-	var selectedOption workspace.Template
+	options, optionToTemplateMap := templatesToOptionArrayAndMap(templates, true)
+	nopts := len(options)
+	pageSize := optimalPageSize(optimalPageSizeOpts{nopts: nopts})
+	message := fmt.Sprintf("\rPlease choose a template (%d/%d shown):\n", pageSize, nopts)
+	message = opts.Color.Colorize(colors.SpecPrompt + message + colors.Reset)
 
-	for {
-		options, optionToTemplateMap := templatesToOptionArrayAndMap(templates, true)
-		nopts := len(options)
-		pageSize := optimalPageSize(optimalPageSizeOpts{nopts: nopts})
-		message := fmt.Sprintf("\rPlease choose a template (%d/%d shown):\n", pageSize, nopts)
-		message = opts.Color.Colorize(colors.SpecPrompt + message + colors.Reset)
-
-		var option string
-		if err := survey.AskOne(&survey.Select{
-			Message:  message,
-			Options:  options,
-			PageSize: pageSize,
-		}, &option, surveyIcons(opts.Color)); err != nil {
-			return workspace.Template{}, errors.New(chooseTemplateErr)
-		}
-
-		var has bool
-		selectedOption, has = optionToTemplateMap[option]
-		if has {
-			break
-		}
+	var option string
+	if err := survey.AskOne(&survey.Select{
+		Message:  message,
+		Options:  options,
+		PageSize: pageSize,
+	}, &option, surveyIcons(opts.Color)); err != nil {
+		return workspace.Template{}, errors.New(chooseTemplateErr)
 	}
 
-	return selectedOption, nil
+	return optionToTemplateMap[option], nil
 }
 
 // parseConfig parses the config values passed via command line flags.
@@ -875,13 +903,15 @@ func parseConfig(configArray []string, path bool) (config.Map, error) {
 // value when prompting instead of the default value specified in templateConfig.
 func promptForConfig(
 	ctx context.Context,
+	prompt promptForValueFunc,
+	project *workspace.Project,
 	stack backend.Stack,
 	templateConfig map[string]workspace.ProjectTemplateConfigValue,
 	commandLineConfig config.Map,
 	stackConfig config.Map,
 	yes bool,
-	opts display.Options) (config.Map, error) {
-
+	opts display.Options,
+) (config.Map, error) {
 	// Convert `string` keys to `config.Key`. If a string key is missing a delimiter,
 	// the project name will be prepended.
 	parsedTemplateConfig := make(map[config.Key]workspace.ProjectTemplateConfigValue)
@@ -901,9 +931,20 @@ func promptForConfig(
 	}
 	sort.Sort(keys)
 
-	sm, err := getStackSecretsManager(stack)
+	// We need to load the stack config here for the secret manager
+	ps, err := loadProjectStack(project, stack)
+	if err != nil {
+		return nil, fmt.Errorf("loading stack config: %w", err)
+	}
+
+	sm, needsSave, err := getStackSecretsManager(stack, ps)
 	if err != nil {
 		return nil, err
+	}
+	if needsSave {
+		if err = saveProjectStack(stack, ps); err != nil {
+			return nil, fmt.Errorf("saving stack config: %w", err)
+		}
 	}
 	encrypter, err := sm.Encrypter()
 	if err != nil {
@@ -947,15 +988,20 @@ func promptForConfig(
 		}
 
 		// Prepare the prompt.
-		prompt := prettyKey(k)
+		promptText := prettyKey(k)
 		if templateConfigValue.Description != "" {
-			prompt = prompt + ": " + templateConfigValue.Description
+			promptText = promptText + ": " + templateConfigValue.Description
 		}
 
 		// Prompt.
-		value, err := promptForValue(yes, prompt, defaultValue, secret, nil, opts)
+		value, err := prompt(yes, promptText, defaultValue, secret, nil, opts)
 		if err != nil {
 			return nil, err
+		}
+
+		if value == "" {
+			// Don't add empty values to the config.
+			continue
 		}
 
 		// Encrypt the value if needed.
@@ -984,6 +1030,8 @@ func promptForConfig(
 	return c, nil
 }
 
+var errRetry = errors.New("Try again")
+
 // promptForValue prompts the user for a value with a defaultValue preselected. Hitting enter accepts the
 // default. If yes is true, defaultValue is returned without prompting. isValidFn is an optional parameter;
 // when specified, it will be run to validate that value entered. When this function returns a non nil error
@@ -992,8 +1040,8 @@ func promptForConfig(
 // prompts again.
 func promptForValue(
 	yes bool, valueType string, defaultValue string, secret bool,
-	isValidFn func(value string) error, opts display.Options) (string, error) {
-
+	isValidFn func(value string) error, opts display.Options,
+) (string, error) {
 	var value string
 	for {
 		// If we are auto-accepting the default (--yes), just set it and move on to validating.
@@ -1004,7 +1052,7 @@ func promptForValue(
 			var prompt string
 			if defaultValue == "" {
 				prompt = opts.Color.Colorize(
-					fmt.Sprintf("%s%s:%s ", colors.SpecPrompt, valueType, colors.Reset))
+					fmt.Sprintf("%s%s%s", colors.SpecPrompt, valueType, colors.Reset))
 			} else {
 				defaultValuePrompt := defaultValue
 				if secret {
@@ -1012,19 +1060,18 @@ func promptForValue(
 				}
 
 				prompt = opts.Color.Colorize(
-					fmt.Sprintf("%s%s:%s (%s) ", colors.SpecPrompt, valueType, colors.Reset, defaultValuePrompt))
+					fmt.Sprintf("%s%s%s (%s)", colors.SpecPrompt, valueType, colors.Reset, defaultValuePrompt))
 			}
-			fmt.Print(prompt)
 
 			// Read the value.
 			var err error
 			if secret {
-				value, err = cmdutil.ReadConsoleNoEcho("")
+				value, err = cmdutil.ReadConsoleNoEcho(prompt)
 				if err != nil {
 					return "", err
 				}
 			} else {
-				value, err = cmdutil.ReadConsole("")
+				value, err = cmdutil.ReadConsole(prompt)
 				if err != nil {
 					return "", err
 				}
@@ -1040,7 +1087,10 @@ func promptForValue(
 		// Ensure the resulting value is valid; note that we even validate the default, since sometimes
 		// we will have invalid default values, like "" for the project name.
 		if isValidFn != nil {
-			if validationError := isValidFn(value); validationError != nil {
+			validationError := isValidFn(value)
+			if validationError == errRetry {
+				continue
+			} else if validationError != nil {
 				// If validation failed, let the user know. If interactive, we will print the error and
 				// prompt the user again; otherwise, in the case of --yes, we fail and report an error.
 				err := fmt.Errorf("Sorry, '%s' is not a valid %s. %w", value, valueType, validationError)
@@ -1061,8 +1111,8 @@ func promptForValue(
 // templatesToOptionArrayAndMap returns an array of option strings and a map of option strings to templates.
 // Each option string is made up of the template name and description with some padding in between.
 func templatesToOptionArrayAndMap(templates []workspace.Template,
-	showAll bool) ([]string, map[string]workspace.Template) {
-
+	showAll bool,
+) ([]string, map[string]workspace.Template) {
 	// Find the longest name length. Used to add padding between the name and description.
 	maxNameLength := 0
 	for _, template := range templates {
@@ -1073,21 +1123,32 @@ func templatesToOptionArrayAndMap(templates []workspace.Template,
 
 	// Build the array and map.
 	var options []string
+	var brokenOptions []string
 	nameToTemplateMap := make(map[string]workspace.Template)
 	for _, template := range templates {
 		// If showAll is false, then only include templates marked Important
 		if !showAll && !template.Important {
 			continue
 		}
+		// If template is broken, indicate it in the project description.
+		if template.Errored() {
+			template.ProjectDescription = brokenTemplateDescription
+		}
+
 		// Create the option string that combines the name, padding, and description.
-		desc := workspace.ValueOrDefaultProjectDescription("", template.ProjectDescription, template.Description)
+		desc := pkgWorkspace.ValueOrDefaultProjectDescription("", template.ProjectDescription, template.Description)
 		option := fmt.Sprintf(fmt.Sprintf("%%%ds    %%s", -maxNameLength), template.Name, desc)
 
-		// Add it to the array and map.
-		options = append(options, option)
 		nameToTemplateMap[option] = template
+		if template.Errored() {
+			brokenOptions = append(brokenOptions, option)
+		} else {
+			options = append(options, option)
+		}
 	}
+	// After sorting the options, add the broken templates to the end
 	sort.Strings(options)
+	options = append(options, brokenOptions...)
 
 	if !showAll {
 		// If showAll is false, include an option to show all
@@ -1106,4 +1167,32 @@ func containsWhiteSpace(value string) bool {
 		}
 	}
 	return false
+}
+
+// compareStackProjectName takes a stack name and a project name and returns an error if they are not the same.
+//   - projectName comes from the --name flag.
+//   - stackName comes from the --stack flag. stackName can be a stack name or a fully qualified stack reference
+//     i.e org/project/stack
+func compareStackProjectName(b backend.Backend, stackName, projectName string) error {
+	if stackName == "" || projectName == "" {
+		// No potential for conflicting project names.
+		return nil
+	}
+
+	// Catch the case where the user has specified a fully qualified stack reference.
+	ref, err := b.ParseStackReference(stackName)
+	if err != nil {
+		// If we can't parse the stack reference, we can't compare the project names.
+		// We assume the project names don't conflict and that this parsing issue will be handled downstream.
+		return nil
+	}
+	stackProjectName, hasProject := ref.Project()
+	if !hasProject {
+		return nil
+	}
+	if projectName == stackProjectName.String() {
+		return nil
+	}
+	return fmt.Errorf("project name (--name %s) and stack reference project name (--stack %s) must be the same",
+		projectName, stackProjectName)
 }

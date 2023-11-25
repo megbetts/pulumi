@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,8 @@ import { minimumVersion } from "./minimumVersion";
 import { ProjectSettings } from "./projectSettings";
 import { RemoteGitProgramArgs } from "./remoteWorkspace";
 import { OutputMap, Stack } from "./stack";
-import * as localState from "../runtime/state";
 import { StackSettings, stackSettingsSerDeKeys } from "./stackSettings";
+import { TagMap } from "./tag";
 import { Deployment, PluginInfo, PulumiFn, StackSummary, WhoAmIResult, Workspace } from "./workspace";
 
 const SKIP_VERSION_CHECK_VAR = "PULUMI_AUTOMATION_API_SKIP_VERSION_CHECK";
@@ -100,6 +100,11 @@ export class LocalWorkspace implements Workspace {
      * The environment variables to pass along when running remote Pulumi operations.
      */
     private remoteEnvVars?: { [key: string]: string | { secret: string } };
+
+    /**
+     * Whether to skip the default dependency installation step.
+     */
+    private remoteSkipInstallDependencies?: boolean;
 
     /**
      * Creates a workspace using the specified options. Used for maximal control and customization
@@ -186,7 +191,10 @@ export class LocalWorkspace implements Workspace {
      * @param opts Additional customizations to be applied to the Workspace.
      */
     static async createOrSelectStack(args: InlineProgramArgs, opts?: LocalWorkspaceOptions): Promise<Stack>;
-    static async createOrSelectStack(args: InlineProgramArgs | LocalProgramArgs, opts?: LocalWorkspaceOptions): Promise<Stack> {
+    static async createOrSelectStack(
+        args: InlineProgramArgs | LocalProgramArgs,
+        opts?: LocalWorkspaceOptions,
+    ): Promise<Stack> {
         if (isInlineProgramArgs(args)) {
             return await this.inlineSourceStackHelper(args, Stack.createOrSelect, opts);
         } else if (isLocalProgramArgs(args)) {
@@ -195,7 +203,9 @@ export class LocalWorkspace implements Workspace {
         throw new Error(`unexpected args: ${args}`);
     }
     private static async localSourceStackHelper(
-        args: LocalProgramArgs, initFn: StackInitializer, opts?: LocalWorkspaceOptions,
+        args: LocalProgramArgs,
+        initFn: StackInitializer,
+        opts?: LocalWorkspaceOptions,
     ): Promise<Stack> {
         let wsOpts = { workDir: args.workDir };
         if (opts) {
@@ -208,7 +218,9 @@ export class LocalWorkspace implements Workspace {
         return await initFn(args.stackName, ws);
     }
     private static async inlineSourceStackHelper(
-        args: InlineProgramArgs, initFn: StackInitializer, opts?: LocalWorkspaceOptions,
+        args: InlineProgramArgs,
+        initFn: StackInitializer,
+        opts?: LocalWorkspaceOptions,
     ): Promise<Stack> {
         let wsOpts: LocalWorkspaceOptions = { program: args.program };
         if (opts) {
@@ -216,7 +228,7 @@ export class LocalWorkspace implements Workspace {
         }
 
         if (!wsOpts.projectSettings) {
-            if (!!wsOpts.workDir) {
+            if (wsOpts.workDir) {
                 try {
                     // Try to load the project settings.
                     loadProjectSettings(wsOpts.workDir);
@@ -241,13 +253,25 @@ export class LocalWorkspace implements Workspace {
     private constructor(opts?: LocalWorkspaceOptions) {
         let dir = "";
         let envs = {};
-        const store = new localState.LocalStore();
-        localState.asyncLocalStorage.enterWith(store);
 
         if (opts) {
-            const { workDir, pulumiHome, program, envVars, secretsProvider,
-                remote, remoteGitProgramArgs, remotePreRunCommands, remoteEnvVars } = opts;
+            const {
+                workDir,
+                pulumiHome,
+                program,
+                envVars,
+                secretsProvider,
+                remote,
+                remoteGitProgramArgs,
+                remotePreRunCommands,
+                remoteEnvVars,
+                remoteSkipInstallDependencies,
+            } = opts;
             if (workDir) {
+                // Verify that the workdir exists.
+                if (!fs.existsSync(workDir)) {
+                    throw new Error(`Invalid workDir passed to local workspace: '${workDir}' does not exist`);
+                }
                 dir = workDir;
             }
             this.pulumiHome = pulumiHome;
@@ -257,6 +281,7 @@ export class LocalWorkspace implements Workspace {
             this.remoteGitProgramArgs = remoteGitProgramArgs;
             this.remotePreRunCommands = remotePreRunCommands;
             this.remoteEnvVars = { ...remoteEnvVars };
+            this.remoteSkipInstallDependencies = remoteSkipInstallDependencies;
             envs = { ...envVars };
         }
 
@@ -268,10 +293,10 @@ export class LocalWorkspace implements Workspace {
 
         const readinessPromises: Promise<any>[] = [this.getPulumiVersion(minimumVersion)];
 
-        if (opts && opts.projectSettings) {
+        if (opts?.projectSettings) {
             readinessPromises.push(this.saveProjectSettings(opts.projectSettings));
         }
-        if (opts && opts.stackSettings) {
+        if (opts?.stackSettings) {
             for (const [name, value] of Object.entries(opts.stackSettings)) {
                 readinessPromises.push(this.saveStackSettings(name, value));
             }
@@ -307,8 +332,7 @@ export class LocalWorkspace implements Workspace {
         let contents;
         if (foundExt === ".json") {
             contents = JSON.stringify(settings, null, 4);
-        }
-        else {
+        } else {
             contents = yaml.safeDump(settings, { skipInvalid: true });
         }
         return fs.writeFileSync(path, contents);
@@ -324,7 +348,9 @@ export class LocalWorkspace implements Workspace {
         for (const ext of settingsExtensions) {
             const isJSON = ext === ".json";
             const path = upath.joinSafe(this.workDir, `Pulumi.${stackSettingsName}${ext}`);
-            if (!fs.existsSync(path)) { continue; }
+            if (!fs.existsSync(path)) {
+                continue;
+            }
             const contents = fs.readFileSync(path).toString();
             let stackSettings: any;
             if (isJSON) {
@@ -374,8 +400,7 @@ export class LocalWorkspace implements Workspace {
 
         if (foundExt === ".json") {
             contents = JSON.stringify(serializeSettings, null, 4);
-        }
-        else {
+        } else {
             contents = yaml.safeDump(serializeSettings, { skipInvalid: true });
         }
         return fs.writeFileSync(path, contents);
@@ -425,9 +450,15 @@ export class LocalWorkspace implements Workspace {
      *
      * @param stackName The stack to read config from
      * @param key The key to use for the config lookup
+     * @param path The key contains a path to a property in a map or list to get
      */
-    async getConfig(stackName: string, key: string): Promise<ConfigValue> {
-        const result = await this.runPulumiCmd(["config", "get", key, "--json", "--stack", stackName]);
+    async getConfig(stackName: string, key: string, path?: boolean): Promise<ConfigValue> {
+        const args = ["config", "get"];
+        if (path) {
+            args.push("--path");
+        }
+        args.push(key, "--json", "--stack", stackName);
+        const result = await this.runPulumiCmd(args);
         return JSON.parse(result.stdout);
     }
     /**
@@ -447,23 +478,33 @@ export class LocalWorkspace implements Workspace {
      * @param stackName The stack to operate on
      * @param key The config key to set
      * @param value The value to set
+     * @param path The key contains a path to a property in a map or list to set
      */
-    async setConfig(stackName: string, key: string, value: ConfigValue): Promise<void> {
+    async setConfig(stackName: string, key: string, value: ConfigValue, path?: boolean): Promise<void> {
+        const args = ["config", "set"];
+        if (path) {
+            args.push("--path");
+        }
         const secretArg = value.secret ? "--secret" : "--plaintext";
-        await this.runPulumiCmd(["config", "set", key, "--stack", stackName, secretArg, "--non-interactive", "--", value.value]);
+        args.push(key, "--stack", stackName, secretArg, "--non-interactive", "--", value.value);
+        await this.runPulumiCmd(args);
     }
     /**
      * Sets all values in the provided config map for the specified stack name.
      * LocalWorkspace writes the config to the matching Pulumi.<stack>.yaml file in Workspace.WorkDir().
      *
      * @param stackName The stack to operate on
-     * @param config The `ConfigMap` to upsert against the existing config.
+     * @param config The `ConfigMap` to upsert against the existing config
+     * @param path The keys contain a path to a property in a map or list to set
      */
-    async setAllConfig(stackName: string, config: ConfigMap): Promise<void> {
-        let args = ["config", "set-all", "--stack", stackName];
+    async setAllConfig(stackName: string, config: ConfigMap, path?: boolean): Promise<void> {
+        const args = ["config", "set-all", "--stack", stackName];
+        if (path) {
+            args.push("--path");
+        }
         for (const [key, value] of Object.entries(config)) {
             const secretArg = value.secret ? "--secret" : "--plaintext";
-            args = [...args, secretArg, `${key}=${value.value}`];
+            args.push(secretArg, `${key}=${value.value}`);
         }
 
         await this.runPulumiCmd(args);
@@ -474,9 +515,14 @@ export class LocalWorkspace implements Workspace {
      *
      * @param stackName The stack to operate on
      * @param key The config key to remove
+     * @param path The key contains a path to a property in a map or list to remove
      */
-    async removeConfig(stackName: string, key: string): Promise<void> {
-        await this.runPulumiCmd(["config", "rm", key, "--stack", stackName]);
+    async removeConfig(stackName: string, key: string, path?: boolean): Promise<void> {
+        const args = ["config", "rm", key, "--stack", stackName];
+        if (path) {
+            args.push("--path");
+        }
+        await this.runPulumiCmd(args);
     }
     /**
      *
@@ -485,9 +531,15 @@ export class LocalWorkspace implements Workspace {
      *
      * @param stackName The stack to operate on
      * @param keys The list of keys to remove from the underlying config
+     * @param path The keys contain a path to a property in a map or list to remove
      */
-    async removeAllConfig(stackName: string, keys: string[]): Promise<void> {
-        await this.runPulumiCmd(["config", "rm-all", "--stack", stackName, ...keys]);
+    async removeAllConfig(stackName: string, keys: string[], path?: boolean): Promise<void> {
+        const args = ["config", "rm-all", "--stack", stackName];
+        if (path) {
+            args.push("--path");
+        }
+        args.push(...keys);
+        await this.runPulumiCmd(args);
     }
     /**
      * Gets and sets the config map used with the last update for Stack matching stack name.
@@ -500,11 +552,62 @@ export class LocalWorkspace implements Workspace {
         return this.getAllConfig(stackName);
     }
     /**
+     * Returns the value associated with the specified stack name and key,
+     * scoped to the LocalWorkspace.
+     *
+     * @param stackName The stack to read tag metadata from.
+     * @param key The key to use for the tag lookup.
+     */
+    async getTag(stackName: string, key: string): Promise<string> {
+        const result = await this.runPulumiCmd(["stack", "tag", "get", key, "--stack", stackName]);
+        return result.stdout.trim();
+    }
+    /**
+     * Sets the specified key-value pair on the provided stack name.
+     *
+     * @param stackName The stack to operate on.
+     * @param key The tag key to set.
+     * @param value The tag value to set.
+     */
+    async setTag(stackName: string, key: string, value: string): Promise<void> {
+        await this.runPulumiCmd(["stack", "tag", "set", key, value, "--stack", stackName]);
+    }
+    /**
+     * Removes the specified key-value pair on the provided stack name.
+     *
+     * @param stackName The stack to operate on.
+     * @param key The tag key to remove.
+     */
+    async removeTag(stackName: string, key: string): Promise<void> {
+        await this.runPulumiCmd(["stack", "tag", "rm", key, "--stack", stackName]);
+    }
+    /**
+     * Returns the tag map for the specified tag name, scoped to the current LocalWorkspace.
+     *
+     * @param stackName The stack to read tag metadata from.
+     */
+    async listTags(stackName: string): Promise<TagMap> {
+        const result = await this.runPulumiCmd(["stack", "tag", "ls", "--json", "--stack", stackName]);
+        return JSON.parse(result.stdout);
+    }
+    /**
      * Returns the currently authenticated user.
      */
     async whoAmI(): Promise<WhoAmIResult> {
-        const result = await this.runPulumiCmd(["whoami"]);
-        return { user: result.stdout.trim() };
+        let ver = this._pulumiVersion;
+        if (ver === undefined) {
+            // Assume an old version. Doesn't really matter what this is as long as it's pre-3.58.
+            ver = semver.parse("3.0.0")!;
+        }
+
+        // 3.58 added the --json flag (https://github.com/pulumi/pulumi/releases/tag/v3.58.0)
+        if (ver.compare("3.58.0") >= 0) {
+            const result = await this.runPulumiCmd(["whoami", "--json"]);
+            return JSON.parse(result.stdout);
+        } else {
+            const result = await this.runPulumiCmd(["whoami"]);
+            return { user: result.stdout.trim() };
+        }
     }
     /**
      * Returns a summary of the currently selected stack, if any.
@@ -610,7 +713,14 @@ export class LocalWorkspace implements Workspace {
     async stackOutputs(stackName: string): Promise<OutputMap> {
         // TODO: do this in parallel after this is fixed https://github.com/pulumi/pulumi/issues/6050
         const maskedResult = await this.runPulumiCmd(["stack", "output", "--json", "--stack", stackName]);
-        const plaintextResult = await this.runPulumiCmd(["stack", "output", "--json", "--show-secrets", "--stack", stackName]);
+        const plaintextResult = await this.runPulumiCmd([
+            "stack",
+            "output",
+            "--json",
+            "--show-secrets",
+            "--stack",
+            stackName,
+        ]);
         const maskedOuts = JSON.parse(maskedResult.stdout);
         const plaintextOuts = JSON.parse(plaintextResult.stdout);
         const outputs: OutputMap = {};
@@ -660,9 +770,7 @@ export class LocalWorkspace implements Workspace {
             }
         }
     }
-    private async runPulumiCmd(
-        args: string[],
-    ): Promise<CommandResult> {
+    private async runPulumiCmd(args: string[]): Promise<CommandResult> {
         let envs: { [key: string]: string } = {};
         if (this.pulumiHome) {
             envs["PULUMI_HOME"] = this.pulumiHome;
@@ -686,7 +794,7 @@ export class LocalWorkspace implements Workspace {
 
         args.push("--remote");
         if (this.remoteGitProgramArgs) {
-            const { url, projectPath, branch, commitHash, auth  } = this.remoteGitProgramArgs;
+            const { url, projectPath, branch, commitHash, auth } = this.remoteGitProgramArgs;
             if (url) {
                 args.push(url);
             }
@@ -714,7 +822,7 @@ export class LocalWorkspace implements Workspace {
                     args.push("--remote-git-auth-password", password);
                 }
                 if (username) {
-                    args.push("--remote-git-username", username);
+                    args.push("--remote-git-auth-username", username);
                 }
             }
         }
@@ -732,6 +840,10 @@ export class LocalWorkspace implements Workspace {
 
         for (const command of this.remotePreRunCommands ?? []) {
             args.push("--remote-pre-run-command", command);
+        }
+
+        if (this.remoteSkipInstallDependencies) {
+            args.push("--remote-skip-install-dependencies");
         }
 
         return args;
@@ -823,6 +935,12 @@ export interface LocalWorkspaceOptions {
      * @internal
      */
     remoteEnvVars?: { [key: string]: string | { secret: string } };
+    /**
+     * Whether to skip the default dependency installation step.
+     *
+     * @internal
+     */
+    remoteSkipInstallDependencies?: boolean;
 }
 
 /**
@@ -840,8 +958,7 @@ function isLocalProgramArgs(args: LocalProgramArgs | InlineProgramArgs): args is
  * @param args The args object to evaluate
  */
 function isInlineProgramArgs(args: LocalProgramArgs | InlineProgramArgs): args is InlineProgramArgs {
-    return (args as InlineProgramArgs).projectName !== undefined &&
-        (args as InlineProgramArgs).program !== undefined;
+    return (args as InlineProgramArgs).projectName !== undefined && (args as InlineProgramArgs).program !== undefined;
 }
 
 const settingsExtensions = [".yaml", ".yml", ".json"];
@@ -865,7 +982,9 @@ function loadProjectSettings(workDir: string) {
     for (const ext of settingsExtensions) {
         const isJSON = ext === ".json";
         const path = upath.joinSafe(workDir, `Pulumi${ext}`);
-        if (!fs.existsSync(path)) { continue; }
+        if (!fs.existsSync(path)) {
+            continue;
+        }
         const contents = fs.readFileSync(path).toString();
         if (isJSON) {
             return JSON.parse(contents);
@@ -883,19 +1002,31 @@ function loadProjectSettings(workDir: string) {
  * @param currentVersion The currently known version. `null` indicates that the current version is unknown.
  * @paramoptOut If the user has opted out of the version check.
  */
-export function parseAndValidatePulumiVersion(minVersion: semver.SemVer, currentVersion: string, optOut: boolean): semver.SemVer | null {
+export function parseAndValidatePulumiVersion(
+    minVersion: semver.SemVer,
+    currentVersion: string,
+    optOut: boolean,
+): semver.SemVer | null {
     const version = semver.parse(currentVersion);
     if (optOut) {
         return version;
     }
     if (version == null) {
-        throw new Error(`Failed to parse Pulumi CLI version. This is probably an internal error. You can override this by setting "${SKIP_VERSION_CHECK_VAR}" to "true".`);
+        throw new Error(
+            `Failed to parse Pulumi CLI version. This is probably an internal error. You can override this by setting "${SKIP_VERSION_CHECK_VAR}" to "true".`,
+        );
     }
     if (minVersion.major < version.major) {
-        throw new Error(`Major version mismatch. You are using Pulumi CLI version ${currentVersion.toString()} with Automation SDK v${minVersion.major}. Please update the SDK.`);
+        throw new Error(
+            `Major version mismatch. You are using Pulumi CLI version ${currentVersion.toString()} with Automation SDK v${
+                minVersion.major
+            }. Please update the SDK.`,
+        );
     }
     if (minVersion.compare(version) === 1) {
-        throw new Error(`Minimum version requirement failed. The minimum CLI version requirement is ${minVersion.toString()}, your current CLI version is ${currentVersion.toString()}. Please update the Pulumi CLI.`);
+        throw new Error(
+            `Minimum version requirement failed. The minimum CLI version requirement is ${minVersion.toString()}, your current CLI version is ${currentVersion.toString()}. Please update the Pulumi CLI.`,
+        );
     }
     return version;
 }

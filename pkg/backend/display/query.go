@@ -28,8 +28,8 @@ import (
 
 // ShowQueryEvents displays query events on the CLI.
 func ShowQueryEvents(op string, events <-chan engine.Event,
-	done chan<- bool, opts Options) {
-
+	done chan<- bool, opts Options,
+) {
 	prefix := fmt.Sprintf("%s%s...", cmdutil.EmojiOr("✨ ", "@ "), op)
 
 	var spinner cmdutil.Spinner
@@ -91,6 +91,9 @@ func renderQueryEvent(event engine.Event, opts Options) string {
 		engine.ResourceOutputsEvent, engine.ResourcePreEvent:
 
 		contract.Failf("query mode does not support resource operations")
+		return ""
+
+	case engine.PolicyLoadEvent:
 		return ""
 
 	default:

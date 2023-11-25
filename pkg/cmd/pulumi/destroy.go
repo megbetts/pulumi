@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -26,8 +27,11 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/graph"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
@@ -38,7 +42,7 @@ import (
 func newDestroyCmd() *cobra.Command {
 	var debug bool
 	var remove bool
-	var stack string
+	var stackName string
 
 	var message string
 	var execKind string
@@ -69,7 +73,7 @@ func newDestroyCmd() *cobra.Command {
 		use, cmdArgs = "destroy [url]", cmdutil.MaximumNArgs(1)
 	}
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:        use,
 		Aliases:    []string{"down"},
 		SuggestFor: []string{"delete", "kill", "remove", "rm", "stop"},
@@ -81,7 +85,7 @@ func newDestroyCmd() *cobra.Command {
 			"all of this stack's resources and associated state are deleted.\n" +
 			"\n" +
 			"The stack itself is not deleted. Use `pulumi stack rm` or the \n" +
-			"`--remove` flag to delete the stack.\n" +
+			"`--remove` flag to delete the stack and its config file.\n" +
 			"\n" +
 			"Warning: this command is generally irreversible and should be used with great care.",
 		Args: cmdArgs,
@@ -105,7 +109,7 @@ func newDestroyCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			var displayType = display.DisplayProgress
+			displayType := display.DisplayProgress
 			if diffDisplay {
 				displayType = display.DisplayDiff
 			}
@@ -125,7 +129,6 @@ func newDestroyCmd() *cobra.Command {
 
 			// we only suppress permalinks if the user passes true. the default is an empty string
 			// which we pass as 'false'
-			//nolint:goconst
 			if suppressPermalink == "true" {
 				opts.Display.SuppressPermalink = true
 			} else {
@@ -138,14 +141,14 @@ func newDestroyCmd() *cobra.Command {
 				}
 
 				err = validateUnsupportedRemoteFlags(false, nil, false, "", jsonDisplay, nil,
-					nil, refresh, showConfig, showReplacementSteps, showSames, false,
+					nil, refresh, showConfig, false, showReplacementSteps, showSames, false,
 					suppressOutputs, "default", targets, nil, nil,
 					targetDependents, "", stackConfigFile)
 				if err != nil {
 					return result.FromError(err)
 				}
 
-				return runDeployment(ctx, opts.Display, apitype.Destroy, stack, args[0], remoteArgs)
+				return runDeployment(ctx, opts.Display, apitype.Destroy, stackName, args[0], remoteArgs)
 			}
 
 			filestateBackend, err := isFilestateBackend(opts.Display)
@@ -155,12 +158,11 @@ func newDestroyCmd() *cobra.Command {
 
 			// by default, we are going to suppress the permalink when using self-managed backends
 			// this can be re-enabled by explicitly passing "false" to the `suppress-permalink` flag
-			//nolint:goconst
 			if suppressPermalink != "false" && filestateBackend {
 				opts.Display.SuppressPermalink = true
 			}
 
-			s, err := requireStack(ctx, stack, false, opts.Display, false /*setCurrent*/)
+			s, err := requireStack(ctx, stackName, stackLoadOnly, opts.Display)
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -169,30 +171,43 @@ func newDestroyCmd() *cobra.Command {
 			if err != nil && errors.Is(err, workspace.ErrProjectNotFound) {
 				logging.Warningf("failed to find current Pulumi project, continuing with an empty project"+
 					"using stack %v from backend %v", s.Ref().Name(), s.Backend().Name())
-				proj = &workspace.Project{}
+				projectName, has := s.Ref().Project()
+				if !has {
+					// If the stack doesn't have a project name (legacy filestate) then leave this blank, as
+					// we used to.
+					projectName = ""
+				}
+				proj = &workspace.Project{
+					Name: tokens.PackageName(projectName),
+				}
 				root = ""
 			} else if err != nil {
 				return result.FromError(err)
 			}
 
-			m, err := getUpdateMetadata(message, root, execKind, execAgent, false)
+			m, err := getUpdateMetadata(message, root, execKind, execAgent, false, cmd.Flags())
 			if err != nil {
 				return result.FromError(fmt.Errorf("gathering environment metadata: %w", err))
 			}
 
-			snap, err := s.Snapshot(ctx)
+			snap, err := s.Snapshot(ctx, stack.DefaultSecretsProvider)
 			if err != nil {
 				return result.FromError(err)
 			}
 
-			sm, err := getStackSecretsManager(s)
-			if err != nil {
-				// fallback on snapshot SecretsManager
-				sm = snap.SecretsManager
+			// Use the current snapshot secrets manager, if there is one, as the fallback secrets manager.
+			var defaultSecretsManager secrets.Manager
+			if snap != nil {
+				defaultSecretsManager = snap.SecretsManager
 			}
 
-			cfg, err := getStackConfiguration(ctx, s, proj, sm)
-
+			getConfig := getStackConfiguration
+			if stackName != "" {
+				// `pulumi destroy --stack <stack>` can be run outside of the project directory.
+				// The config may be missing, fallback on the latest configuration in the backend.
+				getConfig = getStackConfigurationOrLatest
+			}
+			cfg, sm, err := getConfig(ctx, s, proj, defaultSecretsManager)
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack configuration: %w", err))
 			}
@@ -201,9 +216,19 @@ func newDestroyCmd() *cobra.Command {
 			if err != nil {
 				return result.FromError(fmt.Errorf("getting stack decrypter: %w", err))
 			}
+			encrypter, err := sm.Encrypter()
+			if err != nil {
+				return result.FromError(fmt.Errorf("getting stack encrypter: %w", err))
+			}
 
 			stackName := s.Ref().Name().String()
-			configError := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+			configError := workspace.ValidateStackConfigAndApplyProjectConfig(
+				stackName,
+				proj,
+				cfg.Environment,
+				cfg.Config,
+				encrypter,
+				decrypter)
 			if configError != nil {
 				return result.FromError(fmt.Errorf("validating stack config: %w", configError))
 			}
@@ -218,9 +243,9 @@ func newDestroyCmd() *cobra.Command {
 			}
 
 			var protectedCount int
-			var targetUrns []string = *targets
+			targetUrns := *targets
 			if excludeProtected {
-				contract.Assert(len(targetUrns) == 0)
+				contract.Assertf(len(targetUrns) == 0, "Expected no target URNs, got %d", len(targetUrns))
 				targetUrns, protectedCount, err = handleExcludeProtected(ctx, s)
 				if err != nil {
 					return result.FromError(err)
@@ -240,7 +265,7 @@ func newDestroyCmd() *cobra.Command {
 				Parallel:                  parallel,
 				Debug:                     debug,
 				Refresh:                   refreshOption,
-				DestroyTargets:            deploy.NewUrnTargets(targetUrns),
+				Targets:                   deploy.NewUrnTargets(targetUrns),
 				TargetDependents:          targetDependents,
 				UseLegacyDiff:             useLegacyDiff(),
 				DisableProviderPreview:    disableProviderPreview(),
@@ -256,7 +281,8 @@ func newDestroyCmd() *cobra.Command {
 				Opts:               opts,
 				StackConfiguration: cfg,
 				SecretsManager:     sm,
-				Scopes:             cancellationScopes,
+				SecretsProvider:    stack.DefaultSecretsProvider,
+				Scopes:             backend.CancellationScopes,
 			})
 
 			if res == nil && protectedCount > 0 && !jsonDisplay {
@@ -271,9 +297,15 @@ func newDestroyCmd() *cobra.Command {
 					_, err = s.Remove(ctx, false)
 					if err != nil {
 						return result.FromError(err)
-					} else if !jsonDisplay {
-						fmt.Printf("The resources in the stack have been deleted, and the history and " +
-							"configuration removed.\n")
+					}
+					// Remove also the stack config file.
+					if _, path, err := workspace.DetectProjectStackPath(s.Ref().Name().Q()); err == nil {
+						if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+							return result.FromError(err)
+						} else if !jsonDisplay {
+							fmt.Printf("The resources in the stack have been deleted, and the history and " +
+								"configuration removed.\n")
+						}
 					}
 				}
 			} else if res != nil && res.Error() == context.Canceled {
@@ -288,9 +320,9 @@ func newDestroyCmd() *cobra.Command {
 		"Print detailed debugging output during resource operations")
 	cmd.PersistentFlags().BoolVar(
 		&remove, "remove", false,
-		"Remove the stack after all resources in the stack have been deleted")
+		"Remove the stack and its config file after all resources in the stack have been deleted")
 	cmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
 		&stackConfigFile, "config-file", "",
@@ -368,7 +400,7 @@ func newDestroyCmd() *cobra.Command {
 	return cmd
 }
 
-// seperateProtected returns a list or unprotected and protected resources respectively. This allows
+// separateProtected returns a list or unprotected and protected resources respectively. This allows
 // us to safely destroy all resources in the unprotected list without invalidating any resource in
 // the protected list. Protection is contravarient: A < B where A: Protected => B: Protected, A < B
 // where B: Protected !=> A: Protected.
@@ -385,8 +417,9 @@ func newDestroyCmd() *cobra.Command {
 //
 // We rely on the fact that `resources` is topologically sorted with respect to its dependencies.
 // This function understands that providers live outside this topological sort.
-func seperateProtected(resources []*resource.State) (
-	/*unprotected*/ []*resource.State /*protected*/, []*resource.State) {
+func separateProtected(resources []*resource.State) (
+	/*unprotected*/ []*resource.State /*protected*/, []*resource.State,
+) {
 	dg := graph.NewDependencyGraph(resources)
 	transitiveProtected := graph.ResourceSet{}
 	for _, r := range resources {
@@ -403,13 +436,13 @@ func seperateProtected(resources []*resource.State) (
 // Returns the number of protected resources that remain. Appends all unprotected resources to `targetUrns`.
 func handleExcludeProtected(ctx context.Context, s backend.Stack) ([]string, int, error) {
 	// Get snapshot
-	snapshot, err := s.Snapshot(ctx)
+	snapshot, err := s.Snapshot(ctx, stack.DefaultSecretsProvider)
 	if err != nil {
 		return nil, 0, err
 	} else if snapshot == nil {
 		return nil, 0, errors.New("Failed to find the stack snapshot. Are you in a stack?")
 	}
-	unprotected, protected := seperateProtected(snapshot.Resources)
+	unprotected, protected := separateProtected(snapshot.Resources)
 	targetUrns := make([]string, len(unprotected))
 	for i, r := range unprotected {
 		targetUrns[i] = string(r.URN)

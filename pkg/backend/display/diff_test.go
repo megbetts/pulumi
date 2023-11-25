@@ -1,5 +1,20 @@
-//nolint:goconst
+// Copyright 2016-2023, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package display
+
+// Note: to regenerate the baselines for these tests, run `go test` with `PULUMI_ACCEPT=true`.
 
 import (
 	"bytes"
@@ -48,7 +63,7 @@ func loadEvents(path string) (events []engine.Event, err error) {
 	// If there are no events or if the event stream does not terminate with a cancel event,
 	// synthesize one here.
 	if len(events) == 0 || events[len(events)-1].Type != engine.CancelEvent {
-		events = append(events, engine.NewEvent(engine.CancelEvent, nil))
+		events = append(events, engine.NewCancelEvent())
 	}
 
 	return events, nil
@@ -90,13 +105,13 @@ func testDiffEvents(t *testing.T, path string, accept bool, truncateOutput bool)
 	<-doneChannel
 
 	if !accept {
-		assert.Equal(t, string(expectedStdout), string(stdout.Bytes()))
-		assert.Equal(t, string(expectedStderr), string(stderr.Bytes()))
+		assert.Equal(t, string(expectedStdout), stdout.String())
+		assert.Equal(t, string(expectedStderr), stderr.String())
 	} else {
-		err = os.WriteFile(path+".stdout.txt", stdout.Bytes(), 0600)
+		err = os.WriteFile(path+".stdout.txt", stdout.Bytes(), 0o600)
 		require.NoError(t, err)
 
-		err = os.WriteFile(path+".stderr.txt", stderr.Bytes(), 0600)
+		err = os.WriteFile(path+".stderr.txt", stderr.Bytes(), 0o600)
 		require.NoError(t, err)
 	}
 }

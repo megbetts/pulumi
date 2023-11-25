@@ -44,20 +44,20 @@ func getInvokeToken(call *hclsyntax.FunctionCallExpr) (string, hcl.Range, bool) 
 	return literal.Val.AsString(), call.Args[0].Range(), true
 }
 
-// annotateObjectProperties annotates the properties of an object expression with the types of the corresponding
-// properties in the schema. This is used to provide type information
-// for invoke calls that didn't have type annotations.
+// annotateObjectProperties annotates the properties of an object expression with the
+// types of the corresponding properties in the schema. This is used to provide type
+// information for invoke calls that didn't have type annotations.
 //
-// This function will recursively annotate the properties of objects
-// that are nested within the object expression type.
+// This function will recursively annotate the properties of objects that are nested
+// within the object expression type.
 func annotateObjectProperties(modelType model.Type, schemaType schema.Type) {
-	if optionalType, ok := schemaType.(*schema.OptionalType); ok {
+	if optionalType, ok := schemaType.(*schema.OptionalType); ok && optionalType != nil {
 		schemaType = optionalType.ElementType
 	}
 
 	switch arg := modelType.(type) {
 	case *model.ObjectType:
-		if schemaObjectType, ok := schemaType.(*schema.ObjectType); ok {
+		if schemaObjectType, ok := schemaType.(*schema.ObjectType); ok && schemaObjectType != nil {
 			schemaProperties := make(map[string]schema.Type)
 			for _, schemaProperty := range schemaObjectType.Properties {
 				schemaProperties[schemaProperty.Name] = schemaProperty.Type
@@ -74,13 +74,13 @@ func annotateObjectProperties(modelType model.Type, schemaType schema.Type) {
 		}
 	case *model.ListType:
 		underlyingArrayType := arg.ElementType
-		if schemaArrayType, ok := schemaType.(*schema.ArrayType); ok {
+		if schemaArrayType, ok := schemaType.(*schema.ArrayType); ok && schemaArrayType != nil {
 			underlyingSchemaArrayType := schemaArrayType.ElementType
 			annotateObjectProperties(underlyingArrayType, underlyingSchemaArrayType)
 		}
 
 	case *model.TupleType:
-		if schemaArrayType, ok := schemaType.(*schema.ArrayType); ok {
+		if schemaArrayType, ok := schemaType.(*schema.ArrayType); ok && schemaArrayType != nil {
 			underlyingSchemaArrayType := schemaArrayType.ElementType
 			elementTypes := arg.ElementTypes
 			for _, elemType := range elementTypes {
@@ -94,8 +94,7 @@ func annotateObjectProperties(modelType model.Type, schemaType schema.Type) {
 			annotateObjectProperties(arg.ElementTypes[1], schemaType)
 		} else if len(arg.ElementTypes) == 2 && arg.ElementTypes[1] == model.NoneType {
 			annotateObjectProperties(arg.ElementTypes[0], schemaType)
-		} else {
-			// TODO https://github.com/pulumi/pulumi/issues/10993
+		} else { //nolint:staticcheck // TODO https://github.com/pulumi/pulumi/issues/10993
 			// We need to handle the case where the schema type is a union type.
 		}
 	}
@@ -126,18 +125,28 @@ func (b *binder) bindInvokeSignature(args []model.Expression) (model.StaticFunct
 	}
 	pkgSchema, ok := b.options.packageCache.entries[pkgInfo]
 	if !ok {
+		if b.options.skipInvokeTypecheck {
+			return b.zeroSignature(), nil
+		}
 		return b.zeroSignature(), hcl.Diagnostics{unknownPackage(pkg, tokenRange)}
 	}
 
-	var fn *schema.Function
-	if f, tk, ok, err := pkgSchema.LookupFunction(token); err != nil {
+	fn, tk, ok, err := pkgSchema.LookupFunction(token)
+	if err != nil {
+		if b.options.skipInvokeTypecheck {
+			return b.zeroSignature(), nil
+		}
+
 		return b.zeroSignature(), hcl.Diagnostics{functionLoadError(token, err, tokenRange)}
 	} else if !ok {
+		if b.options.skipInvokeTypecheck {
+			return b.zeroSignature(), nil
+		}
+
 		return b.zeroSignature(), hcl.Diagnostics{unknownFunction(token, tokenRange)}
-	} else {
-		fn = f
-		lit.Value = cty.StringVal(tk)
 	}
+
+	lit.Value = cty.StringVal(tk)
 
 	if len(args) < 2 {
 		return b.zeroSignature(), hcl.Diagnostics{errorf(tokenRange, "missing second arg")}
@@ -155,6 +164,7 @@ func (b *binder) bindInvokeSignature(args []model.Expression) (model.StaticFunct
 		}
 	}
 
+	sig.MultiArgumentInputs = fn.MultiArgumentInputs
 	return sig, nil
 }
 
@@ -190,12 +200,21 @@ func (b *binder) signatureForArgs(fn *schema.Function, args model.Expression) (m
 }
 
 // Heuristic to decide when to use `fnOutput` form of a function. Will
-// conservatively prefer `false`. It only decides to return `true` if
-// doing so avoids the need to introduce an `apply` form to
+// conservatively prefer `false` unless bind option choose to prefer otherwise.
+// It decides to return `true` if doing so avoids the need to introduce an `apply` form to
 // accommodate `Output` args (`Promise` args do not count).
 func (b *binder) useOutputVersion(fn *schema.Function, args model.Expression) bool {
-	if !fn.NeedsOutputVersion() {
+	if fn.ReturnType == nil {
 		// No code emitted for an `fnOutput` form, impossible.
+		return false
+	}
+
+	if b.options.preferOutputVersionedInvokes {
+		return true
+	}
+
+	if fn.Inputs == nil || len(fn.Inputs.Properties) == 0 {
+		// use the output version when there are actual args to use
 		return false
 	}
 
@@ -221,10 +240,10 @@ func (b *binder) regularSignature(fn *schema.Function) model.StaticFunctionSigna
 	}
 
 	var returnType model.Type
-	if fn.Outputs == nil {
+	if fn.ReturnType == nil {
 		returnType = model.NewObjectType(map[string]model.Type{})
 	} else {
-		returnType = b.schemaTypeToType(fn.Outputs)
+		returnType = b.schemaTypeToType(fn.ReturnType)
 	}
 
 	return b.makeSignature(argsType, model.NewPromiseType(returnType))
@@ -235,9 +254,14 @@ func (b *binder) outputVersionSignature(fn *schema.Function) (model.StaticFuncti
 		return model.StaticFunctionSignature{}, fmt.Errorf("Function %s does not have an Output version", fn.Token)
 	}
 
-	// Given `fn.NeedsOutputVersion()==true`, can assume `fn.Inputs != nil`, `fn.Outputs != nil`.
-	argsType := b.schemaTypeToType(fn.Inputs.InputShape)
-	returnType := b.schemaTypeToType(fn.Outputs)
+	// Given `fn.NeedsOutputVersion()==true` `fn.ReturnType != nil`.
+	var argsType model.Type
+	if fn.Inputs != nil {
+		argsType = b.schemaTypeToType(fn.Inputs.InputShape)
+	} else {
+		argsType = model.NewObjectType(map[string]model.Type{})
+	}
+	returnType := b.schemaTypeToType(fn.ReturnType)
 	return b.makeSignature(argsType, model.NewOutputType(returnType)), nil
 }
 

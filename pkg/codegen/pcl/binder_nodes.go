@@ -61,6 +61,9 @@ func (b *binder) bindNode(node Node) hcl.Diagnostics {
 	case *Resource:
 		diags := b.bindResource(node)
 		diagnostics = append(diagnostics, diags...)
+	case *Component:
+		diags := b.bindComponent(node)
+		diagnostics = append(diagnostics, diags...)
 	case *OutputVariable:
 		diags := b.bindOutputVariable(node)
 		diagnostics = append(diagnostics, diags...)
@@ -96,18 +99,36 @@ func (b *binder) getDependencies(node Node) []Node {
 		}
 		return nil
 	})
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 	return SourceOrderNodes(deps)
+}
+
+func expressionIsLiteralNull(expr model.Expression) bool {
+	switch expr := expr.(type) {
+	case *model.LiteralValueExpression:
+		return expr.Value.IsNull()
+	default:
+		return false
+	}
 }
 
 func (b *binder) bindConfigVariable(node *ConfigVariable) hcl.Diagnostics {
 	block, diagnostics := model.BindBlock(node.syntax, model.StaticScope(b.root), b.tokens, b.options.modelOptions()...)
 	if defaultValue, ok := block.Body.Attribute("default"); ok {
 		node.DefaultValue = defaultValue.Value
+		// when default is null and the type is not already optional
+		// turn the config type T into option(T)
+		if expressionIsLiteralNull(node.DefaultValue) && !model.IsOptionalType(node.typ) {
+			node.typ = model.NewOptionalType(node.typ)
+			node.Nullable = true
+		}
+
 		if model.InputType(node.typ).ConversionFrom(node.DefaultValue.Type()) == model.NoConversion {
-			diagnostics = append(diagnostics, model.ExprNotConvertible(model.InputType(node.typ), node.DefaultValue))
+			errorDiagnostic := model.ExprNotConvertible(model.InputType(node.typ), node.DefaultValue)
+			diagnostics = append(diagnostics, errorDiagnostic)
 		}
 	}
+
 	if attr, ok := block.Body.Attribute(LogicalNamePropertyKey); ok {
 		logicalName, lDiags := getStringAttrValue(attr)
 		if lDiags != nil {
@@ -116,6 +137,25 @@ func (b *binder) bindConfigVariable(node *ConfigVariable) hcl.Diagnostics {
 			node.logicalName = logicalName
 		}
 	}
+
+	if descriptionAttr, ok := block.Body.Attribute("description"); ok {
+		description, diags := getStringAttrValue(descriptionAttr)
+		if diags != nil {
+			diagnostics = diagnostics.Append(diags)
+		} else {
+			node.Description = description
+		}
+	}
+
+	if nullableAttr, ok := block.Body.Attribute("nullable"); ok {
+		nullable, diags := getBooleanAttributeValue(nullableAttr)
+		if diags != nil {
+			diagnostics = diagnostics.Append(diags)
+		} else {
+			node.Nullable = nullable
+		}
+	}
+
 	node.Definition = block
 	return diagnostics
 }

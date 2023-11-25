@@ -3,6 +3,8 @@ package docs
 import (
 	"fmt"
 	"sort"
+
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
 type entryType string
@@ -28,7 +30,9 @@ func generatePackageTree(rootMod modContext) ([]PackageTreeItem, error) {
 	numFunctions := len(rootMod.functions)
 	// +1 to add the module itself as an entry.
 	size := numResources + numFunctions + 1
-	packageTree := make([]PackageTreeItem, 0, size)
+	packageTree := slice.Prealloc[PackageTreeItem](size)
+
+	conflictResolver := rootMod.docGenContext.newModuleConflictResolver()
 
 	for _, m := range rootMod.children {
 		modName := m.getModuleFileName()
@@ -39,10 +43,14 @@ func generatePackageTree(rootMod modContext) ([]PackageTreeItem, error) {
 			return nil, fmt.Errorf("generating children for module %s (mod token: %s): %w", displayName, m.mod, err)
 		}
 
+		safeName := conflictResolver.getSafeName(displayName, m)
+		if safeName == "" {
+			continue // unresolved conflict
+		}
 		ti := PackageTreeItem{
 			Name:     displayName,
 			Type:     entryTypeModule,
-			Link:     getModuleLink(displayName),
+			Link:     getModuleLink(safeName),
 			Children: children,
 		}
 
@@ -54,10 +62,14 @@ func generatePackageTree(rootMod modContext) ([]PackageTreeItem, error) {
 
 	for _, r := range rootMod.resources {
 		name := resourceName(r)
+		safeName := conflictResolver.getSafeName(name, r)
+		if safeName == "" {
+			continue // unresolved conflict
+		}
 		ti := PackageTreeItem{
 			Name:     name,
 			Type:     entryTypeResource,
-			Link:     getResourceLink(name),
+			Link:     getResourceLink(safeName),
 			Children: nil,
 		}
 
@@ -75,10 +87,14 @@ func generatePackageTree(rootMod modContext) ([]PackageTreeItem, error) {
 
 	for _, f := range rootMod.functions {
 		name := tokenToName(f.Token)
+		safeName := conflictResolver.getSafeName(name, f)
+		if safeName == "" {
+			continue // unresolved conflict
+		}
 		ti := PackageTreeItem{
 			Name:     name,
 			Type:     entryTypeFunction,
-			Link:     getFunctionLink(name),
+			Link:     getFunctionLink(safeName),
 			Children: nil,
 		}
 

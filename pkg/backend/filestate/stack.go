@@ -16,47 +16,59 @@ package filestate
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend"
+	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/operations"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	"github.com/pulumi/pulumi/pkg/v3/secrets/passphrase"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/display"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 )
 
-// Stack is a local stack.  This simply adds some local-specific properties atop the standard backend stack interface.
-type Stack interface {
-	backend.Stack
-	Path() string // a path to the stack's checkpoint file on disk.
-}
-
 // localStack is a local stack descriptor.
 type localStack struct {
-	ref      backend.StackReference // the stack's reference (qualified name).
-	path     string                 // a path to the stack's checkpoint file on disk.
-	snapshot *deploy.Snapshot       // a snapshot representing the latest deployment state.
-	b        *localBackend          // a pointer to the backend this stack belongs to.
+	// the stack's reference (qualified name).
+	ref *localBackendReference
+	// a snapshot representing the latest deployment state, allocated on first use. It's valid for the
+	// snapshot itself to be nil.
+	snapshot atomic.Pointer[*deploy.Snapshot]
+	// a pointer to the backend this stack belongs to.
+	b *localBackend
 }
 
-func newStack(ref backend.StackReference, path string, snapshot *deploy.Snapshot, b *localBackend) Stack {
+func newStack(ref *localBackendReference, b *localBackend) backend.Stack {
+	contract.Requiref(ref != nil, "ref", "ref was nil")
+
 	return &localStack{
-		ref:      ref,
-		path:     path,
-		snapshot: snapshot,
-		b:        b,
+		ref: ref,
+		b:   b,
 	}
 }
 
-func (s *localStack) Ref() backend.StackReference                            { return s.ref }
-func (s *localStack) Snapshot(ctx context.Context) (*deploy.Snapshot, error) { return s.snapshot, nil }
-func (s *localStack) Backend() backend.Backend                               { return s.b }
-func (s *localStack) Path() string                                           { return s.path }
-func (s *localStack) Tags() map[apitype.StackTagName]string                  { return nil }
+func (s *localStack) Ref() backend.StackReference { return s.ref }
+func (s *localStack) Snapshot(ctx context.Context, secretsProvider secrets.Provider) (*deploy.Snapshot, error) {
+	if v := s.snapshot.Load(); v != nil {
+		return *v, nil
+	}
+
+	snap, err := s.b.getSnapshot(ctx, secretsProvider, s.ref)
+	if err != nil {
+		return nil, err
+	}
+
+	s.snapshot.Store(&snap)
+	return snap, nil
+}
+func (s *localStack) Backend() backend.Backend              { return s.b }
+func (s *localStack) Tags() map[apitype.StackTagName]string { return nil }
 
 func (s *localStack) Remove(ctx context.Context, force bool) (bool, error) {
 	return backend.RemoveStack(ctx, s, force)
@@ -68,8 +80,8 @@ func (s *localStack) Rename(ctx context.Context, newName tokens.QName) (backend.
 
 func (s *localStack) Preview(
 	ctx context.Context,
-	op backend.UpdateOperation) (*deploy.Plan, display.ResourceChanges, result.Result) {
-
+	op backend.UpdateOperation,
+) (*deploy.Plan, display.ResourceChanges, result.Result) {
 	return backend.PreviewStack(ctx, s, op)
 }
 
@@ -78,7 +90,8 @@ func (s *localStack) Update(ctx context.Context, op backend.UpdateOperation) (di
 }
 
 func (s *localStack) Import(ctx context.Context, op backend.UpdateOperation,
-	imports []deploy.Import) (display.ResourceChanges, result.Result) {
+	imports []deploy.Import,
+) (display.ResourceChanges, result.Result) {
 	return backend.ImportStack(ctx, s, op, imports)
 }
 
@@ -94,9 +107,10 @@ func (s *localStack) Watch(ctx context.Context, op backend.UpdateOperation, path
 	return backend.WatchStack(ctx, s, op, paths)
 }
 
-func (s *localStack) GetLogs(ctx context.Context, cfg backend.StackConfiguration,
-	query operations.LogQuery) ([]operations.LogEntry, error) {
-	return backend.GetStackLogs(ctx, s, cfg, query)
+func (s *localStack) GetLogs(ctx context.Context, secretsProvider secrets.Provider, cfg backend.StackConfiguration,
+	query operations.LogQuery,
+) ([]operations.LogEntry, error) {
+	return backend.GetStackLogs(ctx, secretsProvider, s, cfg, query)
 }
 
 func (s *localStack) ExportDeployment(ctx context.Context) (*apitype.UntypedDeployment, error) {
@@ -107,8 +121,8 @@ func (s *localStack) ImportDeployment(ctx context.Context, deployment *apitype.U
 	return backend.ImportStackDeployment(ctx, s, deployment)
 }
 
-func (s *localStack) DefaultSecretManager(configFile string) (secrets.Manager, error) {
-	return NewPassphraseSecretsManager(s.Ref().Name(), configFile, false /* rotatePassphraseSecretsProvider */)
+func (s *localStack) DefaultSecretManager(info *workspace.ProjectStack) (secrets.Manager, error) {
+	return passphrase.NewPromptingPassphraseSecretsManager(info, false /* rotatePassphraseSecretsProvider */)
 }
 
 type localStackSummary struct {

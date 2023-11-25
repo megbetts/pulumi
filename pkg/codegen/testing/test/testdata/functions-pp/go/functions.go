@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"strings"
 
+	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws"
 	"github.com/pulumi/pulumi-aws/sdk/v5/go/aws/s3"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
@@ -18,6 +19,14 @@ func main() {
 			decoded,
 			"2",
 		}, "-")
+		_, err := aws.GetAvailabilityZones(ctx, nil, nil)
+		if err != nil {
+			return err
+		}
+		_, err = aws.GetAvailabilityZones(ctx, nil, nil)
+		if err != nil {
+			return err
+		}
 		bucket, err := s3.NewBucket(ctx, "bucket", nil)
 		if err != nil {
 			return err
@@ -29,6 +38,8 @@ func main() {
 			value, _ := base64.StdEncoding.DecodeString(id)
 			return pulumi.String(value), nil
 		}).(pulumi.StringOutput)
+		secretValue := pulumi.ToSecret("hello").(pulumi.StringOutput)
+		_ = pulumi.Unsecret(secretValue).(pulumi.StringOutput)
 		return nil
 	})
 }

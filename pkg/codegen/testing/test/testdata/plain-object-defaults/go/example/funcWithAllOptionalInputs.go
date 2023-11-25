@@ -8,10 +8,12 @@ import (
 	"reflect"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"plain-object-defaults/example/internal"
 )
 
 // Check codegen of functions with all optional inputs.
 func FuncWithAllOptionalInputs(ctx *pulumi.Context, args *FuncWithAllOptionalInputsArgs, opts ...pulumi.InvokeOption) (*FuncWithAllOptionalInputsResult, error) {
+	opts = internal.PkgInvokeDefaultOpts(opts)
 	var rv FuncWithAllOptionalInputsResult
 	err := ctx.Invoke("example::funcWithAllOptionalInputs", args.Defaults(), &rv, opts...)
 	if err != nil {
@@ -35,7 +37,7 @@ func (val *FuncWithAllOptionalInputsArgs) Defaults() *FuncWithAllOptionalInputsA
 	tmp := *val
 	tmp.A = tmp.A.Defaults()
 
-	if isZero(tmp.B) {
+	if tmp.B == nil {
 		b_ := "defValue"
 		tmp.B = &b_
 	}

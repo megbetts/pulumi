@@ -642,7 +642,7 @@
       "optimizeNodeModuleLoading": ["lazy-load-functions", "lazy-load-resources", "use-type-only-enums-references"],
       "devDependencies": {
         "@types/mocha": "latest",
-        "@types/node": "latest",
+        "@types/node": "ts4.3",
         "mocha": "latest",
         "ts-node": "latest"
       },
@@ -651,13 +651,12 @@
       ]
     },
     "go": {
-      "generateExtraInputTypes": true
+      "generateExtraInputTypes": true,
+      "importBasePath": "output-funcs/mypkg",
+      "generics": "side-by-side"
     },
     "python": {},
     "csharp": {
-      "projectReferences": [
-         "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-      ],
       "packageReferences": {
         "FluentAssertions": "5.10.2",
         "Microsoft.NET.Test.Sdk": "16.5.0",

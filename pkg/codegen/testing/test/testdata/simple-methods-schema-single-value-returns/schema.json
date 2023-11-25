@@ -37,19 +37,16 @@
   },
   "language": {
     "csharp": {
-      "projectReferences": [
-        "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-      ],
       "liftSingleValueMethodReturns": true
     },
     "go": {
-      "importBasePath": "github.com/pulumi/pulumi/pkg/v3/codegen/testing/test/testdata/simple-methods-schema/go/example",
+      "importBasePath": "simple-methods-schema-single-value-returns/example",
       "liftSingleValueMethodReturns": true,
       "generateExtraInputTypes": true
     },
     "nodejs": {
       "devDependencies": {
-        "@types/node": "latest"
+        "@types/node": "ts4.3"
       },
       "liftSingleValueMethodReturns": true
     },

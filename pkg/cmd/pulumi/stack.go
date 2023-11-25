@@ -15,8 +15,9 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"time"
 
@@ -26,7 +27,9 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/backend/httpstate"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 )
 
@@ -53,7 +56,7 @@ func newStackCmd() *cobra.Command {
 				Color: cmdutil.GetGlobalColorization(),
 			}
 
-			s, err := requireStack(ctx, stackName, true, opts, false /*setCurrent*/)
+			s, err := requireStack(ctx, stackName, stackOfferNew, opts)
 			if err != nil {
 				return err
 			}
@@ -63,7 +66,7 @@ func newStackCmd() *cobra.Command {
 				return nil
 			}
 
-			snap, err := s.Snapshot(ctx)
+			snap, err := s.Snapshot(ctx, stack.DefaultSecretsProvider)
 			if err != nil {
 				return err
 			}
@@ -131,16 +134,17 @@ func newStackCmd() *cobra.Command {
 					}
 				}
 
-				cmdutil.PrintTable(cmdutil.Table{
+				printTable(cmdutil.Table{
 					Headers: []string{"TYPE", "NAME"},
 					Rows:    rows,
 					Prefix:  "    ",
-				})
+				}, nil)
 
 				outputs, err := getStackOutputs(snap, showSecrets)
 				if err == nil {
 					fmt.Printf("\n")
-					printStackOutputs(outputs)
+					_ = fprintStackOutputs(os.Stdout, outputs)
+					// stdout error ignored
 				}
 
 				if showSecrets {
@@ -192,29 +196,33 @@ func newStackCmd() *cobra.Command {
 	return cmd
 }
 
-func printStackOutputs(outputs map[string]interface{}) {
-	fmt.Printf("Current stack outputs (%d):\n", len(outputs))
-	if len(outputs) == 0 {
-		fmt.Printf("    No output values currently in this stack\n")
-	} else {
-		var outKeys []string
-		for v := range outputs {
-			outKeys = append(outKeys, v)
-		}
-		sort.Strings(outKeys)
-
-		rows := []cmdutil.TableRow{}
-
-		for _, key := range outKeys {
-			rows = append(rows, cmdutil.TableRow{Columns: []string{key, stringifyOutput(outputs[key])}})
-		}
-
-		cmdutil.PrintTable(cmdutil.Table{
-			Headers: []string{"OUTPUT", "VALUE"},
-			Rows:    rows,
-			Prefix:  "    ",
-		})
+func fprintStackOutputs(w io.Writer, outputs map[string]interface{}) error {
+	_, err := fmt.Fprintf(w, "Current stack outputs (%d):\n", len(outputs))
+	if err != nil {
+		return err
 	}
+
+	if len(outputs) == 0 {
+		_, err = fmt.Fprintf(w, "    No output values currently in this stack\n")
+		return err
+	}
+
+	outKeys := slice.Prealloc[string](len(outputs))
+	for v := range outputs {
+		outKeys = append(outKeys, v)
+	}
+	sort.Strings(outKeys)
+
+	rows := []cmdutil.TableRow{}
+	for _, key := range outKeys {
+		rows = append(rows, cmdutil.TableRow{Columns: []string{key, stringifyOutput(outputs[key])}})
+	}
+
+	return cmdutil.FprintTable(w, cmdutil.Table{
+		Headers: []string{"OUTPUT", "VALUE"},
+		Rows:    rows,
+		Prefix:  "    ",
+	})
 }
 
 // stringifyOutput formats an output value for presentation to a user. We use JSON formatting, except in the case
@@ -225,12 +233,12 @@ func stringifyOutput(v interface{}) string {
 		return s
 	}
 
-	b, err := json.Marshal(v)
+	o, err := makeJSONString(v, false /* single line */)
 	if err != nil {
 		return "error: could not format value"
 	}
 
-	return string(b)
+	return o
 }
 
 type treeNode struct {
@@ -314,7 +322,7 @@ func renderTree(snap *deploy.Snapshot, showURNs, showIDs bool) ([]cmdutil.TableR
 }
 
 func renderResourceRow(res *resource.State, prefix, infoPrefix string, showURN, showID bool) cmdutil.TableRow {
-	columns := []string{prefix + string(res.Type), string(res.URN.Name())}
+	columns := []string{prefix + string(res.Type), res.URN.Name()}
 	additionalInfo := ""
 
 	// If the ID and/or URN is requested, show it on the following line.  It would be nice to do

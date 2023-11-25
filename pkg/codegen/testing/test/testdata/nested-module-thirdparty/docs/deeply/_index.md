@@ -13,13 +13,13 @@ no_edit_this_page: true
 
 <h2 id="modules">Modules</h2>
 <ul class="api">
-    <li><a href="nested/" title="nested"><span class="api-symbol api-symbol--module"></span>nested</a></li>
+    <li><a href="nested/" title="nested">nested</a></li>
 </ul>
 
 <h2 id="package-details">Package Details</h2>
 <dl class="package-details">
 	<dt>Repository</dt>
-	<dd><a href=""></a></dd>
+	<dd><a href="">foo-bar </a></dd>
 	<dt>License</dt>
 	<dd></dd>
 	<dt>Version</dt>

@@ -37,6 +37,9 @@ type ResourceOptions struct {
 	DependsOn model.Expression
 	// Whether or not the resource is protected.
 	Protect model.Expression
+	// Whether the resource should be left in the cloud provider
+	// when it's deleted from the Pulumi state.
+	RetainOnDelete model.Expression
 	// A list of properties that are not considered when diffing the resource.
 	IgnoreChanges model.Expression
 	// The version of the provider for this resource.
@@ -58,6 +61,10 @@ type Resource struct {
 
 	// The definition of the resource.
 	Definition *model.Block
+
+	// When set to true, allows traversing unknown properties through a resource. i.e. `resource.unknownProperty`
+	// will be valid and the type of the traversal is dynamic. This property is set to false by default
+	LenientTraversal bool
 
 	// Token is the type token for this resource.
 	Token string
@@ -95,7 +102,17 @@ func (r *Resource) VisitExpressions(pre, post model.ExpressionVisitor) hcl.Diagn
 }
 
 func (r *Resource) Traverse(traverser hcl.Traverser) (model.Traversable, hcl.Diagnostics) {
-	return r.VariableType.Traverse(traverser)
+	if r == nil || r.VariableType == nil {
+		return model.DynamicType.Traverse(traverser)
+	}
+
+	traversable, diags := r.VariableType.Traverse(traverser)
+
+	if diags.HasErrors() && r.LenientTraversal {
+		return model.DynamicType.Traverse(traverser)
+	}
+
+	return traversable, diags
 }
 
 // Deprecated: Name returns the variable or declaration name of the resource.

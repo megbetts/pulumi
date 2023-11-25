@@ -26,7 +26,10 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -98,7 +101,7 @@ func (p pluginSet) Deduplicate() pluginSet {
 
 // Values returns a slice of all of the plugins contained within this set.
 func (p pluginSet) Values() []workspace.PluginSpec {
-	var plugins []workspace.PluginSpec
+	plugins := slice.Prealloc[workspace.PluginSpec](len(p))
 	for _, value := range p {
 		plugins = append(plugins, value)
 	}
@@ -162,6 +165,10 @@ func gatherPluginsFromSnapshot(plugctx *plugin.Context, target *deploy.Target) (
 		if err != nil {
 			return set, err
 		}
+		checksums, err := providers.GetProviderChecksums(res.Inputs)
+		if err != nil {
+			return set, err
+		}
 		logging.V(preparePluginLog).Infof(
 			"gatherPluginsFromSnapshot(): plugin %s %s is required by first-class provider %q", pkg, version, urn)
 		set.Add(workspace.PluginSpec{
@@ -169,6 +176,7 @@ func gatherPluginsFromSnapshot(plugctx *plugin.Context, target *deploy.Target) (
 			Kind:              workspace.ResourcePlugin,
 			Version:           version,
 			PluginDownloadURL: downloadURL,
+			Checksums:         checksums,
 		})
 	}
 	return set, nil
@@ -177,19 +185,44 @@ func gatherPluginsFromSnapshot(plugctx *plugin.Context, target *deploy.Target) (
 // ensurePluginsAreInstalled inspects all plugins in the plugin set and, if any plugins are not currently installed,
 // uses the given backend client to install them. Installations are processed in parallel, though
 // ensurePluginsAreInstalled does not return until all installations are completed.
-func ensurePluginsAreInstalled(ctx context.Context, plugins pluginSet, projectPlugins []workspace.ProjectPlugin) error {
+func ensurePluginsAreInstalled(ctx context.Context, d diag.Sink,
+	plugins pluginSet, projectPlugins []workspace.ProjectPlugin,
+) error {
 	logging.V(preparePluginLog).Infof("ensurePluginsAreInstalled(): beginning")
 	var installTasks errgroup.Group
 	for _, plug := range plugins.Values() {
-		path, err := workspace.GetPluginPath(plug.Kind, plug.Name, plug.Version, projectPlugins)
+		if plug.Name == "pulumi" && plug.Kind == workspace.ResourcePlugin {
+			logging.V(preparePluginLog).Infof("ensurePluginsAreInstalled(): pulumi is a builtin plugin")
+			continue
+		}
+
+		path, err := workspace.GetPluginPath(d, plug.Kind, plug.Name, plug.Version, projectPlugins)
 		if err == nil && path != "" {
 			logging.V(preparePluginLog).Infof(
 				"ensurePluginsAreInstalled(): plugin %s %s already installed", plug.Name, plug.Version)
 			continue
 		}
 
-		// Launch an install task asynchronously and add it to the current error group.
+		if workspace.IsPluginBundled(plug.Kind, plug.Name) {
+			return fmt.Errorf(
+				"the %v %v plugin is bundled with Pulumi, and cannot be directly installed."+
+					" Reinstall Pulumi via your package manager or install script",
+				plug.Name,
+				plug.Kind,
+			)
+		}
+
 		info := plug // don't close over the loop induction variable
+
+		// If DISABLE_AUTOMATIC_PLUGIN_ACQUISITION is set just add an error to the error group and continue.
+		if env.DisableAutomaticPluginAcquisition.Value() {
+			installTasks.Go(func() error {
+				return fmt.Errorf("plugin %s %s not installed", info.Name, info.Version)
+			})
+			continue
+		}
+
+		// Launch an install task asynchronously and add it to the current error group.
 		installTasks.Go(func() error {
 			logging.V(preparePluginLog).Infof(
 				"ensurePluginsAreInstalled(): plugin %s %s not installed, doing install", info.Name, info.Version)
@@ -211,11 +244,6 @@ func ensurePluginsAreLoaded(plugctx *plugin.Context, plugins pluginSet, kinds pl
 // installPlugin installs a plugin from the given backend client.
 func installPlugin(ctx context.Context, plugin workspace.PluginSpec) error {
 	logging.V(preparePluginLog).Infof("installPlugin(%s, %s): beginning install", plugin.Name, plugin.Version)
-	if plugin.Kind == workspace.LanguagePlugin {
-		logging.V(preparePluginLog).Infof(
-			"installPlugin(%s, %s): is a language plugin, skipping install", plugin.Name, plugin.Version)
-		return nil
-	}
 
 	// If we don't have a version yet try and call GetLatestVersion to fill it in
 	if plugin.Version == nil {
@@ -244,6 +272,7 @@ func installPlugin(ctx context.Context, plugin workspace.PluginSpec) error {
 	if err != nil {
 		return fmt.Errorf("failed to download plugin: %s: %w", plugin, err)
 	}
+	defer func() { contract.IgnoreError(os.Remove(tarball.Name())) }()
 
 	fmt.Fprintf(os.Stderr, "[%s plugin %s-%s] installing\n", plugin.Kind, plugin.Name, plugin.Version)
 
@@ -252,7 +281,6 @@ func installPlugin(ctx context.Context, plugin workspace.PluginSpec) error {
 	if err := plugin.InstallWithContext(ctx, workspace.TarPlugin(tarball), false); err != nil {
 		return fmt.Errorf("installing plugin; run `pulumi plugin install %s %s v%s` to retry manually: %w",
 			plugin.Kind, plugin.Name, plugin.Version, err)
-
 	}
 
 	logging.V(7).Infof("installPlugin(%s, %s): installation complete", plugin.Name, plugin.Version)

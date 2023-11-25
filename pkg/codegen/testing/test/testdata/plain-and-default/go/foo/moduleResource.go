@@ -7,12 +7,16 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/pkg/errors"
+	"errors"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumix"
+	"plain-and-default/foo/internal"
 )
 
 type ModuleResource struct {
 	pulumi.CustomResourceState
+
+	Optional_bool pulumi.BoolPtrOutput `pulumi:"optional_bool"`
 }
 
 // NewModuleResource registers a new resource with the given unique name, arguments, and options.
@@ -22,55 +26,56 @@ func NewModuleResource(ctx *pulumi.Context,
 		return nil, errors.New("missing one or more required arguments")
 	}
 
-	if isZero(args.Optional_bool) {
+	if args.Optional_bool == nil {
 		args.Optional_bool = pulumi.BoolPtr(true)
 	}
 	args.Optional_const = pulumi.StringPtr("val")
-	if isZero(args.Optional_enum) {
+	if args.Optional_enum == nil {
 		args.Optional_enum = EnumThing(8)
 	}
-	if isZero(args.Optional_number) {
+	if args.Optional_number == nil {
 		args.Optional_number = pulumi.Float64Ptr(42.0)
 	}
-	if isZero(args.Optional_string) {
+	if args.Optional_string == nil {
 		args.Optional_string = pulumi.StringPtr("buzzer")
 	}
-	if isZero(args.Plain_optional_bool) {
+	if args.Plain_optional_bool == nil {
 		plain_optional_bool_ := true
 		args.Plain_optional_bool = &plain_optional_bool_
 	}
 	plain_optional_const_ := "val"
 	args.Plain_optional_const = &plain_optional_const_
-	if isZero(args.Plain_optional_number) {
+	if args.Plain_optional_number == nil {
 		plain_optional_number_ := 42.0
 		args.Plain_optional_number = &plain_optional_number_
 	}
-	if isZero(args.Plain_optional_string) {
+	if args.Plain_optional_string == nil {
 		plain_optional_string_ := "buzzer"
 		args.Plain_optional_string = &plain_optional_string_
 	}
-	if isZero(args.Plain_required_bool) {
+	if internal.IsZero(args.Plain_required_bool) {
 		args.Plain_required_bool = true
 	}
 	args.Plain_required_const = "val"
-	if isZero(args.Plain_required_number) {
+	if internal.IsZero(args.Plain_required_number) {
 		args.Plain_required_number = 42.0
 	}
-	if isZero(args.Plain_required_string) {
+	if internal.IsZero(args.Plain_required_string) {
 		args.Plain_required_string = "buzzer"
 	}
-	if isZero(args.Required_bool) {
+	if args.Required_bool == nil {
 		args.Required_bool = pulumi.Bool(true)
 	}
-	if isZero(args.Required_enum) {
+	if args.Required_enum == nil {
 		args.Required_enum = EnumThing(4)
 	}
-	if isZero(args.Required_number) {
+	if args.Required_number == nil {
 		args.Required_number = pulumi.Float64(42.0)
 	}
-	if isZero(args.Required_string) {
+	if args.Required_string == nil {
 		args.Required_string = pulumi.String("buzzer")
 	}
+	opts = internal.PkgResourceDefaultOpts(opts)
 	var resource ModuleResource
 	err := ctx.RegisterResource("foobar::ModuleResource", name, args, &resource, opts...)
 	if err != nil {
@@ -166,6 +171,12 @@ func (i *ModuleResource) ToModuleResourceOutputWithContext(ctx context.Context) 
 	return pulumi.ToOutputWithContext(ctx, i).(ModuleResourceOutput)
 }
 
+func (i *ModuleResource) ToOutput(ctx context.Context) pulumix.Output[*ModuleResource] {
+	return pulumix.Output[*ModuleResource]{
+		OutputState: i.ToModuleResourceOutputWithContext(ctx).OutputState,
+	}
+}
+
 type ModuleResourceOutput struct{ *pulumi.OutputState }
 
 func (ModuleResourceOutput) ElementType() reflect.Type {
@@ -178,6 +189,16 @@ func (o ModuleResourceOutput) ToModuleResourceOutput() ModuleResourceOutput {
 
 func (o ModuleResourceOutput) ToModuleResourceOutputWithContext(ctx context.Context) ModuleResourceOutput {
 	return o
+}
+
+func (o ModuleResourceOutput) ToOutput(ctx context.Context) pulumix.Output[*ModuleResource] {
+	return pulumix.Output[*ModuleResource]{
+		OutputState: o.OutputState,
+	}
+}
+
+func (o ModuleResourceOutput) Optional_bool() pulumi.BoolPtrOutput {
+	return o.ApplyT(func(v *ModuleResource) pulumi.BoolPtrOutput { return v.Optional_bool }).(pulumi.BoolPtrOutput)
 }
 
 func init() {

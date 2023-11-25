@@ -25,11 +25,11 @@ import (
 	surveycore "github.com/AlecAivazis/survey/v2/core"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
+	sdkDisplay "github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
-	sdkDisplay "github.com/pulumi/pulumi/sdk/v3/go/common/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
@@ -49,8 +49,8 @@ type Applier func(ctx context.Context, kind apitype.UpdateKind, stack Stack, op 
 
 func ActionLabel(kind apitype.UpdateKind, dryRun bool) string {
 	v := updateTextMap[kind]
-	contract.Assert(v.previewText != "")
-	contract.Assert(v.text != "")
+	contract.Assertf(v.previewText != "", "preview text for %q cannot be empty", kind)
+	contract.Assertf(v.text != "", "text for %q cannot be empty", kind)
 
 	if dryRun {
 		return "Previewing " + v.previewText
@@ -80,7 +80,8 @@ const (
 )
 
 func PreviewThenPrompt(ctx context.Context, kind apitype.UpdateKind, stack Stack,
-	op UpdateOperation, apply Applier) (*deploy.Plan, sdkDisplay.ResourceChanges, result.Result) {
+	op UpdateOperation, apply Applier,
+) (*deploy.Plan, sdkDisplay.ResourceChanges, result.Result) {
 	// create a channel to hear about the update events from the engine. this will be used so that
 	// we can build up the diff display in case the user asks to see the details of the diff
 
@@ -92,12 +93,16 @@ func PreviewThenPrompt(ctx context.Context, kind apitype.UpdateKind, stack Stack
 
 	var events []engine.Event
 	go func() {
-		// pull the events from the channel and store them locally
+		// Pull out relevant events we will want to display in the confirmation below.
 		for e := range eventsChannel {
+			// Don't include internal events in the confirmation stats.
+			if e.Internal() {
+				continue
+			}
 			if e.Type == engine.ResourcePreEvent ||
 				e.Type == engine.ResourceOutputsEvent ||
+				e.Type == engine.PolicyRemediationEvent ||
 				e.Type == engine.SummaryEvent {
-
 				events = append(events, e)
 			}
 		}
@@ -121,26 +126,51 @@ func PreviewThenPrompt(ctx context.Context, kind apitype.UpdateKind, stack Stack
 	// If there are no changes, or we're auto-approving or just previewing, we can skip the confirmation prompt.
 	if op.Opts.AutoApprove || kind == apitype.PreviewUpdate {
 		close(eventsChannel)
+		// If we're running in experimental mode then return the plan generated, else discard it. The user may
+		// be explicitly setting a plan but that's handled higher up the call stack.
+		if !op.Opts.Engine.Experimental {
+			plan = nil
+		}
 		return plan, changes, nil
 	}
+
+	stats := computeUpdateStats(events)
 
 	infoPrefix := "\b" + op.Opts.Display.Color.Colorize(colors.SpecWarning+"info: "+colors.Reset)
 	if kind != apitype.UpdateUpdate {
 		// If not an update, we can skip displaying warnings
-	} else if countResources(events) == 0 {
+	} else if stats.numNonStackResources == 0 {
 		// This is an update and there are no resources being CREATED
 		fmt.Print(infoPrefix, "There are no resources in your stack (other than the stack resource).\n\n")
 	}
 
+	// Warn user if an update is going to leave untracked resources in the environment.
+	switch kind {
+	case apitype.UpdateUpdate, apitype.PreviewUpdate, apitype.DestroyUpdate:
+		if len(stats.retainedResources) == 0 {
+			// No resources. Skip.
+			break
+		}
+		fmt.Printf(
+			"%sThis update will leave %d resource(s) untracked in your environment:\n",
+			infoPrefix, len(stats.retainedResources))
+		for _, res := range stats.retainedResources {
+			urn := res.URN
+			fmt.Printf("    - %s %s\n", urn.Type().DisplayName(), urn.Name())
+		}
+		fmt.Print("\n")
+	}
+
 	// Otherwise, ensure the user wants to proceed.
-	res = confirmBeforeUpdating(kind, stack, events, op.Opts)
+	plan, err := confirmBeforeUpdating(kind, stack, events, plan, op.Opts)
 	close(eventsChannel)
-	return plan, changes, res
+	return plan, changes, result.WrapIfNonNil(err)
 }
 
 // confirmBeforeUpdating asks the user whether to proceed. A nil error means yes.
 func confirmBeforeUpdating(kind apitype.UpdateKind, stack Stack,
-	events []engine.Event, opts UpdateOptions) result.Result {
+	events []engine.Event, plan *deploy.Plan, opts UpdateOptions,
+) (*deploy.Plan, error) {
 	for {
 		var response string
 
@@ -179,16 +209,19 @@ func confirmBeforeUpdating(kind apitype.UpdateKind, stack Stack,
 			Options: choices,
 			Default: string(no),
 		}, &response, surveyIcons); err != nil {
-			return result.FromError(fmt.Errorf("confirmation cancelled, not proceeding with the %s: %w", kind, err))
+			return nil, fmt.Errorf("confirmation cancelled, not proceeding with the %s: %w", kind, err)
 		}
 
 		if response == string(no) {
-			fmt.Printf("confirmation declined, not proceeding with the %s\n", kind)
-			return result.Bail()
+			return nil, result.FprintBailf(os.Stdout, "confirmation declined, not proceeding with the %s", kind)
 		}
 
 		if response == string(yes) {
-			return nil
+			// If we're in experimental mode always use the plan
+			if opts.Engine.Experimental {
+				return plan, nil
+			}
+			return nil, nil
 		}
 
 		if response == string(details) {
@@ -201,7 +234,8 @@ func confirmBeforeUpdating(kind apitype.UpdateKind, stack Stack,
 }
 
 func PreviewThenPromptThenExecute(ctx context.Context, kind apitype.UpdateKind, stack Stack,
-	op UpdateOperation, apply Applier) (sdkDisplay.ResourceChanges, result.Result) {
+	op UpdateOperation, apply Applier,
+) (sdkDisplay.ResourceChanges, result.Result) {
 	// Preview the operation to the user and ask them if they want to proceed.
 
 	if !op.Opts.SkipPreview {
@@ -219,11 +253,11 @@ func PreviewThenPromptThenExecute(ctx context.Context, kind apitype.UpdateKind, 
 			return changes, res
 		}
 
-		// If we had an original plan use it, else if experimental use the newly generated plan (might be nil if we've turned
-		// plan generation off)
+		// If we had an original plan use it, else if prompt said to use the plan from Preview then use the
+		// newly generated plan
 		if originalPlan != nil {
 			op.Opts.Engine.Plan = originalPlan
-		} else if op.Opts.Engine.Experimental {
+		} else if plan != nil {
 			op.Opts.Engine.Plan = plan
 		} else {
 			op.Opts.Engine.Plan = nil
@@ -243,8 +277,13 @@ func PreviewThenPromptThenExecute(ctx context.Context, kind apitype.UpdateKind, 
 	return changes, res
 }
 
-func countResources(events []engine.Event) int {
-	count := 0
+type updateStats struct {
+	numNonStackResources int
+	retainedResources    []engine.StepEventMetadata
+}
+
+func computeUpdateStats(events []engine.Event) updateStats {
+	var stats updateStats
 
 	for _, e := range events {
 		if e.Type != engine.ResourcePreEvent {
@@ -256,12 +295,19 @@ func countResources(events []engine.Event) int {
 			continue
 		}
 
-		if p.Metadata.Type.String() == "pulumi:pulumi:Stack" {
-			continue
+		if p.Metadata.Type.String() != "pulumi:pulumi:Stack" {
+			stats.numNonStackResources++
 		}
-		count++
+
+		// Track deleted resources that are retained.
+		switch p.Metadata.Op {
+		case deploy.OpDelete, deploy.OpReplace:
+			if old := p.Metadata.Old; old != nil && old.State != nil && old.State.RetainOnDelete {
+				stats.retainedResources = append(stats.retainedResources, p.Metadata)
+			}
+		}
 	}
-	return count
+	return stats
 }
 
 func createDiff(updateKind apitype.UpdateKind, events []engine.Event, displayOpts display.Options) string {
@@ -271,25 +317,50 @@ func createDiff(updateKind apitype.UpdateKind, events []engine.Event, displayOpt
 	displayOpts.SummaryDiff = true
 
 	outputEventsDiff := make([]string, 0)
+	remediationEventsDiff := make([]string, 0)
 	for _, e := range events {
 		if e.Type == engine.SummaryEvent {
 			continue
 		}
+
 		msg := display.RenderDiffEvent(e, seen, displayOpts)
 		if msg == "" {
 			continue
 		}
-		// display output events last
+
+		// Keep track of output and remediation events separately, since we print them after the
+		// ordinary resource diff information.
 		if e.Type == engine.ResourceOutputsEvent {
 			outputEventsDiff = append(outputEventsDiff, msg)
 			continue
+		} else if e.Type == engine.PolicyRemediationEvent {
+			remediationEventsDiff = append(remediationEventsDiff, msg)
+			continue
 		}
+
 		_, err := buff.WriteString(msg)
 		contract.IgnoreError(err)
 	}
-	for _, msg := range outputEventsDiff {
-		_, err := buff.WriteString(msg)
+
+	// Print resource outputs next.
+	if len(outputEventsDiff) > 0 {
+		_, err := buff.WriteString("\n")
 		contract.IgnoreError(err)
+		for _, msg := range outputEventsDiff {
+			_, err := buff.WriteString(msg)
+			contract.IgnoreError(err)
+		}
+	}
+
+	// Print policy remediations last.
+	if len(remediationEventsDiff) > 0 {
+		_, err := buff.WriteString(displayOpts.Color.Colorize(
+			fmt.Sprintf("\n%s  Policy Remediations:%s\n", colors.SpecHeadline, colors.Reset)))
+		contract.IgnoreError(err)
+		for _, msg := range remediationEventsDiff {
+			_, err := buff.WriteString(msg)
+			contract.IgnoreError(err)
+		}
 	}
 
 	return strings.TrimSpace(buff.String())

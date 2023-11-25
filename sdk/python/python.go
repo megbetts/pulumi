@@ -16,6 +16,7 @@ package python
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,7 +25,6 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
@@ -68,13 +68,12 @@ func CommandPath() (string /*pythonPath*/, string /*pythonCmd*/, error) {
 			pythonCmd, pythonPath, err = resolveWindowsExecutionAlias(pythonCmds)
 		}
 		if err != nil {
-			return "", "", errors.Errorf(
-				"Failed to locate any of %q on your PATH.  Have you installed Python 3.6 or greater?",
+			return "", "", fmt.Errorf(
+				"failed to locate any of %q on your PATH. Have you installed Python 3.6 or greater?",
 				pythonCmds)
 		}
 	}
 	return pythonPath, pythonCmd, nil
-
 }
 
 // Command returns an *exec.Cmd for running `python`. Uses `ComandPath`
@@ -129,7 +128,7 @@ func resolveWindowsExecutionAlias(pythonCmds []string) (string, string, error) {
 				path := filepath.Join(dir, pythonCmd+ext)
 				_, err := os.Lstat(path)
 				if err != nil && !os.IsNotExist(err) {
-					return "", "", errors.Wrap(err, "evaluating python execution alias")
+					return "", "", fmt.Errorf("evaluating python execution alias: %w", err)
 				}
 				if os.IsNotExist(err) {
 					continue
@@ -181,7 +180,7 @@ func NewVirtualEnvError(dir, fullPath string) error {
 		fmt.Sprintf("    2. %s -m pip install --upgrade pip setuptools wheel\n", venvPythonBin) +
 		fmt.Sprintf("    3. %s -m pip install -r requirements.txt\n", venvPythonBin)
 
-	return errors.Errorf("The 'virtualenv' option in Pulumi.yaml is set to %q, but %q %s; "+
+	return fmt.Errorf("The 'virtualenv' option in Pulumi.yaml is set to %q, but %q %s; "+
 		"run the following commands to create the virtual environment and install dependencies into it:\n\n%s\n\n"+
 		"For more information see: https://www.pulumi.com/docs/intro/languages/python/#virtual-environments",
 		dir, fullPath, message, commandsText)
@@ -197,7 +196,7 @@ func ActivateVirtualEnv(environ []string, virtualEnvDir string) []string {
 	var result []string
 	for _, env := range environ {
 		split := strings.SplitN(env, "=", 2)
-		contract.Assert(len(split) == 2)
+		contract.Assertf(len(split) == 2, "unexpected environment variable: %q", env)
 		key, value := split[0], split[1]
 
 		// Case-insensitive compare, as Windows will normally be "Path", not "PATH".
@@ -226,40 +225,54 @@ func InstallDependencies(ctx context.Context, root, venvDir string, showOutput b
 }
 
 func InstallDependenciesWithWriters(ctx context.Context,
-	root, venvDir string, showOutput bool, infoWriter, errorWriter io.Writer) error {
-	print := func(message string) {
+	root, venvDir string, showOutput bool, infoWriter, errorWriter io.Writer,
+) error {
+	printmsg := func(message string) {
 		if showOutput {
 			fmt.Fprintf(infoWriter, "%s\n", message)
 		}
 	}
 
-	print("Creating virtual environment...")
+	if venvDir != "" {
+		printmsg("Creating virtual environment...")
 
-	// Create the virtual environment by running `python -m venv <venvDir>`.
-	if !filepath.IsAbs(venvDir) {
-		venvDir = filepath.Join(root, venvDir)
-	}
-
-	cmd, err := Command(ctx, "-m", "venv", venvDir)
-	if err != nil {
-		return err
-	}
-	if output, err := cmd.CombinedOutput(); err != nil {
-		if len(output) > 0 {
-			fmt.Fprintf(errorWriter, "%s\n", string(output))
+		// Create the virtual environment by running `python -m venv <venvDir>`.
+		if !filepath.IsAbs(venvDir) {
+			venvDir = filepath.Join(root, venvDir)
 		}
-		return errors.Wrapf(err, "creating virtual environment at %s", venvDir)
-	}
 
-	print("Finished creating virtual environment")
+		cmd, err := Command(ctx, "-m", "venv", venvDir)
+		if err != nil {
+			return err
+		}
+		if output, err := cmd.CombinedOutput(); err != nil {
+			if len(output) > 0 {
+				fmt.Fprintf(errorWriter, "%s\n", string(output))
+			}
+			return fmt.Errorf("creating virtual environment at %s: %w", venvDir, err)
+		}
+
+		printmsg("Finished creating virtual environment")
+	}
 
 	runPipInstall := func(errorMsg string, arg ...string) error {
-		pipCmd := VirtualEnvCommand(venvDir, "python", append([]string{"-m", "pip", "install"}, arg...)...)
+		args := append([]string{"-m", "pip", "install"}, arg...)
+
+		var pipCmd *exec.Cmd
+		if venvDir == "" {
+			var err error
+			pipCmd, err = Command(ctx, args...)
+			if err != nil {
+				return err
+			}
+		} else {
+			pipCmd = VirtualEnvCommand(venvDir, "python", args...)
+		}
 		pipCmd.Dir = root
 		pipCmd.Env = ActivateVirtualEnv(os.Environ(), venvDir)
 
 		wrapError := func(err error) error {
-			return errors.Wrapf(err, "%s via '%s'", errorMsg, strings.Join(pipCmd.Args, " "))
+			return fmt.Errorf("%s via '%s': %w", errorMsg, strings.Join(pipCmd.Args, " "), err)
 		}
 
 		if showOutput {
@@ -281,14 +294,14 @@ func InstallDependenciesWithWriters(ctx context.Context,
 		return nil
 	}
 
-	print("Updating pip, setuptools, and wheel in virtual environment...")
+	printmsg("Updating pip, setuptools, and wheel in virtual environment...")
 
-	err = runPipInstall("updating pip, setuptools, and wheel", "--upgrade", "pip", "setuptools", "wheel")
+	err := runPipInstall("updating pip, setuptools, and wheel", "--upgrade", "pip", "setuptools", "wheel")
 	if err != nil {
 		return err
 	}
 
-	print("Finished updating")
+	printmsg("Finished updating")
 
 	// If `requirements.txt` doesn't exist, exit early.
 	requirementsPath := filepath.Join(root, "requirements.txt")
@@ -296,14 +309,14 @@ func InstallDependenciesWithWriters(ctx context.Context,
 		return nil
 	}
 
-	print("Installing dependencies in virtual environment...")
+	printmsg("Installing dependencies in virtual environment...")
 
 	err = runPipInstall("installing dependencies", "-r", "requirements.txt")
 	if err != nil {
 		return err
 	}
 
-	print("Finished installing dependencies")
+	printmsg("Finished installing dependencies")
 
 	return nil
 }

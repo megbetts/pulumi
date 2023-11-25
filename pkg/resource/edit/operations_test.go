@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ func NewResource(name string, provider *resource.State, deps ...resource.URN) *r
 	t := tokens.Type("a:b:c")
 	return &resource.State{
 		Type:         t,
-		URN:          resource.NewURN("test", "test", "", t, tokens.QName(name)),
+		URN:          resource.NewURN("test", "test", "", t, name),
 		Inputs:       resource.PropertyMap{},
 		Outputs:      resource.PropertyMap{},
 		Dependencies: deps,
@@ -55,7 +55,7 @@ func NewProviderResource(pkg, name, id string, deps ...resource.URN) *resource.S
 	t := providers.MakeProviderType(tokens.Package(pkg))
 	return &resource.State{
 		Type:         t,
-		URN:          resource.NewURN("test", "test", "", t, tokens.QName(name)),
+		URN:          resource.NewURN("test", "test", "", t, name),
 		ID:           resource.ID(id),
 		Inputs:       resource.PropertyMap{},
 		Outputs:      resource.PropertyMap{},
@@ -89,6 +89,72 @@ func TestDeletion(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, snap.Resources, 3)
 	assert.Equal(t, []*resource.State{pA, a, c}, snap.Resources)
+}
+
+func TestDeletingDuplicateURNs(t *testing.T) {
+	t.Parallel()
+
+	pA := NewProviderResource("a", "p1", "0")
+	a := NewResource("a", pA)
+
+	// Create duplicate resources.
+	b1 := NewResource("b", pA)
+	b2 := NewResource("b", pA)
+	b3 := NewResource("b", pA)
+
+	// ensure b1, b2, and b3 must have the same URN.
+	bURN := b1.URN
+	assert.Equal(t, bURN, b1.URN)
+	assert.Equal(t, bURN, b2.URN)
+	assert.Equal(t, bURN, b3.URN)
+
+	// c exists to check behavior on b's dependents.
+	c := NewResource("c", pA, bURN)
+
+	// This test ensures that when targeting dependent resources, deleting a
+	// resource with a redundant URN will not delete dependent resources in
+	// state as it's ambiguous since another URN can satisfy the dependency.
+	t.Run("do-target-dependents", func(t *testing.T) {
+		t.Parallel()
+		snap := NewSnapshot([]*resource.State{
+			pA, a, b1, b2, b3, c,
+		})
+
+		err := DeleteResource(snap, b1, nil, true /* targetDependents */)
+		require.NoError(t, err)
+
+		// assert.Equals does a deep equals with the expected list.
+		assert.Equal(t, []*resource.State{
+			pA, a, b2, b3, c,
+		}, snap.Resources)
+
+		// Ensure that a pointer to b1 is not in the list.
+		for _, s := range snap.Resources {
+			assert.False(t, s == b1)
+		}
+	})
+
+	// This test ensures that when targeting a resource with a redundant URN,
+	// dependency checks should not block the resource from being deleted from state.
+	t.Run("do-not-target-dependents", func(t *testing.T) {
+		t.Parallel()
+		snap := NewSnapshot([]*resource.State{
+			pA, a, b1, b2, b3, c,
+		})
+
+		err := DeleteResource(snap, b1, nil, false /* targetDependents */)
+		require.NoError(t, err)
+
+		// assert.Equals does a deep equals with the expected list.
+		assert.Equal(t, []*resource.State{
+			pA, a, b2, b3, c,
+		}, snap.Resources)
+
+		// Ensure that a pointer to b1 is not in the list.
+		for _, s := range snap.Resources {
+			assert.False(t, s == b1)
+		}
+	})
 }
 
 func TestDeletingDependencies(t *testing.T) {
@@ -222,7 +288,6 @@ func TestDeleteProtected(t *testing.T) {
 				// scheduled for deletion, so we don't call the onProtect handler.
 				assert.Equal(t, protectedCount, 2)
 				assert.Equal(t, snap.Resources, []*resource.State{pA, a})
-
 			},
 		},
 		{
@@ -427,7 +492,7 @@ func TestRenameStack(t *testing.T) {
 	// Rename just the stack.
 	//nolint:paralleltest // uses shared stack
 	t.Run("JustTheStack", func(t *testing.T) {
-		err := RenameStack(snap, tokens.Name("new-stack"), tokens.PackageName(""))
+		err := RenameStack(snap, tokens.MustParseStackName("new-stack"), tokens.PackageName(""))
 		if err != nil {
 			t.Fatalf("Error renaming stack: %v", err)
 		}
@@ -447,7 +512,7 @@ func TestRenameStack(t *testing.T) {
 	// Rename the stack and project.
 	//nolint:paralleltest // uses shared stack
 	t.Run("StackAndProject", func(t *testing.T) {
-		err := RenameStack(snap, tokens.Name("new-stack2"), tokens.PackageName("new-project"))
+		err := RenameStack(snap, tokens.MustParseStackName("new-stack2"), tokens.PackageName("new-project"))
 		if err != nil {
 			t.Fatalf("Error renaming stack: %v", err)
 		}

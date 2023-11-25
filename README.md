@@ -15,23 +15,22 @@
     <img src="https://www.pulumi.com/images/get-started.svg?" align="right" width="120">
 </a>
 
-**Pulumi's Infrastructure as Code SDK** is the easiest way to create and deploy cloud software that use
-containers, serverless functions, hosted services, and infrastructure, on any cloud.
+**Pulumi's Infrastructure as Code SDK** is the easiest way to build and deploy infrastructure, of any architecture and on any cloud, using programming languages that you already know and love. Code and ship infrastructure faster with your favorite languages and tools, and embed IaC anywhere with [Automation API](https://www.pulumi.com/docs/guides/automation-api/).
 
-Simply write code in your favorite language and Pulumi automatically provisions and manages your
+Simply write code in your favorite language and Pulumi automatically provisions and manages your resources on
 [AWS](https://www.pulumi.com/docs/reference/clouds/aws/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=aws-reference-link),
 [Azure](https://www.pulumi.com/docs/reference/clouds/azure/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=azure-reference-link),
-[Google Cloud Platform](https://www.pulumi.com/docs/reference/clouds/gcp/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=gcp-reference-link), and/or
-[Kubernetes](https://www.pulumi.com/docs/reference/clouds/kubernetes/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=kuberneters-reference-link) resources, using an
-[infrastructure-as-code](https://en.wikipedia.org/wiki/Infrastructure_as_Code) approach.
+[Google Cloud Platform](https://www.pulumi.com/docs/reference/clouds/gcp/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=gcp-reference-link), 
+[Kubernetes](https://www.pulumi.com/docs/reference/clouds/kubernetes/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=kuberneters-reference-link), and [120+ providers](https://www.pulumi.com/registry/?utm_campaign=pulumi-pulumi-github-repo&utm_source=github.com&utm_medium=providers-reference-link) using an
+[infrastructure-as-code](https://www.pulumi.com/what-is/what-is-infrastructure-as-code/) approach.
 Skip the YAML, and use standard language features like loops, functions, classes,
 and package management that you already know and love.
 
 For example, create three web servers:
 
 ```typescript
-let aws = require("@pulumi/aws");
-let sg = new aws.ec2.SecurityGroup("web-sg", {
+const aws = require("@pulumi/aws");
+const sg = new aws.ec2.SecurityGroup("web-sg", {
     ingress: [{ protocol: "tcp", fromPort: 80, toPort: 80, cidrBlocks: ["0.0.0.0/0"] }],
 });
 for (let i = 0; i < 3; i++) {
@@ -172,10 +171,10 @@ details of the core Pulumi CLI and [programming model concepts](https://www.pulu
 
 |    | Language | Status | Runtime |
 | -- | -------- | ------ | ------- |
-| <img src="https://www.pulumi.com/logos/tech/logo-js.png" height=38 />     | [JavaScript](https://www.pulumi.com/docs/intro/languages/javascript/) | Stable  | Node.js 14+  |
-| <img src="https://www.pulumi.com/logos/tech/logo-ts.png" height=38 />     | [TypeScript](https://www.pulumi.com/docs/intro/languages/javascript/) | Stable  | Node.js 14+  |
+| <img src="https://www.pulumi.com/logos/tech/logo-js.png" height=38 />     | [JavaScript](https://www.pulumi.com/docs/intro/languages/javascript/) | Stable  | Node.js 16+  |
+| <img src="https://www.pulumi.com/logos/tech/logo-ts.png" height=38 />     | [TypeScript](https://www.pulumi.com/docs/intro/languages/javascript/) | Stable  | Node.js 16+  |
 | <img src="https://www.pulumi.com/logos/tech/logo-python.svg" height=38 /> | [Python](https://www.pulumi.com/docs/intro/languages/python/)     | Stable  | Python 3.7+ |
-| <img src="https://www.pulumi.com/logos/tech/logo-golang.png" height=38 /> | [Go](https://www.pulumi.com/docs/intro/languages/go/)             | Stable  | Go 1.18+   |
+| <img src="https://www.pulumi.com/logos/tech/logo-golang.png" height=38 /> | [Go](https://www.pulumi.com/docs/intro/languages/go/)             | Stable  | Go [supported versions](https://go.dev/doc/devel/release#policy) |
 | <img src="https://www.pulumi.com/logos/tech/dotnet.svg" height=38 />      | [.NET (C#/F#/VB.NET)](https://www.pulumi.com/docs/intro/languages/dotnet/)     | Stable  | .NET Core 3.1+  |
 | <img src="https://www.pulumi.com/logos/tech/java.svg" height=38 />      | [Java](https://www.pulumi.com/docs/intro/languages/java/)     | Public Preview  | JDK 11+  |
 | <img src="https://www.pulumi.com/logos/tech/yaml.svg" height=38 />      | [YAML](https://www.pulumi.com/docs/intro/languages/yaml/)     | Public Preview  | n/a  |
@@ -184,9 +183,7 @@ details of the core Pulumi CLI and [programming model concepts](https://www.pulu
 
 The Pulumi CLI v1 and v2 are no longer supported. If you are not yet running v3, please consider migrating to v3 to continue getting the latest and greatest Pulumi has to offer! :muscle:
 
-* To migrate from v2 to v3, please see our [v3 Migration Guide](https://www.pulumi.com/docs/get-started/install/migrating-3.0/).
-
-* To migrate to v2 from v1, please see our [v2 Migration Guide](https://www.pulumi.com/docs/get-started/install/migrating-2.0/).
+* To migrate from v2 to v3, please see our [v3 Migration Guide](https://www.pulumi.com/docs/install/migrating-3.0/).
 
 ### Clouds
 

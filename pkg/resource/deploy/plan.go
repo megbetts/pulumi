@@ -8,9 +8,9 @@ import (
 
 	"github.com/mitchellh/copystructure"
 
+	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/v3/version"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/display"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
@@ -72,8 +72,8 @@ func (planDiff *PlanDiff) ContainsDelete(key resource.PropertyKey) bool {
 func (planDiff *PlanDiff) MakeError(
 	key resource.PropertyKey,
 	actualOperation string,
-	actualValue *resource.PropertyValue) string {
-
+	actualValue *resource.PropertyValue,
+) string {
 	// diff wants to do 'actualOperation' (one of '+', '~', '-', '=') but plan differs. This function looks up what
 	// key wanted to do to print a more useful error message
 
@@ -108,7 +108,7 @@ type GoalPlan struct {
 	// the type of resource.
 	Type tokens.Type
 	// the name for the resource's URN.
-	Name tokens.QName
+	Name string
 	// true if this resource is custom, managed by a plugin.
 	Custom bool
 	// the resource's checked input properties we expect to change.
@@ -169,7 +169,7 @@ func NewGoalPlan(inputDiff *resource.ObjectDiff, goal *resource.Goal) *GoalPlan 
 		return nil
 	}
 
-	var diff = NewPlanDiff(inputDiff)
+	diff := NewPlanDiff(inputDiff)
 
 	return &GoalPlan{
 		Type:                    goal.Type,
@@ -268,7 +268,6 @@ func (rp *ResourcePlan) diffStringSets(a, b []string) (message string, changed b
 }
 
 func (rp *ResourcePlan) diffAliases(a, b []resource.Alias) (message string, changed bool) {
-
 	setA := map[resource.Alias]struct{}{}
 	for _, s := range a {
 		setA[s] = struct{}{}
@@ -315,8 +314,8 @@ func (rp *ResourcePlan) diffAliases(a, b []resource.Alias) (message string, chan
 func checkMissingPlan(
 	oldState *resource.State,
 	newInputs resource.PropertyMap,
-	programGoal *resource.Goal) error {
-
+	programGoal *resource.Goal,
+) error {
 	// We new up a fake ResourcePlan that matches the old state and then simply call checkGoal on it.
 	goal := &GoalPlan{
 		Type:                    oldState.Type,
@@ -501,25 +500,25 @@ func (rp *ResourcePlan) checkOutputs(
 	oldOutputs resource.PropertyMap,
 	newOutputs resource.PropertyMap,
 ) error {
-	contract.Assert(rp.Goal != nil)
+	contract.Assertf(rp.Goal != nil, "resource plan goal must be set")
 
 	// Check that the property diffs meet the constraints set in the plan.
-	if err := checkDiff(oldOutputs, newOutputs, rp.Goal.OutputDiff); err != nil {
-		return err
-	}
-
-	return nil
+	return checkDiff(oldOutputs, newOutputs, rp.Goal.OutputDiff)
 }
 
 func (rp *ResourcePlan) checkGoal(
 	oldInputs resource.PropertyMap,
 	newInputs resource.PropertyMap,
-	programGoal *resource.Goal) error {
-
-	contract.Assert(programGoal != nil)
+	programGoal *resource.Goal,
+) error {
+	contract.Requiref(programGoal != nil, "programGoal", "must not be nil")
 	// rp.Goal may be nil, but if it isn't Type and Name should match
-	contract.Assert(rp.Goal == nil || rp.Goal.Type == programGoal.Type)
-	contract.Assert(rp.Goal == nil || rp.Goal.Name == programGoal.Name)
+	if rp.Goal != nil {
+		contract.Assertf(rp.Goal.Type == programGoal.Type,
+			"resource plan goal type (%v) does not match program goal type (%v)", rp.Goal.Type, programGoal.Type)
+		contract.Assertf(rp.Goal.Name == programGoal.Name,
+			"resource plan goal name (%v) does not match program goal name (%v)", rp.Goal.Type, programGoal.Name)
+	}
 
 	if rp.Goal == nil {
 		// If the plan goal is nil it expected a delete

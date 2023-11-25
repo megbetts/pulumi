@@ -25,7 +25,9 @@ import (
 	multierror "github.com/hashicorp/go-multierror"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/constant"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 
 	"google.golang.org/grpc"
 )
@@ -42,7 +44,7 @@ func Run(body RunFunc, opts ...RunOption) {
 	logError := func(ctx *Context, programErr error) {
 		logErr := ctx.Log.Error(fmt.Sprintf("an unhandled error occurred: program failed: \n%v",
 			programErr), nil)
-		contract.AssertNoError(logErr)
+		contract.IgnoreError(logErr)
 	}
 
 	err := runErrInner(body, logError, opts...)
@@ -140,18 +142,23 @@ type RunFunc func(ctx *Context) error
 
 // RunInfo contains all the metadata about a run request.
 type RunInfo struct {
-	Project          string
-	Stack            string
-	Config           map[string]string
-	ConfigSecretKeys []string
-	Parallel         int
-	DryRun           bool
-	MonitorAddr      string
-	EngineAddr       string
-	Organization     string
-	Mocks            MockResourceMonitor
-	getPlugins       bool
-	engineConn       *grpc.ClientConn // Pre-existing engine connection. If set this is used over EngineAddr.
+	Project           string
+	Stack             string
+	Config            map[string]string
+	ConfigSecretKeys  []string
+	ConfigPropertyMap resource.PropertyMap
+	Parallel          int
+	DryRun            bool
+	MonitorAddr       string
+	EngineAddr        string
+	Organization      string
+	Mocks             MockResourceMonitor
+
+	getPlugins bool
+	engineConn *grpc.ClientConn // Pre-existing engine connection. If set this is used over EngineAddr.
+
+	// If non-nil, wraps the resource monitor client used by Context.
+	wrapResourceMonitorClient func(pulumirpc.ResourceMonitorClient) pulumirpc.ResourceMonitorClient
 }
 
 // getEnvInfo reads various program information from the process environment.
@@ -195,7 +202,7 @@ const (
 	// EnvConfig is the envvar used to read the current Pulumi configuration variables.
 	EnvConfig = "PULUMI_CONFIG"
 	// EnvConfigSecretKeys is the envvar used to read the current Pulumi configuration keys that are secrets.
-	//nolint: gosec
+	//nolint:gosec
 	EnvConfigSecretKeys = "PULUMI_CONFIG_SECRET_KEYS"
 	// EnvParallel is the envvar used to read the current Pulumi degree of parallelism.
 	EnvParallel = "PULUMI_PARALLEL"

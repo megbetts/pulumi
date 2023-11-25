@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 
@@ -29,6 +28,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
@@ -43,14 +43,15 @@ const (
 )
 
 // intentionally disabling here for cleaner err declaration/assignment.
-// nolint: vetshadow
+//
+//nolint:vetshadow
 func newUpCmd() *cobra.Command {
 	var debug bool
 	var expectNop bool
 	var message string
 	var execKind string
 	var execAgent string
-	var stack string
+	var stackName string
 	var configArray []string
 	var path bool
 	var client string
@@ -67,6 +68,7 @@ func newUpCmd() *cobra.Command {
 	var parallel int
 	var refresh string
 	var showConfig bool
+	var showPolicyRemediations bool
 	var showReplacementSteps bool
 	var showSames bool
 	var showReads bool
@@ -83,8 +85,8 @@ func newUpCmd() *cobra.Command {
 	var planFilePath string
 
 	// up implementation used when the source of the Pulumi program is in the current working directory.
-	upWorkingDirectory := func(ctx context.Context, opts backend.UpdateOptions) result.Result {
-		s, err := requireStack(ctx, stack, true, opts.Display, false /*setCurrent*/)
+	upWorkingDirectory := func(ctx context.Context, opts backend.UpdateOptions, cmd *cobra.Command) result.Result {
+		s, err := requireStack(ctx, stackName, stackOfferNew, opts.Display)
 		if err != nil {
 			return result.FromError(err)
 		}
@@ -99,17 +101,12 @@ func newUpCmd() *cobra.Command {
 			return result.FromError(err)
 		}
 
-		m, err := getUpdateMetadata(message, root, execKind, execAgent, planFilePath != "")
+		m, err := getUpdateMetadata(message, root, execKind, execAgent, planFilePath != "", cmd.Flags())
 		if err != nil {
 			return result.FromError(fmt.Errorf("gathering environment metadata: %w", err))
 		}
 
-		sm, err := getStackSecretsManager(s)
-		if err != nil {
-			return result.FromError(fmt.Errorf("getting secrets manager: %w", err))
-		}
-
-		cfg, err := getStackConfiguration(ctx, s, proj, sm)
+		cfg, sm, err := getStackConfiguration(ctx, s, proj, nil)
 		if err != nil {
 			return result.FromError(fmt.Errorf("getting stack configuration: %w", err))
 		}
@@ -118,22 +115,26 @@ func newUpCmd() *cobra.Command {
 		if err != nil {
 			return result.FromError(fmt.Errorf("getting stack decrypter: %w", err))
 		}
+		encrypter, err := sm.Encrypter()
+		if err != nil {
+			return result.FromError(fmt.Errorf("getting stack encrypter: %w", err))
+		}
 
 		stackName := s.Ref().Name().String()
-		configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+		configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
+			stackName,
+			proj,
+			cfg.Environment,
+			cfg.Config,
+			encrypter,
+			decrypter)
 		if configErr != nil {
 			return result.FromError(fmt.Errorf("validating stack config: %w", configErr))
 		}
 
 		targetURNs, replaceURNs := []string{}, []string{}
-
-		for _, t := range targets {
-			targetURNs = append(targetURNs, t)
-		}
-
-		for _, r := range replaces {
-			replaceURNs = append(replaceURNs, r)
-		}
+		targetURNs = append(targetURNs, targets...)
+		replaceURNs = append(replaceURNs, replaces...)
 
 		for _, tr := range targetReplaces {
 			targetURNs = append(targetURNs, tr)
@@ -149,13 +150,12 @@ func newUpCmd() *cobra.Command {
 			Parallel:                  parallel,
 			Debug:                     debug,
 			Refresh:                   refreshOption,
-			RefreshTargets:            deploy.NewUrnTargets(targetURNs),
 			ReplaceTargets:            deploy.NewUrnTargets(replaceURNs),
 			UseLegacyDiff:             useLegacyDiff(),
 			DisableProviderPreview:    disableProviderPreview(),
 			DisableResourceReferences: disableResourceReferences(),
 			DisableOutputValues:       disableOutputValues(),
-			UpdateTargets:             deploy.NewUrnTargets(targetURNs),
+			Targets:                   deploy.NewUrnTargets(targetURNs),
 			TargetDependents:          targetDependents,
 			// Trigger a plan to be generated during the preview phase which can be constrained to during the
 			// update phase.
@@ -186,7 +186,8 @@ func newUpCmd() *cobra.Command {
 			Opts:               opts,
 			StackConfiguration: cfg,
 			SecretsManager:     sm,
-			Scopes:             cancellationScopes,
+			SecretsProvider:    stack.DefaultSecretsProvider,
+			Scopes:             backend.CancellationScopes,
 		})
 		switch {
 		case res != nil && res.Error() == context.Canceled:
@@ -202,7 +203,8 @@ func newUpCmd() *cobra.Command {
 
 	// up implementation used when the source of the Pulumi program is a template name or a URL to a template.
 	upTemplateNameOrURL := func(ctx context.Context,
-		templateNameOrURL string, opts backend.UpdateOptions) result.Result {
+		templateNameOrURL string, opts backend.UpdateOptions, cmd *cobra.Command,
+	) result.Result {
 		// Retrieve the template repo.
 		repo, err := workspace.RetrieveTemplates(templateNameOrURL, false, workspace.TemplateKindPulumiProject)
 		if err != nil {
@@ -235,7 +237,7 @@ func newUpCmd() *cobra.Command {
 		}
 
 		// Create temp directory for the "virtual workspace".
-		temp, err := ioutil.TempDir("", "pulumi-up-")
+		temp, err := os.MkdirTemp("", "pulumi-up-")
 		if err != nil {
 			return result.FromError(err)
 		}
@@ -248,21 +250,27 @@ func newUpCmd() *cobra.Command {
 			return result.FromError(fmt.Errorf("changing the working directory: %w", err))
 		}
 
+		// There is no current project at this point to pass into currentBackend
+		b, err := currentBackend(ctx, nil, opts.Display)
+		if err != nil {
+			return result.FromError(err)
+		}
+
 		// If a stack was specified via --stack, see if it already exists.
 		var name string
 		var description string
 		var s backend.Stack
-		if stack != "" {
-			if s, name, description, err = getStack(ctx, stack, opts.Display); err != nil {
+		if stackName != "" {
+			if s, name, description, err = getStack(ctx, b, stackName, opts.Display); err != nil {
 				return result.FromError(err)
 			}
 		}
 
 		// Prompt for the project name, if we don't already have one from an existing stack.
 		if name == "" {
-			defaultValue := workspace.ValueOrSanitizedDefaultProjectName(name, template.ProjectName, template.Name)
+			defaultValue := pkgWorkspace.ValueOrSanitizedDefaultProjectName(name, template.ProjectName, template.Name)
 			name, err = promptForValue(
-				yes, "project name", defaultValue, false, workspace.ValidateProjectName, opts.Display)
+				yes, "project name", defaultValue, false, pkgWorkspace.ValidateProjectName, opts.Display)
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -270,10 +278,10 @@ func newUpCmd() *cobra.Command {
 
 		// Prompt for the project description, if we don't already have one from an existing stack.
 		if description == "" {
-			defaultValue := workspace.ValueOrDefaultProjectDescription(
+			defaultValue := pkgWorkspace.ValueOrDefaultProjectDescription(
 				description, template.ProjectDescription, template.Description)
 			description, err = promptForValue(
-				yes, "project description", defaultValue, false, workspace.ValidateProjectDescription, opts.Display)
+				yes, "project description", defaultValue, false, pkgWorkspace.ValidateProjectDescription, opts.Display)
 			if err != nil {
 				return result.FromError(err)
 			}
@@ -298,7 +306,7 @@ func newUpCmd() *cobra.Command {
 
 		// Create the stack, if needed.
 		if s == nil {
-			if s, err = promptAndCreateStack(ctx, promptForValue, stack, name, false /*setCurrent*/, yes,
+			if s, err = promptAndCreateStack(ctx, b, promptForValue, stackName, root, false /*setCurrent*/, yes,
 				opts.Display, secretsProvider); err != nil {
 				return result.FromError(err)
 			}
@@ -306,14 +314,17 @@ func newUpCmd() *cobra.Command {
 		}
 
 		// Prompt for config values (if needed) and save.
-		if err = handleConfig(ctx, s, templateNameOrURL, template, configArray, yes, path, opts.Display); err != nil {
+		if err = handleConfig(
+			ctx, promptForValue, proj, s,
+			templateNameOrURL, template, configArray,
+			yes, path, opts.Display); err != nil {
 			return result.FromError(err)
 		}
 
 		// Install dependencies.
 
 		projinfo := &engine.Projinfo{Proj: proj, Root: root}
-		pwd, _, pctx, err := engine.ProjectInfoContext(projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil)
+		pwd, _, pctx, err := engine.ProjectInfoContext(projinfo, nil, cmdutil.Diag(), cmdutil.Diag(), false, nil, nil)
 		if err != nil {
 			return result.FromError(fmt.Errorf("building project context: %w", err))
 		}
@@ -324,17 +335,12 @@ func newUpCmd() *cobra.Command {
 			return result.FromError(err)
 		}
 
-		m, err := getUpdateMetadata(message, root, execKind, execAgent, planFilePath != "")
+		m, err := getUpdateMetadata(message, root, execKind, execAgent, planFilePath != "", cmd.Flags())
 		if err != nil {
 			return result.FromError(fmt.Errorf("gathering environment metadata: %w", err))
 		}
 
-		sm, err := getStackSecretsManager(s)
-		if err != nil {
-			return result.FromError(fmt.Errorf("getting secrets manager: %w", err))
-		}
-
-		cfg, err := getStackConfiguration(ctx, s, proj, sm)
+		cfg, sm, err := getStackConfiguration(ctx, s, proj, nil)
 		if err != nil {
 			return result.FromError(fmt.Errorf("getting stack configuration: %w", err))
 		}
@@ -343,9 +349,18 @@ func newUpCmd() *cobra.Command {
 		if err != nil {
 			return result.FromError(fmt.Errorf("getting stack decrypter: %w", err))
 		}
+		encrypter, err := sm.Encrypter()
+		if err != nil {
+			return result.FromError(fmt.Errorf("getting stack encrypter: %w", err))
+		}
 
 		stackName := s.Ref().String()
-		configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName, proj, cfg.Config, decrypter)
+		configErr := workspace.ValidateStackConfigAndApplyProjectConfig(stackName,
+			proj,
+			cfg.Environment,
+			cfg.Config,
+			encrypter,
+			decrypter)
 		if configErr != nil {
 			return result.FromError(fmt.Errorf("validating stack config: %w", configErr))
 		}
@@ -378,7 +393,8 @@ func newUpCmd() *cobra.Command {
 			Opts:               opts,
 			StackConfiguration: cfg,
 			SecretsManager:     sm,
-			Scopes:             cancellationScopes,
+			SecretsProvider:    stack.DefaultSecretsProvider,
+			Scopes:             backend.CancellationScopes,
 		})
 		switch {
 		case res != nil && res.Error() == context.Canceled:
@@ -392,7 +408,7 @@ func newUpCmd() *cobra.Command {
 		}
 	}
 
-	var cmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:        "up [template|url]",
 		Aliases:    []string{"update"},
 		SuggestFor: []string{"apply", "deploy", "push"},
@@ -434,24 +450,25 @@ func newUpCmd() *cobra.Command {
 				return result.FromError(err)
 			}
 
-			var displayType = display.DisplayProgress
+			displayType := display.DisplayProgress
 			if diffDisplay {
 				displayType = display.DisplayDiff
 			}
 
 			opts.Display = display.Options{
-				Color:                cmdutil.GetGlobalColorization(),
-				ShowConfig:           showConfig,
-				ShowReplacementSteps: showReplacementSteps,
-				ShowSameResources:    showSames,
-				ShowReads:            showReads,
-				SuppressOutputs:      suppressOutputs,
-				TruncateOutput:       !showFullOutput,
-				IsInteractive:        interactive,
-				Type:                 displayType,
-				EventLogPath:         eventLogPath,
-				Debug:                debug,
-				JSONDisplay:          jsonDisplay,
+				Color:                  cmdutil.GetGlobalColorization(),
+				ShowConfig:             showConfig,
+				ShowPolicyRemediations: showPolicyRemediations,
+				ShowReplacementSteps:   showReplacementSteps,
+				ShowSameResources:      showSames,
+				ShowReads:              showReads,
+				SuppressOutputs:        suppressOutputs,
+				TruncateOutput:         !showFullOutput,
+				IsInteractive:          interactive,
+				Type:                   displayType,
+				EventLogPath:           eventLogPath,
+				Debug:                  debug,
+				JSONDisplay:            jsonDisplay,
 			}
 
 			// we only suppress permalinks if the user passes true. the default is an empty string
@@ -468,14 +485,14 @@ func newUpCmd() *cobra.Command {
 				}
 
 				err = validateUnsupportedRemoteFlags(expectNop, configArray, path, client, jsonDisplay, policyPackPaths,
-					policyPackConfigPaths, refresh, showConfig, showReplacementSteps, showSames, showReads,
-					suppressOutputs, secretsProvider, &targets, replaces, targetReplaces,
+					policyPackConfigPaths, refresh, showConfig, showPolicyRemediations, showReplacementSteps, showSames,
+					showReads, suppressOutputs, secretsProvider, &targets, replaces, targetReplaces,
 					targetDependents, planFilePath, stackConfigFile)
 				if err != nil {
 					return result.FromError(err)
 				}
 
-				return runDeployment(ctx, opts.Display, apitype.Update, stack, args[0], remoteArgs)
+				return runDeployment(ctx, opts.Display, apitype.Update, stackName, args[0], remoteArgs)
 			}
 
 			filestateBackend, err := isFilestateBackend(opts.Display)
@@ -490,10 +507,10 @@ func newUpCmd() *cobra.Command {
 			}
 
 			if len(args) > 0 {
-				return upTemplateNameOrURL(ctx, args[0], opts)
+				return upTemplateNameOrURL(ctx, args[0], opts, cmd)
 			}
 
-			return upWorkingDirectory(ctx, opts)
+			return upWorkingDirectory(ctx, opts, cmd)
 		}),
 	}
 
@@ -504,7 +521,7 @@ func newUpCmd() *cobra.Command {
 		&expectNop, "expect-no-changes", false,
 		"Return an error if any changes occur during this update")
 	cmd.PersistentFlags().StringVarP(
-		&stack, "stack", "s", "",
+		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
 	cmd.PersistentFlags().StringVar(
 		&stackConfigFile, "config-file", "",
@@ -569,6 +586,9 @@ func newUpCmd() *cobra.Command {
 		&showConfig, "show-config", false,
 		"Show configuration keys and variables")
 	cmd.PersistentFlags().BoolVar(
+		&showPolicyRemediations, "show-policy-remediations", false,
+		"Show per-resource policy remediation details instead of a summary")
+	cmd.PersistentFlags().BoolVar(
 		&showReplacementSteps, "show-replacement-steps", false,
 		"Show detailed resource replacement creates and deletes instead of a single step")
 
@@ -602,7 +622,7 @@ func newUpCmd() *cobra.Command {
 			"perform operations that exceed its plan (e.g. replacements instead of updates, or updates instead"+
 			"of sames).")
 	if !hasExperimentalCommands() {
-		contract.AssertNoError(cmd.PersistentFlags().MarkHidden("plan"))
+		contract.AssertNoErrorf(cmd.PersistentFlags().MarkHidden("plan"), `Could not mark "plan" as hidden`)
 	}
 
 	// Remote flags
@@ -645,14 +665,16 @@ func validatePolicyPackConfig(policyPackPaths []string, policyPackConfigPaths []
 // handleConfig handles prompting for config values (as needed) and saving config.
 func handleConfig(
 	ctx context.Context,
+	prompt promptForValueFunc,
+	project *workspace.Project,
 	s backend.Stack,
 	templateNameOrURL string,
 	template workspace.Template,
 	configArray []string,
 	yes bool,
 	path bool,
-	opts display.Options) error {
-
+	opts display.Options,
+) error {
 	// Get the existing config. stackConfig will be nil if there wasn't a previous deployment.
 	stackConfig, err := backend.GetLatestConfiguration(ctx, s)
 	if err != nil && err != backend.ErrNoPreviousDeployment {
@@ -660,7 +682,7 @@ func handleConfig(
 	}
 
 	// Get the existing snapshot.
-	snap, err := s.Snapshot(ctx)
+	snap, err := s.Snapshot(ctx, stack.DefaultSecretsProvider)
 	if err != nil {
 		return err
 	}
@@ -683,7 +705,7 @@ func handleConfig(
 		}
 
 		// Prompt for config as needed.
-		c, err = promptForConfig(ctx, s, template.Config, commandLineConfig, stackConfig, yes, opts)
+		c, err = promptForConfig(ctx, prompt, project, s, template.Config, commandLineConfig, stackConfig, yes, opts)
 		if err != nil {
 			return err
 		}
@@ -702,9 +724,7 @@ func handleConfig(
 	return nil
 }
 
-var (
-	templateKey = config.MustMakeKey("pulumi", "template")
-)
+var templateKey = config.MustMakeKey("pulumi", "template")
 
 // isPreconfiguredEmptyStack returns true if the url matches the value of `pulumi:template` in stackConfig,
 // the stackConfig values satisfy the config requirements of templateConfig, and the snapshot is empty.
@@ -714,8 +734,8 @@ func isPreconfiguredEmptyStack(
 	url string,
 	templateConfig map[string]workspace.ProjectTemplateConfigValue,
 	stackConfig config.Map,
-	snap *deploy.Snapshot) bool {
-
+	snap *deploy.Snapshot,
+) bool {
 	// Does stackConfig have a `pulumi:template` value and does it match url?
 	if stackConfig == nil {
 		return false

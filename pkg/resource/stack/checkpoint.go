@@ -79,9 +79,32 @@ func UnmarshalVersionedCheckpointToLatestCheckpoint(m encoding.Marshaler, bytes 
 	}
 }
 
+func MarshalUntypedDeploymentToVersionedCheckpoint(
+	stack tokens.QName, deployment *apitype.UntypedDeployment,
+) (*apitype.VersionedCheckpoint, error) {
+	chk := struct {
+		Stack  tokens.QName
+		Latest json.RawMessage
+	}{
+		Stack:  stack,
+		Latest: deployment.Deployment,
+	}
+
+	bytes, err := encoding.JSON.Marshal(chk)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling checkpoint: %w", err)
+	}
+
+	return &apitype.VersionedCheckpoint{
+		Version:    deployment.Version,
+		Checkpoint: bytes,
+	}, nil
+}
+
 // SerializeCheckpoint turns a snapshot into a data structure suitable for serialization.
-func SerializeCheckpoint(stack tokens.Name, snap *deploy.Snapshot,
-	sm secrets.Manager, showSecrets bool) (*apitype.VersionedCheckpoint, error) {
+func SerializeCheckpoint(stack tokens.QName, snap *deploy.Snapshot,
+	sm secrets.Manager, showSecrets bool,
+) (*apitype.VersionedCheckpoint, error) {
 	// If snap is nil, that's okay, we will just create an empty deployment; otherwise, serialize the whole snapshot.
 	var latest *apitype.DeploymentV3
 	if snap != nil {
@@ -93,7 +116,7 @@ func SerializeCheckpoint(stack tokens.Name, snap *deploy.Snapshot,
 	}
 
 	b, err := encoding.JSON.Marshal(apitype.CheckpointV3{
-		Stack:  stack.Q(),
+		Stack:  stack,
 		Latest: latest,
 	})
 	if err != nil {
@@ -110,10 +133,12 @@ func SerializeCheckpoint(stack tokens.Name, snap *deploy.Snapshot,
 // if there have been no deployments performed on this checkpoint.
 func DeserializeCheckpoint(
 	ctx context.Context,
-	chkpoint *apitype.CheckpointV3) (*deploy.Snapshot, error) {
-	contract.Require(chkpoint != nil, "chkpoint")
+	secretsProvider secrets.Provider,
+	chkpoint *apitype.CheckpointV3,
+) (*deploy.Snapshot, error) {
+	contract.Requiref(chkpoint != nil, "chkpoint", "must not be nil")
 	if chkpoint.Latest != nil {
-		return DeserializeDeploymentV3(ctx, *chkpoint.Latest, DefaultSecretsProvider)
+		return DeserializeDeploymentV3(ctx, *chkpoint.Latest, secretsProvider)
 	}
 
 	return nil, nil

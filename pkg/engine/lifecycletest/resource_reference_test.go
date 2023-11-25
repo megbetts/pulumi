@@ -1,4 +1,3 @@
-//nolint:goconst
 package lifecycletest
 
 import (
@@ -7,7 +6,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/stretchr/testify/assert"
 
-	. "github.com/pulumi/pulumi/pkg/v3/engine"
+	. "github.com/pulumi/pulumi/pkg/v3/engine" //nolint:revive
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/deploytest"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
@@ -26,8 +25,8 @@ func TestResourceReferences(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			v := &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap,
-					timeout float64, preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					timeout float64, preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					id := "created-id"
 					if preview {
 						id = ""
@@ -43,7 +42,8 @@ func TestResourceReferences(t *testing.T) {
 					return resource.ID(id), news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}
@@ -51,7 +51,7 @@ func TestResourceReferences(t *testing.T) {
 		}),
 	}
 
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		var err error
 		urnA, _, _, err = monitor.RegisterResource("component", "resA", false)
 		assert.NoError(t, err)
@@ -76,10 +76,10 @@ func TestResourceReferences(t *testing.T) {
 		}))
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps:   MakeBasicLifecycleSteps(t, 4),
 	}
 	p.Run(t, nil)
@@ -98,8 +98,8 @@ func TestResourceReferences_DownlevelSDK(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			v := &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap,
-					timeout float64, preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					timeout float64, preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					id := "created-id"
 					if preview {
 						id = ""
@@ -116,7 +116,8 @@ func TestResourceReferences_DownlevelSDK(t *testing.T) {
 					return resource.ID(id), state, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}
@@ -125,7 +126,7 @@ func TestResourceReferences_DownlevelSDK(t *testing.T) {
 	}
 
 	opts := deploytest.ResourceOptions{DisableResourceReferences: true}
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		var err error
 		urnA, _, _, err = monitor.RegisterResource("component", "resA", false, opts)
 		assert.NoError(t, err)
@@ -147,10 +148,10 @@ func TestResourceReferences_DownlevelSDK(t *testing.T) {
 		}
 		return nil
 	})
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host},
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps:   MakeBasicLifecycleSteps(t, 4),
 	}
 	p.Run(t, nil)
@@ -168,8 +169,8 @@ func TestResourceReferences_DownlevelEngine(t *testing.T) {
 		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
 			v := &deploytest.Provider{
 				CreateF: func(urn resource.URN, news resource.PropertyMap,
-					timeout float64, preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-
+					timeout float64, preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
 					id := "created-id"
 					if preview {
 						id = ""
@@ -184,7 +185,8 @@ func TestResourceReferences_DownlevelEngine(t *testing.T) {
 					return resource.ID(id), news, resource.StatusOK, nil
 				},
 				ReadF: func(urn resource.URN, id resource.ID,
-					inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
 					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
 				},
 			}
@@ -192,7 +194,7 @@ func TestResourceReferences_DownlevelEngine(t *testing.T) {
 		}),
 	}
 
-	program := deploytest.NewLanguageRuntime(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		var err error
 		urnA, _, _, err = monitor.RegisterResource("component", "resA", false)
 		assert.NoError(t, err)
@@ -221,10 +223,74 @@ func TestResourceReferences_DownlevelEngine(t *testing.T) {
 		return nil
 	})
 
-	host := deploytest.NewPluginHost(nil, nil, program, loaders...)
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
 
 	p := &TestPlan{
-		Options: UpdateOptions{Host: host, DisableResourceReferences: true},
+		Options: TestUpdateOptions{HostF: hostF, UpdateOptions: UpdateOptions{DisableResourceReferences: true}},
+		Steps:   MakeBasicLifecycleSteps(t, 4),
+	}
+	p.Run(t, nil)
+}
+
+// TestResourceReferences_GetResource tests that invoking the built-in 'pulumi:pulumi:getResource' function
+// returns resource references for any resource reference in a resource's state.
+func TestResourceReferences_GetResource(t *testing.T) {
+	t.Parallel()
+
+	loaders := []*deploytest.ProviderLoader{
+		deploytest.NewProviderLoader("pkgA", semver.MustParse("1.0.0"), func() (plugin.Provider, error) {
+			v := &deploytest.Provider{
+				CreateF: func(urn resource.URN, news resource.PropertyMap,
+					timeout float64, preview bool,
+				) (resource.ID, resource.PropertyMap, resource.Status, error) {
+					id := "created-id"
+					if preview {
+						id = ""
+					}
+					return resource.ID(id), news, resource.StatusOK, nil
+				},
+				ReadF: func(urn resource.URN, id resource.ID,
+					inputs, state resource.PropertyMap,
+				) (plugin.ReadResult, resource.Status, error) {
+					return plugin.ReadResult{Inputs: inputs, Outputs: state}, resource.StatusOK, nil
+				},
+			}
+			return v, nil
+		}),
+	}
+
+	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
+		urnChild, idChild, _, err := monitor.RegisterResource("pkgA:m:typChild", "resChild", true)
+		assert.NoError(t, err)
+
+		refChild := resource.MakeCustomResourceReference(urnChild, idChild, "")
+		urnContainer, idContainer, _, err := monitor.RegisterResource("pkgA:m:typContainer", "resContainer", true,
+			deploytest.ResourceOptions{
+				Inputs: resource.PropertyMap{
+					"child": refChild,
+				},
+			})
+		assert.NoError(t, err)
+
+		// Expect the `child` property from `resContainer`'s state to come back from 'pulumi:pulumi:getResource'
+		// as a resource reference.
+		result, failures, err := monitor.Invoke("pulumi:pulumi:getResource", resource.PropertyMap{
+			"urn": resource.NewStringProperty(string(urnContainer)),
+		}, "", "")
+		assert.NoError(t, err)
+		assert.Empty(t, failures)
+		assert.Equal(t, resource.NewStringProperty(string(urnContainer)), result["urn"])
+		assert.Equal(t, resource.NewStringProperty(string(idContainer)), result["id"])
+		state := result["state"].ObjectValue()
+		assert.Equal(t, refChild, state["child"])
+
+		return nil
+	})
+
+	hostF := deploytest.NewPluginHostF(nil, nil, programF, loaders...)
+
+	p := &TestPlan{
+		Options: TestUpdateOptions{HostF: hostF},
 		Steps:   MakeBasicLifecycleSteps(t, 4),
 	}
 	p.Run(t, nil)

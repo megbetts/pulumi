@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,7 +22,7 @@ import (
 // See: https://github.com/golang/vscode-go/wiki/debugging
 //
 // Your mileage may vary with other tooling.
-func TestConvert(t *testing.T) {
+func TestYamlConvert(t *testing.T) {
 	t.Parallel()
 
 	if info, err := os.Stat("convert_testdata/Pulumi.yaml"); err != nil && os.IsNotExist(err) {
@@ -32,19 +33,21 @@ func TestConvert(t *testing.T) {
 		t.Fatalf("Pulumi.yaml is a directory, not a file")
 	}
 
-	result := runConvert("convert_testdata", "yaml", "go", "convert_testdata/go", true)
+	result := runConvert(
+		env.Global(), []string{}, "convert_testdata", []string{},
+		"yaml", "go", "convert_testdata/go", true, true)
 	require.Nil(t, result, "convert failed: %v", result)
 }
 
-//nolint:paralleltest // sets env var, must be run in isolation
 func TestPclConvert(t *testing.T) {
-	t.Setenv("PULUMI_DEV", "TRUE")
+	t.Parallel()
 
 	// Check that we can run convert from PCL to PCL
-	tmp, err := os.MkdirTemp("", "pulumi-convert-test")
-	assert.NoError(t, err)
+	tmp := t.TempDir()
 
-	result := runConvert("pcl_convert_testdata", "pcl", "pcl", tmp, true)
+	result := runConvert(
+		env.Global(), []string{}, "pcl_convert_testdata",
+		[]string{}, "pcl", "pcl", tmp, true, true)
 	assert.Nil(t, result)
 
 	// Check that we made one file
@@ -53,7 +56,7 @@ func TestPclConvert(t *testing.T) {
 	// On Windows, we need to replace \r\n with \n to match the expected string below
 	pclCode := string(pclBytes)
 	if runtime.GOOS == "windows" {
-		pclCode = strings.Replace(pclCode, "\r\n", "\n", -1)
+		pclCode = strings.ReplaceAll(pclCode, "\r\n", "\n")
 	}
 	expectedPclCode := `key = readFile("key.pub")
 

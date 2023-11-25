@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
+	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 )
@@ -34,14 +35,17 @@ func TestGetStackResourceOutputs(t *testing.T) {
 	typ := "some:invalid:type1"
 
 	resc1 := liveState(typ, "resc1", resource.PropertyMap{
-		resource.PropertyKey("prop1"): resource.NewStringProperty("val1")})
+		resource.PropertyKey("prop1"): resource.NewStringProperty("val1"),
+	})
 	resc2 := liveState(typ, "resc2", resource.PropertyMap{
-		resource.PropertyKey("prop2"): resource.NewStringProperty("val2")})
+		resource.PropertyKey("prop2"): resource.NewStringProperty("val2"),
+	})
 
 	// `deleted` will be ignored by `GetStackResourceOutputs`.
 	deletedName := "resc3"
 	deleted := deleteState("deletedType", "resc3", resource.PropertyMap{
-		resource.PropertyKey("deleted"): resource.NewStringProperty("deleted")})
+		resource.PropertyKey("deleted"): resource.NewStringProperty("deleted"),
+	})
 
 	// Mock backend that implements just enough methods to service `GetStackResourceOutputs`.
 	// Returns a single stack snapshot.
@@ -51,7 +55,7 @@ func TestGetStackResourceOutputs(t *testing.T) {
 		},
 		GetStackF: func(ctx context.Context, stackRef StackReference) (Stack, error) {
 			return &MockStack{
-				SnapshotF: func(ctx context.Context) (*deploy.Snapshot, error) {
+				SnapshotF: func(ctx context.Context, sp secrets.Provider) (*deploy.Snapshot, error) {
 					return &deploy.Snapshot{Resources: []*resource.State{
 						resc1, resc2, deleted,
 					}}, nil
@@ -72,11 +76,11 @@ func TestGetStackResourceOutputs(t *testing.T) {
 	assert.True(t, exists)
 	assert.True(t, resc1Actual.IsObject())
 
-	resc1Type, exists := resc1Actual.V.(resource.PropertyMap)["type"]
+	resc1Type, exists := resc1Actual.ObjectValue()["type"]
 	assert.True(t, exists)
 	assert.Equal(t, typ, resc1Type.V)
 
-	resc1Outs, exists := resc1Actual.V.(resource.PropertyMap)["outputs"]
+	resc1Outs, exists := resc1Actual.ObjectValue()["outputs"]
 	assert.True(t, exists)
 	assert.True(t, resc1Outs.IsObject())
 
@@ -85,11 +89,11 @@ func TestGetStackResourceOutputs(t *testing.T) {
 	assert.True(t, exists)
 	assert.True(t, resc2Actual.IsObject())
 
-	resc2Type, exists := resc2Actual.V.(resource.PropertyMap)["type"]
+	resc2Type, exists := resc2Actual.ObjectValue()["type"]
 	assert.True(t, exists)
 	assert.Equal(t, typ, resc2Type.V) // Same type.
 
-	resc2Outs, exists := resc2Actual.V.(resource.PropertyMap)["outputs"]
+	resc2Outs, exists := resc2Actual.ObjectValue()["outputs"]
 	assert.True(t, exists)
 	assert.True(t, resc2Outs.IsObject())
 
@@ -103,7 +107,7 @@ func TestGetStackResourceOutputs(t *testing.T) {
 //
 
 func testURN(typ, name string) resource.URN {
-	return resource.NewURN("test", "test", "", tokens.Type(typ), tokens.QName(name))
+	return resource.NewURN("test", "test", "", tokens.Type(typ), name)
 }
 
 func deleteState(typ, name string, outs resource.PropertyMap) *resource.State {

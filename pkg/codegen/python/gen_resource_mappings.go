@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"io"
 	"sort"
+
+	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
 // Generates code to build and regsiter ResourceModule and
@@ -109,8 +112,8 @@ func collectResourceModuleInfos(mctx *modContext) []resourceModuleInfo {
 		}
 
 		if !res.IsProvider {
-			pkg := mctx.pkg.Name
-			mod := mctx.pkg.TokenToRuntimeModule(res.Token)
+			pkg := mctx.pkg.Name()
+			mod := schema.TokenToRuntimeModule(res.Token)
 			fqn := mctx.fullyQualifiedImportName()
 
 			rmi, found := byMod[mod]
@@ -123,7 +126,7 @@ func collectResourceModuleInfos(mctx *modContext) []resourceModuleInfo {
 		}
 	}
 
-	var result []resourceModuleInfo
+	result := slice.Prealloc[resourceModuleInfo](len(byMod))
 	for _, rmi := range byMod {
 		result = append(result, rmi)
 	}
@@ -169,7 +172,7 @@ func collectResourcePackageInfos(mctx *modContext) []resourcePackageInfo {
 		}
 
 		if res.IsProvider {
-			pkg := mctx.pkg.Name
+			pkg := mctx.pkg.Name()
 			token := res.Token
 			fqn := mctx.fullyQualifiedImportName()
 			class := "Provider"

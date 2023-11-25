@@ -48,15 +48,12 @@
     "language": {
         "nodejs": {
             "devDependencies": {
-                "@types/node": "latest"
+                "@types/node": "ts4.3"
             }
         },
-        "go": {},
-        "python": {},
-        "csharp": {
-            "projectReferences": [
-                "..\\..\\..\\..\\..\\..\\..\\sdk\\dotnet\\Pulumi\\Pulumi.csproj"
-            ]
-        }
+        "go": {
+            "importBasePath": "functions-secrets/mypkg"
+        },
+        "python": {}
     }
 }

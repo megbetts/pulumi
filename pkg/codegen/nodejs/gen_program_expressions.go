@@ -177,9 +177,9 @@ func (g *generator) GenForExpression(w io.Writer, expr *model.ForExpression) {
 
 	if expr.Key != nil {
 		// TODO(pdg): grouping
-		g.Fgenf(w, ".reduce((__obj, %s) => { ...__obj, [%.v]: %.v })", reduceParams, expr.Key, expr.Value)
+		g.Fgenf(w, ".reduce((__obj, %s) => ({ ...__obj, [%.v]: %.v }))", reduceParams, expr.Key, expr.Value)
 	} else {
-		g.Fgenf(w, ".map(%s => %.v)", fnParams, expr.Value)
+		g.Fgenf(w, ".map(%s => (%.v))", fnParams, expr.Value)
 	}
 }
 
@@ -224,7 +224,7 @@ func functionName(tokenArg model.Expression) (string, string, string, hcl.Diagno
 
 	// Compute the resource type from the Pulumi type token.
 	pkg, module, member, diagnostics := pcl.DecomposeToken(token, tokenRange)
-	return pkg, strings.Replace(module, "/", ".", -1), member, diagnostics
+	return pkg, strings.ReplaceAll(module, "/", "."), member, diagnostics
 }
 
 func (g *generator) genRange(w io.Writer, call *model.FunctionCallExpression, entries bool) {
@@ -244,12 +244,12 @@ func (g *generator) genRange(w io.Writer, call *model.FunctionCallExpression, en
 
 	if litFrom, ok := from.(*model.LiteralValueExpression); ok {
 		fromV, err := convert.Convert(litFrom.Value, cty.Number)
-		contract.Assert(err == nil)
+		contract.AssertNoErrorf(err, "conversion of %v to number failed", litFrom.Value.Type())
 
 		from, _ := fromV.AsBigFloat().Int64()
 		if litTo, ok := to.(*model.LiteralValueExpression); ok {
 			toV, err := convert.Convert(litTo.Value, cty.Number)
-			contract.Assert(err == nil)
+			contract.AssertNoErrorf(err, "conversion of %v to number failed", litTo.Value.Type())
 
 			to, _ := toV.AsBigFloat().Int64()
 			if from == 0 {
@@ -296,29 +296,52 @@ func (g *generator) getFunctionImports(x *model.FunctionCallExpression) []string
 	}
 
 	pkg, _, _, diags := functionName(x.Args[0])
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 	return []string{"@pulumi/" + pkg}
 }
 
 func enumName(enum *model.EnumType) (string, error) {
-	components := strings.Split(enum.Token, ":")
-	contract.Assertf(len(components) == 3, "malformed token %v", enum.Token)
-	name := tokenToName(enum.Token)
-	pkg := makeValidIdentifier(components[0])
 	e, ok := pcl.GetSchemaForType(enum)
 	if !ok {
 		return "", fmt.Errorf("Could not get associated enum")
 	}
-	if name := e.(*schema.EnumType).Package.Language["nodejs"].(NodePackageInfo).PackageName; name != "" {
-		pkg = name
-	}
+	pkgRef := e.(*schema.EnumType).PackageReference
+	return enumNameWithPackage(enum.Token, pkgRef)
+}
+
+func enumNameWithPackage(enumToken string, pkgRef schema.PackageReference) (string, error) {
+	components := strings.Split(enumToken, ":")
+	contract.Assertf(len(components) == 3, "malformed token %v", enumToken)
+	name := tokenToName(enumToken)
+	pkg := makeValidIdentifier(components[0])
 	if mod := components[1]; mod != "" && mod != "index" {
-		if pkg := e.(*schema.EnumType).Package; pkg != nil {
-			mod = moduleName(mod, pkg)
+		if pkgRef != nil {
+			mod = moduleName(mod, pkgRef)
 		}
 		pkg += "." + mod
 	}
 	return fmt.Sprintf("%s.%s", pkg, name), nil
+}
+
+func (g *generator) genEntries(w io.Writer, expr *model.FunctionCallExpression) {
+	entriesArg := expr.Args[0]
+	entriesArgType := pcl.UnwrapOption(model.ResolveOutputs(entriesArg.Type()))
+	switch entriesArgType.(type) {
+	case *model.ListType, *model.TupleType:
+		if call, ok := expr.Args[0].(*model.FunctionCallExpression); ok && call.Name == "range" {
+			g.genRange(w, call, true)
+			return
+		}
+		// Mapping over a list with a tuple receiver accepts (value, index).
+		g.Fgenf(w, "%.20v.map((v, k)", expr.Args[0])
+	case *model.MapType, *model.ObjectType:
+		g.Fgenf(w, "Object.entries(%.v).map(([k, v])", expr.Args[0])
+	case *model.OpaqueType:
+		if entriesArgType.Equals(model.DynamicType) {
+			g.Fgenf(w, "Object.entries(%.v).map(([k, v])", expr.Args[0])
+		}
+	}
+	g.Fgenf(w, " => ({key: k, value: v}))")
 }
 
 func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionCallExpression) {
@@ -336,13 +359,16 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 				if isOutput {
 					g.Fgenf(w, "%.v.apply((x) => %s[x])", from, enum)
 				} else {
-					pcl.GenEnum(to, from, func(member *schema.Enum) {
+					diag := pcl.GenEnum(to, from, func(member *schema.Enum) {
 						memberTag, err := enumMemberName(tokenToName(to.Token), member)
 						contract.AssertNoErrorf(err, "Failed to get member name on enum '%s'", enum)
 						g.Fgenf(w, "%s.%s", enum, memberTag)
 					}, func(from model.Expression) {
 						g.Fgenf(w, "%s[%.v]", enum, from)
 					})
+					if diag != nil {
+						g.diagnostics = append(g.diagnostics, diag)
+					}
 				}
 			} else {
 				g.Fgenf(w, "%v", from)
@@ -367,17 +393,7 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 	case "element":
 		g.Fgenf(w, "%.20v[%.v]", expr.Args[0], expr.Args[1])
 	case "entries":
-		switch model.ResolveOutputs(expr.Args[0].Type()).(type) {
-		case *model.ListType, *model.TupleType:
-			if call, ok := expr.Args[0].(*model.FunctionCallExpression); ok && call.Name == "range" {
-				g.genRange(w, call, true)
-				return
-			}
-			g.Fgenf(w, "%.20v.map((k, v)", expr.Args[0])
-		case *model.MapType, *model.ObjectType:
-			g.Fgenf(w, "Object.entries(%.v).map(([k, v])", expr.Args[0])
-		}
-		g.Fgenf(w, " => {key: k, value: v})")
+		g.genEntries(w, expr)
 	case "fileArchive":
 		g.Fgenf(w, "new pulumi.asset.FileArchive(%.v)", expr.Args[0])
 	case "remoteArchive":
@@ -395,9 +411,13 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 	case "filebase64sha256":
 		// Assuming the existence of the following helper method
 		g.Fgenf(w, "computeFilebase64sha256(%v)", expr.Args[0])
+	case "notImplemented":
+		g.Fgenf(w, "notImplemented(%v)", expr.Args[0])
+	case "singleOrNone":
+		g.Fgenf(w, "singleOrNone(%v)", expr.Args[0])
 	case pcl.Invoke:
 		pkg, module, fn, diags := functionName(expr.Args[0])
-		contract.Assert(len(diags) == 0)
+		contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 		if module != "" {
 			module = "." + module
 		}
@@ -408,7 +428,20 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 		}
 		g.Fprintf(w, "%s(", name)
 		if len(expr.Args) >= 2 {
-			g.Fgenf(w, "%.v", expr.Args[1])
+			if expr.Signature.MultiArgumentInputs {
+				var invokeArgs *model.ObjectConsExpression
+				// extract invoke args in case we have the form invoke("token", __convert(args))
+				if converted, objectArgs, _ := pcl.RecognizeTypedObjectCons(expr.Args[1]); converted {
+					invokeArgs = objectArgs
+				} else {
+					// otherwise, we have the form invoke("token", args)
+					invokeArgs = expr.Args[1].(*model.ObjectConsExpression)
+				}
+
+				pcl.GenerateMultiArguments(g.Formatter, w, "undefined", invokeArgs, pcl.SortedFunctionParameters(expr))
+			} else {
+				g.Fgenf(w, "%.v", expr.Args[1])
+			}
 		}
 		if len(expr.Args) == 3 {
 			g.Fgenf(w, ", %.v", expr.Args[2])
@@ -426,11 +459,13 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 	case "range":
 		g.genRange(w, expr, false)
 	case "readFile":
-		g.Fgenf(w, "fs.readFileSync(%v)", expr.Args[0])
+		g.Fgenf(w, "fs.readFileSync(%v, \"utf8\")", expr.Args[0])
 	case "readDir":
-		g.Fgenf(w, "fs.readDirSync(%v)", expr.Args[0])
+		g.Fgenf(w, "fs.readdirSync(%v)", expr.Args[0])
 	case "secret":
 		g.Fgenf(w, "pulumi.secret(%v)", expr.Args[0])
+	case "unsecret":
+		g.Fgenf(w, "pulumi.unsecret(%v)", expr.Args[0])
 	case "split":
 		g.Fgenf(w, "%.20v.split(%v)", expr.Args[1], expr.Args[0])
 	case "toBase64":
@@ -547,9 +582,7 @@ func (g *generator) literalKey(x model.Expression) (string, bool) {
 				break
 			}
 		}
-		var buf bytes.Buffer
-		g.GenTemplateExpression(&buf, x)
-		return buf.String(), true
+		return "", false
 	default:
 		return "", false
 	}
@@ -558,7 +591,6 @@ func (g *generator) literalKey(x model.Expression) (string, bool) {
 		return strKey, true
 	}
 	return fmt.Sprintf("%q", strKey), true
-
 }
 
 func (g *generator) GenObjectConsExpression(w io.Writer, expr *model.ObjectConsExpression) {
@@ -593,8 +625,20 @@ func (g *generator) genRelativeTraversal(w io.Writer, traversal hcl.Traversal, p
 			contract.Failf("unexpected traversal part of type %T (%v)", part, part.SourceRange())
 		}
 
+		var indexPrefix string
 		if model.IsOptionalType(model.GetTraversableType(parts[i])) {
 			g.Fgen(w, "?")
+			// `expr?[expr]` is not valid typescript, since it looks like a ternary
+			// operator.
+			//
+			// Typescript solves this by inserting a `.` in before the `[`: `expr?.[expr]`
+			//
+			// We need to do the same when generating index based expressions.
+			indexPrefix = "."
+		}
+
+		genIndex := func(inner string, value interface{}) {
+			g.Fgenf(w, "%s["+inner+"]", indexPrefix, value)
 		}
 
 		switch key.Type() {
@@ -603,13 +647,13 @@ func (g *generator) genRelativeTraversal(w io.Writer, traversal hcl.Traversal, p
 			if isLegalIdentifier(keyVal) {
 				g.Fgenf(w, ".%s", keyVal)
 			} else {
-				g.Fgenf(w, "[%q]", keyVal)
+				genIndex("%q", keyVal)
 			}
 		case cty.Number:
 			idx, _ := key.AsBigFloat().Int64()
-			g.Fgenf(w, "[%d]", idx)
+			genIndex("%d", idx)
 		default:
-			g.Fgenf(w, "[%q]", key.AsString())
+			genIndex("%q", key.AsString())
 		}
 	}
 }
@@ -621,6 +665,25 @@ func (g *generator) GenRelativeTraversalExpression(w io.Writer, expr *model.Rela
 
 func (g *generator) GenScopeTraversalExpression(w io.Writer, expr *model.ScopeTraversalExpression) {
 	rootName := makeValidIdentifier(expr.RootName)
+	if g.isComponent {
+		if expr.RootName == "this" {
+			// special case for parent: this
+			g.Fgenf(w, "%s", expr.RootName)
+			return
+		}
+
+		configVars := map[string]*pcl.ConfigVariable{}
+		for _, configVar := range g.program.ConfigVariables() {
+			configVars[configVar.Name()] = configVar
+		}
+
+		if _, isConfig := configVars[expr.RootName]; isConfig {
+			if _, configReference := expr.Parts[0].(*pcl.ConfigVariable); configReference {
+				rootName = fmt.Sprintf("args.%s", expr.RootName)
+			}
+		}
+	}
+
 	if _, ok := expr.Parts[0].(*model.SplatVariable); ok {
 		rootName = "__item"
 	}

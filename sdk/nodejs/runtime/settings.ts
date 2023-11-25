@@ -24,7 +24,6 @@ const engproto = require("../proto/engine_pb.js");
 const resrpc = require("../proto/resource_grpc_pb.js");
 const resproto = require("../proto/resource_pb.js");
 
-
 // maxRPCMessageSize raises the gRPC Max Message size from `4194304` (4mb) to `419430400` (400mb)
 /** @internal */
 export const maxRPCMessageSize: number = 1024 * 1024 * 400;
@@ -63,9 +62,14 @@ let engine: any | undefined;
 // reset options resets nodejs runtime global state (such as rpc clients),
 // and sets nodejs runtime option env vars to the specified values.
 export function resetOptions(
-    project: string, stack: string, parallel: number, engineAddr: string,
-    monitorAddr: string, preview: boolean, organization: string) {
-
+    project: string,
+    stack: string,
+    parallel: number,
+    engineAddr: string,
+    monitorAddr: string,
+    preview: boolean,
+    organization: string,
+) {
     const { settings } = getStore();
 
     monitor = undefined;
@@ -74,7 +78,6 @@ export function resetOptions(
     settings.engine = undefined;
     settings.rpcDone = Promise.resolve();
     settings.featureSupport = {};
-
 
     // reset node specific environment variables in the process
     settings.options.project = project;
@@ -87,7 +90,13 @@ export function resetOptions(
     settings.options.organization = organization;
 }
 
-export function setMockOptions(mockMonitor: any, project?: string, stack?: string, preview?: boolean, organization?: string) {
+export function setMockOptions(
+    mockMonitor: any,
+    project?: string,
+    stack?: string,
+    preview?: boolean,
+    organization?: string,
+) {
     const opts = options();
     resetOptions(
         project || opts.project || "project",
@@ -116,7 +125,6 @@ export function _setIsDryRun(val: boolean) {
 export function isDryRun(): boolean {
     return options().dryRun === true;
 }
-
 
 /** @internal Used only for testing purposes */
 export function _setFeatureSupport(key: string, val: boolean) {
@@ -207,7 +215,6 @@ export function _setStack(val: string | undefined) {
     return settings.options.stack;
 }
 
-
 /**
  * hasMonitor returns true if we are currently connected to a resource monitoring service.
  */
@@ -219,18 +226,13 @@ export function hasMonitor(): boolean {
  * getMonitor returns the current resource monitoring service client for RPC communications.
  */
 export function getMonitor(): Object | undefined {
-    runSxSCheck();
     const { settings } = getStore();
     const addr = options().monitorAddr;
     if (getLocalStore() === undefined) {
         if (monitor === undefined) {
             if (addr) {
                 // Lazily initialize the RPC connection to the monitor.
-                monitor = new resrpc.ResourceMonitorClient(
-                    addr,
-                    grpc.credentials.createInsecure(),
-                    grpcChannelOptions,
-                );
+                monitor = new resrpc.ResourceMonitorClient(addr, grpc.credentials.createInsecure(), grpcChannelOptions);
                 settings.options.monitorAddr = addr;
             }
         }
@@ -271,7 +273,6 @@ export function tryGetSyncInvokes(): SyncInvokes | undefined {
     return syncInvokes;
 }
 
-
 /**
  * hasEngine returns true if we are currently connected to an engine.
  */
@@ -289,11 +290,7 @@ export function getEngine(): Object | undefined {
             const addr = options().engineAddr;
             if (addr) {
                 // Lazily initialize the RPC connection to the engine.
-                engine = new engrpc.EngineClient(
-                    addr,
-                    grpc.credentials.createInsecure(),
-                    grpcChannelOptions,
-                );
+                engine = new engrpc.EngineClient(addr, grpc.credentials.createInsecure(), grpcChannelOptions);
             }
         }
         return engine;
@@ -302,11 +299,7 @@ export function getEngine(): Object | undefined {
             const addr = options().engineAddr;
             if (addr) {
                 // Lazily initialize the RPC connection to the engine.
-                settings.engine = new engrpc.EngineClient(
-                    addr,
-                    grpc.credentials.createInsecure(),
-                    grpcChannelOptions,
-                );
+                settings.engine = new engrpc.EngineClient(addr, grpc.credentials.createInsecure(), grpcChannelOptions);
             }
         }
         return settings.engine;
@@ -336,7 +329,6 @@ export function serialize(): boolean {
 
  */
 function options(): Options {
-    runSxSCheck();
     const { settings } = getStore();
 
     return settings.options;
@@ -385,8 +377,7 @@ export function disconnectSync(): void {
     if (monitor) {
         try {
             monitor.close();
-        }
-        catch (err) {
+        } catch (err) {
             // ignore.
         }
         monitor = null;
@@ -394,14 +385,12 @@ export function disconnectSync(): void {
     if (engine) {
         try {
             engine.close();
-        }
-        catch (err) {
+        } catch (err) {
             // ignore.
         }
         engine = null;
     }
 }
-
 
 /**
  * rpcKeepAlive registers a pending call to ensure that we don't prematurely disconnect from the server.  It returns
@@ -410,7 +399,13 @@ export function disconnectSync(): void {
 export function rpcKeepAlive(): () => void {
     const localStore = getStore();
     let done: (() => void) | undefined = undefined;
-    const donePromise = debuggablePromise(new Promise<void>(resolve => done = resolve), "rpcKeepAlive");
+    const donePromise = debuggablePromise(
+        new Promise<void>((resolve) => {
+            done = resolve;
+            return done;
+        }),
+        "rpcKeepAlive",
+    );
     localStore.settings.rpcDone = localStore.settings.rpcDone.then(() => donePromise);
     return done!;
 }
@@ -518,36 +513,13 @@ export async function monitorSupportsDeletedWith(): Promise<boolean> {
     return monitorSupportsFeature("deletedWith");
 }
 
-// sxsRandomIdentifier is a module level global that is transfered to process.env.
-// the goal is to detect side by side (sxs) pulumi/pulumi situations for inline programs
-// and fail fast. See https://github.com/pulumi/pulumi/issues/7333 for details.
-const sxsRandomIdentifier = Math.random().toString();
-
-// indicates that the current runtime context is via an inline program via automation api.
-let isInline = false;
-
-/** @internal only used by the internal inline language host implementation */
-export function setInline() {
-    isInline = true;
-}
-
-const pulumiSxSEnv = "PULUMI_NODEJS_SXS_FLAG";
-
 /**
- * runSxSCheck checks an identifier stored in the environment to detect multiple versions of pulumi.
- * if we're running in inline mode, it will throw an error to fail fast due to global state collisions that can occur.
+ * monitorSupportsAliasSpecs returns a promise that when resolved tells you if the resource monitor we are
+ * connected to is able to support alias specs across its RPC interface. When it does, we marshal aliases
+ * in a special way.
+ *
+ * @internal
  */
-function runSxSCheck() {
-    const envSxS = process.env[pulumiSxSEnv];
-    process.env[pulumiSxSEnv] = sxsRandomIdentifier;
-
-    if (!isInline) {
-        return;
-    }
-
-    // if we see a different identifier, another version of pulumi has been loaded and we should fail.
-    if (!!envSxS && envSxS !== sxsRandomIdentifier) {
-        throw new Error("Detected multiple versions of '@pulumi/pulumi' in use in an inline automation api program.\n" +
-            "Use the yarn 'resolutions' field to pin to a single version: https://github.com/pulumi/pulumi/issues/5449.");
-    }
+export async function monitorSupportsAliasSpecs(): Promise<boolean> {
+    return monitorSupportsFeature("aliasSpecs");
 }
